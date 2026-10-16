@@ -4120,7 +4120,10 @@ fn note_add_index_failure_keeps_the_repo_registered() {
 #[test]
 #[serial]
 fn symbol_index_status_reflects_the_on_disk_meta() {
-    use crate::constants::{INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};
+    use crate::constants::{
+        INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_REFS_COVERAGE_KEY,
+        SCIP_REFS_COVERAGE_LAZY,
+    };
 
     let (_tmp, repo_path, state) = state_with_repo("syminfo");
     let db = repo_path.join(DB_DIR_NAME);
@@ -4145,10 +4148,24 @@ fn symbol_index_status_reflects_the_on_disk_meta() {
         .expect("csharp status entry");
     assert_eq!(csharp.state, "stale", "{csharp:?}");
 
-    // A rebuild by THIS binary (current stamp): ready.
+    // Current builder stamp without a refs_coverage stamp: still stale.
     seed_scip_meta(
         &db,
         &[(SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION)],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "stale", "{csharp:?}");
+
+    // A rebuild by THIS binary (both stamps): ready.
+    seed_scip_meta(
+        &db,
+        &[
+            (SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_LAZY),
+        ],
     );
     let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
         .into_iter()
@@ -4591,19 +4608,50 @@ fn evaluate_rebuilds_an_index_from_an_older_binary() {
     );
 }
 
+/// Meta a rebuild by this binary writes: builder stamp plus coverage stamp.
+const CURRENT_BUILD_META: &[(&str, &str)] = &[
+    (
+        crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+        crate::constants::INDEX_BUILDER_VERSION,
+    ),
+    (
+        crate::constants::SCIP_REFS_COVERAGE_KEY,
+        crate::constants::SCIP_REFS_COVERAGE_LAZY,
+    ),
+];
+
+/// An index with this binary's builder stamp but no `refs_coverage` stamp
+/// predates precomputed references and must rebuild once.
+#[test]
+#[serial]
+fn evaluate_rebuilds_an_index_without_a_coverage_stamp() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
+        "nocoverage",
+        &[(
+            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )],
+    );
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild(
+            "csharp",
+            "nocoverage",
+            &repo_path,
+            &repo_path.join(DB_DIR_NAME)
+        ),
+        RebuildDecision::ChangedSinceLastBuild,
+        "absent coverage stamp must read as stale"
+    );
+}
+
 /// A degraded index (warnings in meta, current builder version) rebuilds
 /// exactly once per serve process: the second evaluation is Fresh (no loop
 /// while the environment stays broken); a fresh process gets a fresh set.
 #[test]
 #[serial]
 fn evaluate_retries_a_degraded_index_once_per_process() {
-    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
-        "degraded",
-        &[(
-            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
-            crate::constants::INDEX_BUILDER_VERSION,
-        )],
-    );
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture("degraded", CURRENT_BUILD_META);
     let db = repo_path.join(DB_DIR_NAME);
     // Re-seed WITH warnings (the fixture seeded only the version stamp).
     seed_scip_meta(
@@ -4631,13 +4679,7 @@ fn evaluate_retries_a_degraded_index_once_per_process() {
 #[test]
 #[serial]
 fn evaluate_stays_fresh_when_index_is_current_and_clean() {
-    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
-        "cleanidx",
-        &[(
-            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
-            crate::constants::INDEX_BUILDER_VERSION,
-        )],
-    );
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture("cleanidx", CURRENT_BUILD_META);
 
     assert_eq!(
         state.evaluate_symbol_rebuild(
