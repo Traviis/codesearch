@@ -5010,3 +5010,144 @@ async fn sweeper_reasserts_cancellation_for_a_removed_live_task() {
         }
     }
 }
+
+// ── status snapshot ──────────────────────────────────────────────────────
+
+#[test]
+fn status_snapshot_handle_starts_empty_and_roundtrips() {
+    let handle = status_snapshot::StatusSnapshotHandle::new();
+    // Before the first background pass handlers must see None and answer
+    // their "starting" shape — never measure inline.
+    assert!(handle.get().is_none());
+
+    let snap = status_snapshot::StatusSnapshot {
+        repos: Vec::new(),
+        projects: Vec::new(),
+        projects_warnings: Vec::new(),
+        active_sessions: 0,
+        cpu_percent: "0%".to_string(),
+        csharp_helper: false,
+        ts_helper: false,
+        generated_at: std::time::Instant::now(),
+    };
+    handle.store(snap);
+
+    let got = handle.get().expect("snapshot readable after store");
+    assert_eq!(got.cpu_percent, "0%");
+    assert!(got.age_secs() <= 1, "fresh snapshot must have ~0 age");
+}
+
+#[test]
+fn compute_status_snapshot_reports_empty_fleet_without_state() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    assert!(state.latest_status_snapshot().is_none());
+
+    let snap = state.compute_status_snapshot();
+    assert!(snap.repos.is_empty());
+    assert_eq!(snap.active_sessions, 0);
+    assert!(!snap.cpu_percent.is_empty(), "cpu is always a string");
+    assert!(snap.age_secs() <= 1);
+}
+
+#[test]
+#[serial]
+fn status_refresh_interval_env_overrides() {
+    {
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "7")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(7));
+    }
+    {
+        // Unparseable falls back to the default rather than failing.
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "abc")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(2));
+    }
+    {
+        // Zero would busy-loop the measuring task; the default floor applies.
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "0")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(2));
+    }
+    {
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(2));
+    }
+}
+
+#[tokio::test]
+async fn status_handler_answers_starting_then_snapshot_with_load() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Before the first background pass: immediate "starting" answer, no
+    // measurement, null age.
+    let res = status_handler(axum::extract::State(state.clone())).await;
+    assert_eq!(res.0["status"], "starting");
+    assert!(res.0["snapshot_age_secs"].is_null());
+    assert!(res.0["repos"].is_array());
+
+    // After a pass is stored: the full contract callers depend on — legacy
+    // fields preserved, load counters present, age numeric.
+    state.status_snapshot.store(state.compute_status_snapshot());
+    let res = status_handler(axum::extract::State(state)).await;
+    let v = res.0;
+    assert!(
+        v["status"].is_null(),
+        "stored pass must not read 'starting'"
+    );
+    assert_eq!(v["load"]["text_indexing"], 0);
+    assert_eq!(v["load"]["symbol_indexing"], 0);
+    assert_eq!(v["load"]["errored"], 0);
+    assert!(v["load"]["refresh_interval_secs"].is_u64());
+    assert!(v["snapshot_age_secs"].is_u64());
+    assert!(v["version"].is_string());
+    assert!(v["uptime_secs"].is_u64());
+}
+
+#[tokio::test]
+async fn mcp_status_and_projects_answer_starting_pre_first_pass() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    // kind=index, no snapshot yet: structured "starting" answer.
+    let res = service
+        .status(rmcp::handler::server::wrapper::Parameters(
+            crate::mcp::types::StatusRequest {
+                kind: Some("index".to_string()),
+                project: None,
+                group: None,
+            },
+        ))
+        .await
+        .expect("status must not error");
+    let text = match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    assert!(
+        text.contains("\"starting\""),
+        "scope-free index status must answer starting pre-first-pass, got: {text}"
+    );
+
+    // kind=projects, no snapshot yet: empty list + explicit warming warning
+    // (the warnings channel terminates — never a silent empty answer).
+    let res = service
+        .status(rmcp::handler::server::wrapper::Parameters(
+            crate::mcp::types::StatusRequest {
+                kind: Some("projects".to_string()),
+                project: None,
+                group: None,
+            },
+        ))
+        .await
+        .expect("projects must not error");
+    let text = match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    assert!(
+        text.contains("warming up"),
+        "projects pre-first-pass must carry the warming warning, got: {text}"
+    );
+}

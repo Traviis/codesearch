@@ -10,6 +10,7 @@
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
+mod status_snapshot;
 mod tui;
 mod tui_common;
 mod tui_remote;
@@ -464,6 +465,12 @@ pub(crate) struct ServeState {
     reload_count: std::sync::atomic::AtomicUsize,
     /// Instant when ServeState was created — used to compute uptime for TUI header.
     started_at: std::time::Instant,
+    /// Precomputed status snapshot the read endpoints answer from: a
+    /// background task measures (filesystem probes, sysinfo), handlers
+    /// never do. Under a heavy rebuild wave the measuring workers are
+    /// OS-starved; inline measurement made /status itself take tens of
+    /// seconds across the fleet (the "status must always answer" fix).
+    status_snapshot: Arc<status_snapshot::StatusSnapshotHandle>,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -548,6 +555,7 @@ impl ServeState {
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
             started_at: std::time::Instant::now(),
+            status_snapshot: Arc::new(status_snapshot::StatusSnapshotHandle::new()),
         }
     }
 
@@ -704,6 +712,13 @@ impl ServeState {
         self.legacy_model_warned
             .insert(alias.to_string(), ())
             .is_none()
+    }
+
+    /// The latest precomputed status snapshot, or `None` before the first
+    /// background pass completes. Read endpoints answer from this — never
+    /// by measuring inline (the /status timeout fix).
+    pub(crate) fn latest_status_snapshot(&self) -> Option<Arc<status_snapshot::StatusSnapshot>> {
+        self.status_snapshot.get()
     }
 
     /// Return the instant when serve started, used to compute uptime.
@@ -3807,6 +3822,54 @@ impl ServeState {
         self.end_indexing(alias, IndexingOwner::Reindex);
     }
 
+    /// Compute one full status pass for the background snapshot task —
+    /// the ONLY place that measures (filesystem probes, sysinfo refresh).
+    /// Runs on the blocking pool via [`status_snapshot::spawn`]; the
+    /// read endpoints answer from the stored result and must never call
+    /// this on the request path.
+    pub(crate) fn compute_status_snapshot(&self) -> status_snapshot::StatusSnapshot {
+        let repos = self.repo_statuses_lightweight();
+        let active_sessions = self.active_session_count();
+
+        // CPU usage — reuse shared System instance so cpu_usage() can compute delta
+        let cpu = (|| -> Option<String> {
+            use sysinfo::ProcessesToUpdate;
+            let pid = sysinfo::get_current_pid().ok()?;
+            let mut sys = self.sysinfo_system.lock().ok()?;
+            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+            let proc = sys.process(pid)?;
+            let num_cpus = sys.cpus().len().max(1) as f32;
+            Some(format!("{:.0}%", proc.cpu_usage() / num_cpus))
+        })()
+        .unwrap_or_else(|| "—".to_string());
+
+        let csharp_helper = self
+            .symbol_registry
+            .get(LANG_CSHARP)
+            .map(|i| i.is_available())
+            .unwrap_or(false);
+
+        let ts_helper = self
+            .symbol_registry
+            .get(LANG_TYPESCRIPT)
+            .map(|i| i.is_available())
+            .unwrap_or(false);
+
+        let (snapshot_projects, snapshot_projects_warnings) =
+            crate::mcp::compute_projects_snapshot(self);
+
+        status_snapshot::StatusSnapshot {
+            repos,
+            projects: snapshot_projects,
+            projects_warnings: snapshot_projects_warnings,
+            active_sessions,
+            cpu_percent: cpu,
+            csharp_helper,
+            ts_helper,
+            generated_at: std::time::Instant::now(),
+        }
+    }
+
     /// Get lightweight repo statuses WITHOUT opening any databases.
     /// Returns a list of (alias, status_info) where status is derived from DashMap state only.
     pub(crate) fn repo_statuses_lightweight(&self) -> Vec<(String, RepoStatusInfo)> {
@@ -4356,15 +4419,33 @@ async fn indexing_handler(
 
 /// Status handler: GET /status
 ///
-/// Returns a JSON snapshot of all repo states, active sessions, and CPU usage.
-/// Used by the standalone TUI (`codesearch serve tui`) to poll server state.
+/// Answers from the precomputed [`status_snapshot::StatusSnapshot`] — the
+/// measuring runs on a background task, so this handler is O(1) no matter
+/// how loaded the machine is (the old inline version took tens of seconds
+/// across the fleet during a rebuild wave; clients timed out). First ticks
+/// after startup get an immediate minimal answer with `"status": "starting"`.
+/// Every answer carries `snapshot_age_secs`; the `load` object counts the
+/// busy repos so calling agents can throttle themselves.
 async fn status_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
 ) -> AxumJson<serde_json::Value> {
-    let repos = state.repo_statuses_lightweight();
-    let active_sessions = state.active_session_count();
+    let uptime_secs = state.started_at().elapsed().as_secs();
+    let version = env!("CARGO_PKG_VERSION");
 
-    let repo_json: Vec<serde_json::Value> = repos
+    let Some(snap) = state.status_snapshot.get() else {
+        return AxumJson(json!({
+            "version": version,
+            "status": "starting",
+            "repos": [],
+            "active_sessions": 0,
+            "cpu_percent": "—",
+            "snapshot_age_secs": serde_json::Value::Null,
+            "uptime_secs": uptime_secs,
+        }));
+    };
+
+    let repo_json: Vec<serde_json::Value> = snap
+        .repos
         .iter()
         .map(|(alias, info)| {
             let status_str = match info.status {
@@ -4409,73 +4490,44 @@ async fn status_handler(
         })
         .collect();
 
-    let uptime_secs = state.started_at().elapsed().as_secs();
-
-    // Serve-wide default model for newly created indexes (`serve --model`).
-    // `null` means the built-in default.
-    let default_model = state.default_model().map(|m| m.short_name());
-
-    // CPU usage — reuse shared System instance so cpu_usage() can compute delta
-    let cpu = {
-        use sysinfo::ProcessesToUpdate;
-        let pid = match sysinfo::get_current_pid() {
-            Ok(p) => p,
-            Err(_) => {
-                return AxumJson(json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "repos": repo_json,
-                    "active_sessions": active_sessions,
-                    "default_model": default_model,
-                    "cpu_percent": "—",
-                    "uptime_secs": uptime_secs,
-                }));
-            }
-        };
-        let mut sys = match state.sysinfo_system.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                return AxumJson(json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "repos": repo_json,
-                    "active_sessions": active_sessions,
-                    "default_model": default_model,
-                    "cpu_percent": "—",
-                    "uptime_secs": uptime_secs,
-                }));
-            }
-        };
-        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-        match sys.process(pid) {
-            Some(proc) => {
-                let num_cpus = sys.cpus().len().max(1) as f32;
-                let pct = proc.cpu_usage() / num_cpus;
-                format!("{:.0}%", pct)
-            }
-            None => "—".to_string(),
-        }
-    };
-
-    let csharp_helper = state
-        .symbol_registry
-        .get(LANG_CSHARP)
-        .map(|i| i.is_available())
-        .unwrap_or(false);
-
-    let ts_helper = state
-        .symbol_registry
-        .get(LANG_TYPESCRIPT)
-        .map(|i| i.is_available())
-        .unwrap_or(false);
+    // Load summary for calling agents: how busy is this serve right now.
+    // Symbol columns count separately from the text label — a pure SCIP
+    // wave never lights "indexing" at the repo level (v1.5.31 semantics).
+    let text_indexing = snap
+        .repos
+        .iter()
+        .filter(|(_, i)| i.status == RepoStateLabel::Indexing)
+        .count();
+    let symbol_indexing = snap
+        .repos
+        .iter()
+        .filter(|(_, i)| {
+            matches!(i.csharp_index, CSharpIndexStatus::Indexing)
+                || matches!(i.typescript_index, CSharpIndexStatus::Indexing)
+        })
+        .count();
+    let errored = snap
+        .repos
+        .iter()
+        .filter(|(_, i)| i.status == RepoStateLabel::Error)
+        .count();
 
     AxumJson(json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": version,
         "repos": repo_json,
-        "active_sessions": active_sessions,
-        "default_model": default_model,
-        "cpu_percent": cpu,
-        "csharp_helper": csharp_helper,
-        "ts_helper": ts_helper,
+        "active_sessions": snap.active_sessions,
+        "default_model": state.default_model().map(|m| m.short_name()),
+        "cpu_percent": snap.cpu_percent,
+        "csharp_helper": snap.csharp_helper,
+        "ts_helper": snap.ts_helper,
         "uptime_secs": uptime_secs,
+        "snapshot_age_secs": snap.age_secs(),
+        "load": {
+            "text_indexing": text_indexing,
+            "symbol_indexing": symbol_indexing,
+            "errored": errored,
+            "refresh_interval_secs": status_snapshot::refresh_interval().as_secs(),
+        },
     }))
 }
 
@@ -6591,6 +6643,12 @@ pub async fn run_serve(
     // it. In particular the embedded TUI must NOT derive a poll cadence from it
     // — it never polls a federated peer on a timer at all.
     let serve_state = Arc::new(ServeState::new(config, None).with_default_model(default_model));
+
+    // The status snapshot refresher: only this task measures. Read
+    // endpoints (GET /status, MCP status) answer from its stored result,
+    // so they respond in microseconds even while a rebuild wave starves
+    // the machine — the failure mode that made /status itself time out.
+    status_snapshot::spawn(serve_state.clone());
 
     // One line that answers "why is it slower / less parallel than before?"
     // without grepping the code: the effective heavy-work budget.

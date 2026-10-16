@@ -526,7 +526,9 @@ pub struct RemoteProjectInfo {
 }
 
 /// Information about a single registered project/repo.
-#[derive(Debug, Serialize)]
+/// `Clone`: the snapshot stores the computed list and every projects answer
+/// clones it out (the slot lock is never held across response building).
+#[derive(Debug, Clone, Serialize)]
 pub struct RepoInfo {
     pub alias: String,
     pub project_path: String,

@@ -121,6 +121,8 @@ pub(crate) use helpers::*;
 pub(crate) use instructions::*;
 pub(crate) use responses::*;
 pub use runtime::*;
+/// The projects-measure pass for the serve status-snapshot background task.
+pub(crate) use status::compute_projects_snapshot;
 
 /// Re-order lexical `usages` hits so source-code paths come before everything
 /// else (docs, configs, markdown). Stable: score order is preserved within

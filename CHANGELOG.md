@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.33]
+
+### Fixed
+
+- **`GET /status` and the MCP `status` tool always answer, even under a heavy rebuild wave.** They used to measure inline in the request path: per registered repo several filesystem probes plus a SCIP LMDB env open and a sysinfo refresh, synchronous on async workers that a rebuild wave (dotnet restore + scip-csharp children) starves — with 28 repos one call took tens of seconds and polling clients (remote TUI, calling agents) piled up and timed out; the project list died the same death. Now a single background task measures (on the blocking pool, one pass at a time — under load the cadence stretches instead of piling measuring tasks onto a starved machine) and stores a snapshot whose readers answer in microseconds. Every answer carries `snapshot_age_secs` (staleness is visible, never a hang) and a `load` summary (`text_indexing` / `symbol_indexing` / `errored` / `refresh_interval_secs`) so calling agents can throttle themselves; before the first pass completes they answer `"starting"` immediately. Cadence: `CODESEARCH_STATUS_REFRESH_SECS`, default 2s.
+
 ## [1.5.31]
 
 ### Changed

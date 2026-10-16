@@ -616,6 +616,12 @@ pub const REMOTE_PEER_RETRY_BACKOFF_MS: &[u64] = &[3000, 8000];
 /// single millisecond value (test hook so retry tests don't sleep for real).
 pub const REMOTE_PEER_RETRY_BACKOFF_ENV: &str = "CODESEARCH_REMOTE_RETRY_BACKOFF_MS";
 
+/// Cadence of the background status-snapshot refresher (seconds). Read
+/// endpoints answer from the stored snapshot, so this only trades staleness
+/// (`snapshot_age_secs`) for probing cost — under load the cadence
+/// stretches on its own; this knob only sets the idle pace.
+pub const STATUS_REFRESH_SECS_ENV: &str = "CODESEARCH_STATUS_REFRESH_SECS";
+
 /// Cooperative join window (seconds) for `await_index_task` and
 /// `await_fsw_shutdown`: how long a background indexing / file-watcher task
 /// is given to observe its `CancellationToken` and exit on its own before it
