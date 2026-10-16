@@ -55,7 +55,7 @@ impl StatusSnapshotHandle {
         self.slot.read().ok().and_then(|s| s.clone())
     }
 
-    fn store(&self, snapshot: StatusSnapshot) {
+    pub(crate) fn store(&self, snapshot: StatusSnapshot) {
         if let Ok(mut slot) = self.slot.write() {
             *slot = Some(Arc::new(snapshot));
         }
@@ -65,7 +65,7 @@ impl StatusSnapshotHandle {
 /// Refresh cadence: `CODESEARCH_STATUS_REFRESH_SECS` when a positive
 /// integer, otherwise 2s. Unparseable values fall back to the default.
 pub(crate) fn refresh_interval() -> Duration {
-    match std::env::var("CODESEARCH_STATUS_REFRESH_SECS")
+    match std::env::var(crate::constants::STATUS_REFRESH_SECS_ENV)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {

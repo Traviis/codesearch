@@ -264,5 +264,5 @@ Older entries: see `CHANGELOG.md`.
 /status must always answer: serve used to measure inline in the handler (28 repos x FS probes + SCIP LMDB opens + sysinfo refresh on async workers OS-starved by rebuild children -> tens of seconds, client timeouts). Now a background task (spawn_blocking, serial passes, CODESEARCH_STATUS_REFRESH_SECS default 2s) computes a StatusSnapshot into a swap-only RwLock slot; /status answers O(1) with snapshot_age_secs + a load summary (text_indexing / symbol_indexing / errored / refresh_interval_secs); before the first pass it answers "starting" immediately. Stage 2: MCP status tool via snapshot. Stage 3: tests + CHANGELOG + validation.
 
 1. [x] Stage 1: status_snapshot.rs + ServeState field + compute_status_snapshot + new status_handler + spawn at startup
-2. [ ] Stage 2: MCP status (kind=index) reads the snapshot
-3. [ ] Stage 3: tests + CHANGELOG + full validation
+2. [x] Stage 2: MCP status (kind=index) reads the snapshot
+3. [x] Stage 3: tests + CHANGELOG + full validation

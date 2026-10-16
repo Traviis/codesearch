@@ -5010,3 +5010,66 @@ async fn sweeper_reasserts_cancellation_for_a_removed_live_task() {
         }
     }
 }
+
+// ── status snapshot ──────────────────────────────────────────────────────
+
+#[test]
+fn status_snapshot_handle_starts_empty_and_roundtrips() {
+    let handle = status_snapshot::StatusSnapshotHandle::new();
+    // Before the first background pass handlers must see None and answer
+    // their "starting" shape — never measure inline.
+    assert!(handle.get().is_none());
+
+    let snap = status_snapshot::StatusSnapshot {
+        repos: Vec::new(),
+        active_sessions: 0,
+        cpu_percent: "0%".to_string(),
+        csharp_helper: false,
+        ts_helper: false,
+        generated_at: std::time::Instant::now(),
+    };
+    handle.store(snap);
+
+    let got = handle.get().expect("snapshot readable after store");
+    assert_eq!(got.cpu_percent, "0%");
+    assert!(got.age_secs() <= 1, "fresh snapshot must have ~0 age");
+}
+
+#[test]
+fn compute_status_snapshot_reports_empty_fleet_without_state() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    assert!(state.latest_status_snapshot().is_none());
+
+    let snap = state.compute_status_snapshot();
+    assert!(snap.repos.is_empty());
+    assert_eq!(snap.active_sessions, 0);
+    assert!(!snap.cpu_percent.is_empty(), "cpu is always a string");
+    assert!(snap.age_secs() <= 1);
+}
+
+#[test]
+#[serial]
+fn status_refresh_interval_env_overrides() {
+    {
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "7")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(7));
+    }
+    {
+        // Unparseable falls back to the default rather than failing.
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "abc")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(2));
+    }
+    {
+        // Zero would busy-loop the measuring task; the default floor applies.
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "0")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(2));
+    }
+    {
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(2));
+    }
+}
