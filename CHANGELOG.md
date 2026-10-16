@@ -22,6 +22,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **The serve TUI status column no longer shows `Indexing` for a pure symbol (SCIP) rebuild.** Only text-indexing flows (startup warmup, file-watcher batches, explicit reindex) light the general repo label; a C#/TypeScript symbol rebuild — including a long restore-pending retry loop — drives only the language columns, so a busy C# pass can no longer read as "the normal index is stuck behind the SCIP index". A queued phase-2 rebuild stays visible in the C# column only. The `/status` wire vocabulary is unchanged. A repo whose index is on disk but which is not loaded renders `Idle` again — the interim `idx` rendering read as active indexing on done, non-SCIP repos.
 
+- **C# `find_impact` answers from precomputed references.** References are computed at index time (index format 2.1) instead of a slow lazy lookup on every query.
+
 ## [1.5.30]
 
 ### Fixed
