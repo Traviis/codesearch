@@ -767,6 +767,23 @@ pub const INDEX_BUILDER_VERSION: &str = "2026-10.1";
 /// parameter types).
 pub const SCIP_KEY_FORMAT: &str = "2";
 
+/// `metadata.version` values accepted from `scip-csharp index` output; the
+/// later version adds the optional precomputed `references` list.
+pub const SCIP_CSHARP_INDEX_VERSIONS: &[&str] = &["2.0", "2.1"];
+
+/// LMDB metadata key recording how much of `scip_ref_cache` a C# rebuild
+/// precomputed. Absent means the index predates the stamp and is stale.
+pub const SCIP_REFS_COVERAGE_KEY: &str = "refs_coverage";
+
+/// Every symbol has a cache entry, empty when nothing references it.
+pub const SCIP_REFS_COVERAGE_COMPLETE: &str = "complete";
+
+/// Only symbols with at least one reference are cached; a miss resolves lazily.
+pub const SCIP_REFS_COVERAGE_PARTIAL: &str = "partial";
+
+/// Nothing was precomputed; every reference lookup resolves lazily.
+pub const SCIP_REFS_COVERAGE_LAZY: &str = "lazy";
+
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
 pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
@@ -927,7 +944,7 @@ pub const SCIP_WORKSPACE_HEAP_CAP_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_HEAP_CA
 /// Resident workspaces idle longer than this are torn down by lazy reaping
 /// (checked on pool access). Restarting a workspace costs one solution load —
 /// acceptable for an idle repo, which is exactly what the TTL measures.
-pub const DEFAULT_SCIP_WORKSPACE_IDLE_SECS: u64 = 600;
+pub const DEFAULT_SCIP_WORKSPACE_IDLE_SECS: u64 = 3600;
 pub const SCIP_WORKSPACE_IDLE_SECS_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_IDLE_SECS";
 
 /// How long (seconds) a budget-overrun `find_impact` lookup stays tracked

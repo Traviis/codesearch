@@ -4,14 +4,17 @@
 //! to produce a JSON symbol index from a .sln/.csproj, parses the
 //! output, and stores references in LMDB.
 //!
-//! ## Two-phase reference model (Opt 2 — lazy FindReferencesAsync)
+//! ## Reference model
 //!
-//! `rebuild()` calls `scip-csharp index` which now emits **definitions only**
-//! (no `FindReferencesAsync` loop). This makes a full rebuild 10–50× faster.
+//! `rebuild()` calls `scip-csharp index`, which emits definitions and — on a
+//! full-scope run of a helper that supports it — every solution reference.
+//! Those references are written to `scip_ref_cache` in the rebuild txn and
+//! the meta `refs_coverage` stamp records how much of the cache that covers
+//! (see [`crate::constants::SCIP_REFS_COVERAGE_KEY`]).
 //!
-//! `find_references_for_key()` resolves references on demand:
+//! `find_references_for_key()`:
 //! 1. Return definitions from `scip_symbols` (always populated after rebuild).
-//! 2. Check `scip_ref_cache` for previously resolved references — return if present.
+//! 2. Check `scip_ref_cache` — return if present.
 //! 3. Cache miss: invoke `scip-csharp find-refs` for the single requested symbol,
 //!    cache the result in `scip_ref_cache`, then return.
 //!
@@ -23,14 +26,13 @@
 //! - Merges the result: updates symbols and positions for affected files only;
 //!   symbols from other projects are preserved.
 //! - Rebuilds `scip_simple_names` from all current `scip_symbols` entries.
-//! - Selectively invalidates `scip_ref_cache` for affected symbols only.
+//! - Clears `scip_ref_cache`; references then resolve lazily.
 //!
 //! ## Phase 3 pre-warm (background ref cache filling)
 //!
-//! After startup Phase 2 completes (definitions indexed), Phase 3 runs
-//! `scip-csharp batch-find-refs` to resolve references for all symbols
-//! in one workspace session. This amortizes the 30-60s workspace open cost
-//! across thousands of symbols, making subsequent `find_impact` calls instant.
+//! For an index without precomputed references (`refs_coverage` = lazy),
+//! Phase 3 runs `scip-csharp batch-find-refs` to resolve references for all
+//! symbols in one workspace session, amortizing the workspace open cost.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -142,6 +144,26 @@ pub(crate) fn summarize_index_warnings(lines: &[String], cap: usize) -> Vec<Stri
     out
 }
 
+/// The `refs_coverage` stamp for one rebuild. A run with index warnings may
+/// have resolved too few references, so its zero-reference symbols stay lazy.
+pub(crate) fn refs_coverage_for(precomputed: bool, clean: bool) -> &'static str {
+    match (precomputed, clean) {
+        (false, _) => crate::constants::SCIP_REFS_COVERAGE_LAZY,
+        (true, true) => crate::constants::SCIP_REFS_COVERAGE_COMPLETE,
+        (true, false) => crate::constants::SCIP_REFS_COVERAGE_PARTIAL,
+    }
+}
+
+/// Whether the Phase 3 batch prewarm still has work: only a lazy (or
+/// unstamped) index lacks precomputed references.
+pub(crate) fn ref_prewarm_needed(refs_coverage: Option<&str>) -> bool {
+    !matches!(
+        refs_coverage,
+        Some(crate::constants::SCIP_REFS_COVERAGE_COMPLETE)
+            | Some(crate::constants::SCIP_REFS_COVERAGE_PARTIAL)
+    )
+}
+
 /// The stored form of the summarized warnings: a stand-alone summary entry
 /// leads, because the list rides on every find_impact answer AND the TUI
 /// info panel and must be understandable alone.
@@ -199,7 +221,7 @@ pub(crate) fn drain_pipe_to_tracing<R: std::io::Read>(pipe: R, mut emit: impl Fn
 
 // ── Constants ─────────────────────────────────────────────────────
 
-/// LMDB database name for the SCIP symbol table (definitions only after Opt 2).
+/// LMDB database name for the SCIP symbol table (definition occurrences).
 const SCIP_DB_NAME: &str = crate::constants::SCIP_SYMBOLS_DB_NAME;
 
 /// LMDB database name for the rebuild timestamp.
@@ -233,6 +255,7 @@ const META_KEY_FORMAT: &str = crate::constants::SCIP_KEY_FORMAT_KEY;
 /// [`summarize_index_warnings`]).
 const META_INDEX_WARNINGS: &str = crate::constants::SCIP_INDEX_WARNINGS_KEY;
 const META_BUILDER_VERSION: &str = crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY;
+const META_REFS_COVERAGE: &str = crate::constants::SCIP_REFS_COVERAGE_KEY;
 
 /// How many distinct index-level warnings are persisted (and thus surfaced
 /// per find_impact answer) before the list is capped with an overflow note.
@@ -713,16 +736,18 @@ impl CSharpSymbolIndexer {
     }
 
     /// Writes the rebuild bookkeeping shared by every scope (full and
-    /// incremental): key-format stamp, index warnings (written or cleared)
-    /// and the builder-version stamp. Called from `rebuild`'s meta txn, so
-    /// meta always describes the newest build. `pub(crate)` so the producer
-    /// test drives the exact write the pipeline runs — a fake helper cannot
-    /// execute on Windows, where the validated filename must be a real PE.
+    /// incremental): key-format stamp, index warnings (written or cleared),
+    /// reference coverage and the builder-version stamp. Called from
+    /// `rebuild`'s meta txn, so meta always describes the newest build.
+    /// `pub(crate)` so the producer test drives the exact write the pipeline
+    /// runs.
     pub(crate) fn write_rebuild_meta(
         meta_db: &Database<Str, Str>,
         wtxn: &mut heed::RwTxn,
         index_warnings: &[String],
+        refs_coverage: &str,
     ) -> Result<()> {
+        meta_db.put(wtxn, META_REFS_COVERAGE, refs_coverage)?;
         // Unconditional: has_index refuses an index whose key-format stamp is
         // absent or stale, so a key-format change forces exactly one rebuild.
         meta_db.put(wtxn, META_KEY_FORMAT, crate::constants::SCIP_KEY_FORMAT)?;
@@ -1007,8 +1032,8 @@ impl CSharpSymbolIndexer {
     /// Invoke `scip-csharp find-refs` for a single symbol and return its
     /// references plus the completeness warnings the helper reported.
     ///
-    /// This is the "lazy" half of Opt 2: called on first `find_impact` for a
-    /// symbol that has not yet been resolved. Result is cached in `scip_ref_cache`.
+    /// Called on a `scip_ref_cache` miss for a symbol the rebuild did not
+    /// precompute. Result is cached in `scip_ref_cache`.
     fn invoke_find_refs_helper(
         &self,
         helper: &Path,
@@ -1243,7 +1268,7 @@ impl CSharpSymbolIndexer {
             };
 
             // Backward compat: old full-index LMDB has reference-kind entries in
-            // scip_symbols (pre-Opt2). Treat those as cache hits — no helper call needed.
+            // scip_symbols. Treat those as cache hits — no helper call needed.
             has_legacy_refs = all_stored.iter().any(|r| r.kind != "definition");
         } // rtxn dropped here
 
@@ -1391,6 +1416,22 @@ impl CSharpSymbolIndexer {
 
         all_stored.extend(lazy_refs);
         Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect())
+    }
+
+    /// The `refs_coverage` stamp of the last rebuild; `None` when absent or
+    /// the meta is unreadable.
+    pub fn refs_coverage(&self, db_path: &Path) -> Option<String> {
+        let env = self.open_scip_env(db_path).ok()?;
+        let rtxn = env.read_txn().ok()?;
+        let meta_db: Database<Str, Str> = env
+            .open_database(&rtxn, Some(SCIP_META_DB_NAME))
+            .ok()
+            .flatten()?;
+        meta_db
+            .get(&rtxn, META_REFS_COVERAGE)
+            .ok()
+            .flatten()
+            .map(str::to_string)
     }
 
     /// Collect all symbol keys that do NOT already have cached references.
@@ -1896,7 +1937,17 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let index_data = std::fs::read(&output_path)
             .with_context(|| format!("Failed to read symbol index at {}", output_path.display()))?;
 
-        let index = scip_parse::parse_json_index(&index_data)?;
+        let scip_parse::ParsedIndex {
+            definitions: index,
+            references,
+        } = scip_parse::parse_json_index(&index_data)?;
+        // Only a full-scope run resolves references solution-wide; a filtered
+        // run's list would cache project-local answers as the whole truth.
+        let precomputed_refs = references.filter(|_| project.is_none());
+        let refs_coverage = refs_coverage_for(
+            precomputed_refs.is_some(),
+            index_warnings_stored(&index_warnings).is_empty(),
+        );
 
         // Open LMDB (all named DBs pre-created by open_scip_env)
         let env = self.open_scip_env(db_path)?;
@@ -1912,6 +1963,8 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             env.create_database(&mut wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))?;
         let ref_cache_db: Database<Str, Bytes> =
             env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
+        let ref_warnings_db: Database<Str, Bytes> =
+            env.create_database(&mut wtxn, Some(SCIP_REF_WARNINGS_DB_NAME))?;
 
         // Collect affected files (non-empty only for incremental/Files scope).
         // Declared outside the if/else so the write loop below can also reference it.
@@ -2044,8 +2097,11 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
             // symbols_db and simple_names_db are merged below, not cleared here.
         }
+        // Per-symbol warnings describe ref_cache entries, which both branches
+        // dropped; a surviving one would replay against a precomputed entry.
+        ref_warnings_db.clear(&mut wtxn)?;
 
-        // ── Write symbol entries (definitions only after Opt 2) ────
+        // ── Write symbol entries (definition occurrences) ──────────
         let mut total_defs = 0usize;
         let mut total_symbols = 0usize;
 
@@ -2112,6 +2168,34 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 .with_context(|| put_ctx(SCIP_DB_NAME, symbol_name, value_bytes.len()))?;
             total_defs += stored.len();
             total_symbols += 1;
+        }
+
+        let mut cached_refs = 0usize;
+        if let Some(refs) = &precomputed_refs {
+            let complete = refs_coverage == crate::constants::SCIP_REFS_COVERAGE_COMPLETE;
+            for symbol_name in index.keys().filter(|k| k.len() <= max_key) {
+                let stored: Vec<StoredReference> = refs
+                    .get(symbol_name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| r.kind != "definition")
+                    .map(|r| StoredReference {
+                        file: r.file.clone(),
+                        start_line: r.start_line,
+                        end_line: r.end_line,
+                        kind: r.kind.clone(),
+                    })
+                    .collect();
+                if stored.is_empty() && !complete {
+                    continue;
+                }
+                let bytes = serialize_refs(&stored)
+                    .with_context(|| format!("Failed to serialize refs for {}", symbol_name))?;
+                ref_cache_db
+                    .put(&mut wtxn, symbol_name.as_str(), &bytes)
+                    .with_context(|| put_ctx(SCIP_REF_CACHE_DB_NAME, symbol_name, bytes.len()))?;
+                cached_refs += stored.len();
+            }
         }
 
         // ── Build position index ───────────────────────────────────
@@ -2228,7 +2312,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         if let Some(sha) = super::current_git_head(repo_path) {
             meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
         }
-        Self::write_rebuild_meta(&meta_db, &mut wtxn, &index_warnings)?;
+        Self::write_rebuild_meta(&meta_db, &mut wtxn, &index_warnings, refs_coverage)?;
 
         wtxn.commit()?;
 
@@ -2237,23 +2321,26 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // silently keep answering find_refs from stale content otherwise —
         // this pool has no other tie to repo state. Evict unconditionally
         // (full or incremental): the next find_refs respawns fresh. Both
-        // branches above now also clear `ref_cache_db`, so a cache hit can
-        // never replay an answer resolved before this rebuild either.
+        // branches above also clear `ref_cache_db`, so a cache hit can only
+        // replay an answer this rebuild wrote.
         crate::symbols::resident::WORKSPACE_POOL.evict(&solution);
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
         tracing::info!(
-            "scip-csharp rebuild complete: {} symbols, {} definition entries in {}ms (incremental={})",
+            "scip-csharp rebuild complete: {} symbols, {} definition entries, {} precomputed \
+             references (coverage={}) in {}ms (incremental={})",
             total_symbols,
             total_defs,
+            cached_refs,
+            refs_coverage,
             duration_ms,
             is_incremental
         );
 
         Ok(RebuildSummary {
             symbols_indexed: total_symbols,
-            references_stored: total_defs, // definitions only; refs resolved lazily
+            references_stored: total_defs + cached_refs,
             duration_ms,
             index_warnings: index_warnings_stored(&index_warnings),
         })
@@ -2441,9 +2528,19 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     /// Same freshness check the rebuild gate applies (mod.rs: an absent or
     /// foreign builder stamp reads as stale for C#, unlike adapters that do
     /// not stamp at all — hence the override, not the trait default).
+    /// A missing `refs_coverage` stamp is stale too: such an index predates
+    /// precomputed references, and only a rebuild produces them.
     fn index_matches_builder(&self, db_path: &Path) -> bool {
         self.index_builder_version(db_path).as_deref()
             == Some(crate::constants::INDEX_BUILDER_VERSION)
+            && matches!(
+                self.refs_coverage(db_path).as_deref(),
+                Some(
+                    crate::constants::SCIP_REFS_COVERAGE_COMPLETE
+                        | crate::constants::SCIP_REFS_COVERAGE_PARTIAL
+                        | crate::constants::SCIP_REFS_COVERAGE_LAZY
+                )
+            )
     }
 
     /// Whether a SCIP index exists AND was built with the current key format.
@@ -2922,7 +3019,11 @@ mod tests {
     /// hits EOF and errors, routing the caller through the one-shot
     /// fallback); `find-refs` writes a fixed warnings-bearing JSON to its
     /// `--output` path, mirroring a helper that survived a partial failure.
-    const FAKE_HELPER_SRC: &str = r#"fn main() {
+    /// With `CS_FAKE_INDEX` set, `index` writes [`FAKE_INDEX_DOCUMENTS`] in
+    /// that flavour, plus `CS_FAKE_EXTRA_KEY` (when set) defined in
+    /// `src/Long.cs` and referenced once; with `CS_FAKE_MARKER` set, every
+    /// other subcommand except `--version` appends its name to that file first.
+    const FAKE_HELPER_SRC: &str = r##"fn main() {
     if std::env::var("CS_FAKE_HELPER_MODE").as_deref() == Ok("exit75") {
         std::process::exit(75);
     }
@@ -2938,26 +3039,83 @@ mod tests {
         std::process::exit(75);
     }
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("--version") {
+    let sub = args.get(1).map(String::as_str).unwrap_or_default();
+    if sub == "--version" {
         println!("scip-csharp 0.0.0-fake");
-        return;
-    }
-    if args.get(1).map(String::as_str) == Some("serve") {
         return;
     }
     let out = args
         .iter()
         .position(|a| a == "--output")
-        .and_then(|i| args.get(i + 1))
-        .expect("usage: find-refs ... --output <path>");
+        .and_then(|i| args.get(i + 1));
+    if sub == "index" {
+        let flavour = std::env::var("CS_FAKE_INDEX").expect("index needs CS_FAKE_INDEX");
+        let (docs, rows) = match std::env::var("CS_FAKE_EXTRA_KEY") {
+            Ok(key) => (
+                format!(
+                    r#"{}, {{"relative_path": "src/Long.cs", "occurrences": [{{"range": [2, 0, 2, 5], "symbol": "{key}", "symbol_roles": 1, "kind": "definition"}}]}}]"#,
+                    DOCS.strip_suffix(']').unwrap()
+                ),
+                format!(
+                    r#"{}, {{"symbol": "{key}", "file": "src/B.cs", "start_line": 4, "end_line": 4, "kind": "reference"}}]"#,
+                    REFS.strip_suffix(']').unwrap()
+                ),
+            ),
+            Err(_) => (DOCS.to_string(), REFS.to_string()),
+        };
+        let (version, refs) = match flavour.as_str() {
+            "2.0" => ("2.0", String::new()),
+            "2.1-null" => ("2.1", r#", "references": null"#.to_string()),
+            _ => ("2.1", format!(r#", "references": {rows}"#)),
+        };
+        if flavour == "2.1-warn" {
+            eprintln!("[WARN] Workspace error: project Broken could not be loaded");
+        }
+        let json = format!(
+            r#"{{"metadata": {{"version": "{version}", "tool_info": "fake"}}, "documents": {docs}, "external_symbols": []{refs}}}"#
+        );
+        std::fs::write(out.expect("index needs --output"), json).unwrap();
+        return;
+    }
+    if let Ok(marker) = std::env::var("CS_FAKE_MARKER") {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(marker).unwrap();
+        writeln!(f, "{sub}").unwrap();
+    }
+    if sub == "serve" {
+        return;
+    }
+    let out = out.expect("usage: find-refs ... --output <path>");
     let json = "{\"version\": \"2.0\", \"symbol\": \"csharp Ns . V#Validate().\", \"references\": [{\"file\": \"src/generated.cs\", \"start_line\": 11, \"end_line\": 11, \"kind\": \"reference\"}], \"warnings\": [\"FindReferencesAsync failed for Validate: InvalidOperationException: boom\"]}";
     std::fs::write(out, json).unwrap();
 }
-"#;
+"##;
+
+    /// `documents` of the fake `index` output: [`FAKE_REFERENCED`] and
+    /// [`FAKE_UNREFERENCED`] defined in `src/A.cs`.
+    const FAKE_INDEX_DOCUMENTS: &str = r#"[{"relative_path": "src/A.cs", "occurrences": [
+        {"range": [1, 0, 1, 5], "symbol": "csharp Ns . A#Run().", "symbol_roles": 1, "kind": "definition"},
+        {"range": [5, 0, 5, 5], "symbol": "csharp Ns . A#Idle().", "symbol_roles": 1, "kind": "definition"}]}]"#;
+
+    /// `references` of the fake 2.1 `index` output: two real references to
+    /// [`FAKE_REFERENCED`], a definition-kind row and a key with no definition
+    /// (both must be dropped).
+    const FAKE_INDEX_REFERENCES: &str = r#"[
+        {"symbol": "csharp Ns . A#Run().", "file": "src/B.cs", "start_line": 3, "end_line": 3, "kind": "reference"},
+        {"symbol": "csharp Ns . A#Run().", "file": "src/C.cs", "start_line": 7, "end_line": 8, "kind": "reference"},
+        {"symbol": "csharp Ns . A#Run().", "file": "src/A.cs", "start_line": 1, "end_line": 1, "kind": "definition"},
+        {"symbol": "csharp Ns . Gone#Away().", "file": "src/B.cs", "start_line": 9, "end_line": 9, "kind": "reference"}]"#;
+
+    const FAKE_REFERENCED: &str = "csharp Ns . A#Run().";
+    const FAKE_UNREFERENCED: &str = "csharp Ns . A#Idle().";
 
     fn build_fake_csharp_helper(dir: &Path) -> PathBuf {
         let src_path = dir.join("fake_helper.rs");
-        std::fs::write(&src_path, FAKE_HELPER_SRC).unwrap();
+        let src = format!(
+            "{FAKE_HELPER_SRC}\nconst DOCS: &str = r#\"{FAKE_INDEX_DOCUMENTS}\"#;\n\
+             const REFS: &str = r#\"{FAKE_INDEX_REFERENCES}\"#;\n"
+        );
+        std::fs::write(&src_path, src).unwrap();
         let exe_path = dir.join(if cfg!(windows) {
             "scip-csharp.exe"
         } else {
@@ -3109,7 +3267,271 @@ mod tests {
         );
     }
 
+    // ── Precomputed references: the rebuild writes scip_ref_cache ───
+
+    struct FakeIndexRun {
+        indexer: CSharpSymbolIndexer,
+        db: PathBuf,
+        marker: PathBuf,
+        summary: RebuildSummary,
+        _guard: crate::testing::EnvRestore,
+    }
+
+    /// Rebuild `dir` against the fake helper's `index` output in `flavour`,
+    /// after seeding a stale per-symbol warning for [`FAKE_REFERENCED`].
+    fn rebuild_with_fake_index(dir: &Path, flavour: &str, scope: RebuildScope) -> FakeIndexRun {
+        let db = dir.join("db");
+        std::fs::write(dir.join("FakeSolution.sln"), "").unwrap();
+        {
+            let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+            let mut wtxn = env.write_txn().unwrap();
+            store_ref_warnings(&env, &mut wtxn, FAKE_REFERENCED, &["stale".into()]).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let helper_dir = dir.join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        let marker = dir.join("non-index-calls.txt");
+        let guard = crate::testing::EnvRestore::set(&[
+            (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
+            ("CS_FAKE_INDEX", flavour),
+            ("CS_FAKE_MARKER", marker.to_string_lossy().as_ref()),
+        ]);
+        let indexer = CSharpSymbolIndexer::new();
+        let summary = indexer.rebuild(dir, &db, scope).unwrap();
+        FakeIndexRun {
+            indexer,
+            db,
+            marker,
+            summary,
+            _guard: guard,
+        }
+    }
+
+    fn ref_cache_keys(db: &Path) -> Vec<String> {
+        table_keys(db, SCIP_REF_CACHE_DB_NAME)
+    }
+
+    fn table_keys(db: &Path, table: &str) -> Vec<String> {
+        let env = crate::symbols::get_shared_scip_env(db).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let entries: Database<Str, Bytes> = env.open_database(&rtxn, Some(table)).unwrap().unwrap();
+        let mut keys: Vec<String> = entries
+            .iter(&rtxn)
+            .unwrap()
+            .map(|e| e.unwrap().0.to_string())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn located(refs: &[SymbolReference]) -> Vec<(String, u32, u32, String)> {
+        let mut out: Vec<_> = refs
+            .iter()
+            .map(|r| {
+                (
+                    r.file.to_string_lossy().replace('\\', "/"),
+                    r.start_line,
+                    r.end_line,
+                    r.kind.clone(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn loc(file: &str, start: u32, end: u32, kind: &str) -> (String, u32, u32, String) {
+        (file.to_string(), start, end, kind.to_string())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn clean_full_rebuild_answers_every_symbol_from_lmdb_without_the_helper() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let run = rebuild_with_fake_index(dir.path(), "2.1", RebuildScope::Full);
+
+        assert_eq!(
+            run.indexer.refs_coverage(&run.db).as_deref(),
+            Some(crate::constants::SCIP_REFS_COVERAGE_COMPLETE)
+        );
+        assert_eq!(
+            run.summary.references_stored, 4,
+            "2 definitions + 2 references"
+        );
+        assert_eq!(
+            ref_cache_keys(&run.db),
+            vec![FAKE_UNREFERENCED.to_string(), FAKE_REFERENCED.to_string()],
+            "one entry per definition key; the definition-less key is dropped"
+        );
+
+        let referenced = run
+            .indexer
+            .find_references_for_key(&run.db, FAKE_REFERENCED)
+            .unwrap();
+        assert_eq!(
+            located(&referenced),
+            vec![
+                loc("src/A.cs", 1, 1, "definition"),
+                loc("src/B.cs", 3, 3, "reference"),
+                loc("src/C.cs", 7, 8, "reference"),
+            ]
+        );
+        let unreferenced = run
+            .indexer
+            .find_references_for_key(&run.db, FAKE_UNREFERENCED)
+            .unwrap();
+        assert_eq!(
+            located(&unreferenced),
+            vec![loc("src/A.cs", 5, 5, "definition")]
+        );
+
+        assert!(
+            !run.marker.exists(),
+            "no helper call besides index: {:?}",
+            std::fs::read_to_string(&run.marker)
+        );
+        assert!(
+            run.indexer
+                .lookup_warnings(&run.db, FAKE_REFERENCED)
+                .is_empty(),
+            "a warning from before the rebuild must not replay against the new cache"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn full_rebuild_skips_an_oversized_precomputed_key_and_caches_the_rest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let max_key = crate::symbols::get_shared_scip_env(&dir.path().join("db"))
+            .unwrap()
+            .max_key_size();
+        let oversized = format!("csharp Ns . A#Long({}).", "x".repeat(max_key));
+        let _extra = crate::testing::EnvRestore::set(&[("CS_FAKE_EXTRA_KEY", &oversized)]);
+        let run = rebuild_with_fake_index(dir.path(), "2.1", RebuildScope::Full);
+
+        let emitted = dir.path().join("emitted.json");
+        let status = std::process::Command::new(std::env::var(HELPER_ENV_VAR).unwrap())
+            .args(["index", "--output"])
+            .arg(&emitted)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let input = scip_parse::parse_json_index(&std::fs::read(&emitted).unwrap()).unwrap();
+        assert!(input.definitions.contains_key(&oversized));
+        assert!(input
+            .references
+            .is_some_and(|refs| refs.contains_key(&oversized)));
+
+        assert_eq!(
+            run.indexer.refs_coverage(&run.db).as_deref(),
+            Some(crate::constants::SCIP_REFS_COVERAGE_COMPLETE)
+        );
+        assert_eq!(run.summary.symbols_indexed, 2);
+        assert_eq!(run.summary.references_stored, 4);
+        let normal = vec![FAKE_UNREFERENCED.to_string(), FAKE_REFERENCED.to_string()];
+        assert_eq!(ref_cache_keys(&run.db), normal);
+        assert_eq!(table_keys(&run.db, SCIP_DB_NAME), normal);
+        assert_eq!(
+            table_keys(&run.db, SCIP_POSITION_DB_NAME),
+            vec!["src/A.cs:1".to_string(), "src/A.cs:5".to_string()]
+        );
+
+        let referenced = run
+            .indexer
+            .find_references_for_key(&run.db, FAKE_REFERENCED)
+            .unwrap();
+        assert_eq!(
+            located(&referenced),
+            vec![
+                loc("src/A.cs", 1, 1, "definition"),
+                loc("src/B.cs", 3, 3, "reference"),
+                loc("src/C.cs", 7, 8, "reference"),
+            ]
+        );
+        let unreferenced = run
+            .indexer
+            .find_references_for_key(&run.db, FAKE_UNREFERENCED)
+            .unwrap();
+        assert_eq!(
+            located(&unreferenced),
+            vec![loc("src/A.cs", 5, 5, "definition")]
+        );
+        assert!(
+            !run.marker.exists(),
+            "no helper call besides index: {:?}",
+            std::fs::read_to_string(&run.marker)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn degraded_full_rebuild_caches_referenced_keys_and_leaves_the_rest_lazy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let run = rebuild_with_fake_index(dir.path(), "2.1-warn", RebuildScope::Full);
+
+        assert_eq!(
+            run.indexer.refs_coverage(&run.db).as_deref(),
+            Some(crate::constants::SCIP_REFS_COVERAGE_PARTIAL)
+        );
+        assert!(!run.indexer.index_warnings(&run.db).is_empty());
+        assert_eq!(ref_cache_keys(&run.db), vec![FAKE_REFERENCED.to_string()]);
+
+        let referenced = run
+            .indexer
+            .find_references_for_key(&run.db, FAKE_REFERENCED)
+            .unwrap();
+        assert_eq!(located(&referenced).len(), 3, "{referenced:?}");
+        assert!(
+            !run.marker.exists(),
+            "a cached key must not reach the helper"
+        );
+
+        let unreferenced = run
+            .indexer
+            .find_references_for_key(&run.db, FAKE_UNREFERENCED)
+            .unwrap();
+        let calls = std::fs::read_to_string(&run.marker).unwrap_or_default();
+        assert!(
+            calls.lines().any(|l| l == "find-refs"),
+            "an uncached key must resolve lazily, helper calls: {calls:?}"
+        );
+        assert!(
+            unreferenced
+                .iter()
+                .any(|r| r.file == Path::new("src/generated.cs")),
+            "{unreferenced:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rebuild_without_solution_wide_references_stays_lazy() {
+        for (flavour, scope) in [
+            ("2.0", RebuildScope::Full),
+            ("2.1-null", RebuildScope::Full),
+            (
+                "2.1",
+                RebuildScope::Files {
+                    changed: vec![PathBuf::from("src/A.cs")],
+                    deleted: vec![],
+                },
+            ),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let run = rebuild_with_fake_index(dir.path(), flavour, scope);
+            assert_eq!(
+                run.indexer.refs_coverage(&run.db).as_deref(),
+                Some(crate::constants::SCIP_REFS_COVERAGE_LAZY),
+                "flavour {flavour}"
+            );
+            assert!(ref_cache_keys(&run.db).is_empty(), "flavour {flavour}");
+            assert_eq!(run.summary.references_stored, 2, "flavour {flavour}");
+        }
+    }
+
     // ── Restore gate (issue #225): producer-side coverage ───────────
+
     //
     // The exit-75 mapping, the retry exhaustion and the lazy find-refs
     // pending branch, driven through the real fake-helper subprocess so

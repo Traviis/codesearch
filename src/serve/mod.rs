@@ -1536,9 +1536,7 @@ impl ServeState {
         // rebuild automatically — the version path on every binary change,
         // the degraded path once per serve process so a still-broken
         // environment cannot loop; the next serve start retries once.
-        if indexer.index_builder_version(db_path).as_deref()
-            != Some(crate::constants::INDEX_BUILDER_VERSION)
-        {
+        if !indexer.index_matches_builder(db_path) {
             return RebuildDecision::ChangedSinceLastBuild;
         }
         if !indexer.index_warnings(db_path).is_empty()
@@ -1964,8 +1962,9 @@ impl ServeState {
 
     /// Phase 3: background pre-warm of reference cache for C# repos.
     ///
-    /// After Phase 2 finishes indexing definitions, Phase 3 runs
-    /// `scip-csharp batch-find-refs` for each repo to resolve references
+    /// For each repo whose index carries no precomputed references
+    /// (`refs_coverage` lazy or absent), Phase 3 runs
+    /// `scip-csharp batch-find-refs` to resolve references
     /// for all uncached symbols in a single workspace session.
     /// This amortizes the 30-60s workspace open cost across thousands of
     /// symbols, making subsequent `find_impact` calls instant (LMDB cache hit).
@@ -2020,6 +2019,20 @@ impl ServeState {
                 .unwrap_or(false);
 
             if !applies {
+                continue;
+            }
+
+            let coverage = self.symbol_registry.get(LANG_CSHARP).and_then(|i| {
+                i.as_any()
+                    .downcast_ref::<csharp::CSharpSymbolIndexer>()
+                    .and_then(|c| c.refs_coverage(&path.join(DB_DIR_NAME)))
+            });
+            if !csharp::ref_prewarm_needed(coverage.as_deref()) {
+                info!(
+                    "phase-3: skip '{}' — references precomputed at index (coverage={})",
+                    alias,
+                    coverage.as_deref().unwrap_or_default()
+                );
                 continue;
             }
 

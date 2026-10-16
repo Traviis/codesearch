@@ -339,20 +339,47 @@ fn index_matches_builder_mirrors_the_rebuild_gate() {
         "another build's stamp must not count as this build's"
     );
 
-    // A rebuild by THIS binary: the meta write stamps the current version.
+    // This build's stamp but no reference-coverage stamp: stale.
     let env = crate::symbols::get_shared_scip_env(&db).unwrap();
     let mut wtxn = env.write_txn().unwrap();
     let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
         .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
         .unwrap()
         .unwrap();
-    super::csharp::CSharpSymbolIndexer::write_rebuild_meta(&meta_db, &mut wtxn, &[])
-        .expect("meta write must succeed");
+    meta_db
+        .put(
+            &mut wtxn,
+            SCIP_INDEX_BUILDER_VERSION_KEY,
+            INDEX_BUILDER_VERSION,
+        )
+        .unwrap();
     wtxn.commit().unwrap();
     assert!(
-        indexer.index_matches_builder(&db),
-        "a rebuild by this binary must match (stamped {INDEX_BUILDER_VERSION})"
+        !indexer.index_matches_builder(&db),
+        "an index without a refs_coverage stamp must rebuild once"
     );
+
+    // A rebuild by THIS binary: the meta write stamps version and coverage.
+    for coverage in [
+        crate::constants::SCIP_REFS_COVERAGE_COMPLETE,
+        crate::constants::SCIP_REFS_COVERAGE_PARTIAL,
+        crate::constants::SCIP_REFS_COVERAGE_LAZY,
+    ] {
+        let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
+            .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+            .unwrap()
+            .unwrap();
+        super::csharp::CSharpSymbolIndexer::write_rebuild_meta(&meta_db, &mut wtxn, &[], coverage)
+            .expect("meta write must succeed");
+        wtxn.commit().unwrap();
+        assert!(
+            indexer.index_matches_builder(&db),
+            "a rebuild by this binary must match (stamped {INDEX_BUILDER_VERSION}, {coverage})"
+        );
+        assert_eq!(indexer.refs_coverage(&db).as_deref(), Some(coverage));
+    }
 }
 
 #[test]
@@ -388,8 +415,13 @@ fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
         .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
         .unwrap()
         .unwrap();
-    super::csharp::CSharpSymbolIndexer::write_rebuild_meta(&meta_db, &mut wtxn, &[])
-        .expect("meta write must succeed");
+    super::csharp::CSharpSymbolIndexer::write_rebuild_meta(
+        &meta_db,
+        &mut wtxn,
+        &[],
+        crate::constants::SCIP_REFS_COVERAGE_LAZY,
+    )
+    .expect("meta write must succeed");
     wtxn.commit().unwrap();
 
     use crate::symbols::SymbolIndexer as _;
@@ -414,6 +446,7 @@ fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
         &meta_db,
         &mut wtxn,
         &["Broken.csproj: Msbuild failed when processing the file".to_string()],
+        crate::constants::SCIP_REFS_COVERAGE_LAZY,
     )
     .expect("meta write must succeed");
     wtxn.commit().unwrap();
@@ -528,6 +561,61 @@ fn restore_pending_flag_round_trips_through_the_trait_method() {
 }
 
 #[test]
+fn symbol_index_status_reports_restore_pending_over_a_ready_index() {
+    use super::SymbolIndexer as _;
+    use crate::constants::{
+        INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_KEY_FORMAT,
+        SCIP_KEY_FORMAT_KEY, SCIP_META_DB_NAME, SCIP_REBUILD_TIMESTAMP_KEY,
+        SCIP_REFS_COVERAGE_COMPLETE, SCIP_REFS_COVERAGE_KEY,
+    };
+
+    struct PendingFlag(PathBuf);
+    impl Drop for PendingFlag {
+        fn drop(&mut self) {
+            restore_pending_flag_clear(&self.0);
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Status.sln"), "").unwrap();
+    let db = dir.path().join("db");
+    {
+        let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+            .open_database(&wtxn, Some(SCIP_META_DB_NAME))
+            .unwrap()
+            .unwrap();
+        for (key, value) in [
+            (SCIP_REBUILD_TIMESTAMP_KEY, "0"),
+            (SCIP_KEY_FORMAT_KEY, SCIP_KEY_FORMAT),
+            (SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_COMPLETE),
+        ] {
+            meta.put(&mut wtxn, key, value).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+    assert!(super::csharp::CSharpSymbolIndexer::new().index_matches_builder(&db));
+
+    let registry = super::SymbolIndexerRegistry::new();
+    let csharp_state = || {
+        super::symbol_index_status(&registry, dir.path(), &db)
+            .into_iter()
+            .find(|s| s.language == "csharp")
+            .expect("csharp status entry")
+            .state
+    };
+
+    let flag = PendingFlag(db.clone());
+    restore_pending_flag_set(&db);
+    assert_eq!(csharp_state(), "restore-pending");
+
+    drop(flag);
+    assert_eq!(csharp_state(), "ready");
+}
+
+#[test]
 fn helper_restore_pending_exit_matches_csharp_exit_codes() {
     // A drifted exit code would demote restore-pending to a generic helper failure.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/helpers/csharp/RestoreGate.cs");
@@ -589,4 +677,45 @@ fn shutdown_kills_registered_helper_children() {
         !status.success(),
         "a killed helper child must not report success (pid {pid})"
     );
+}
+
+#[test]
+fn refs_coverage_follows_precompute_and_index_warnings() {
+    use super::csharp::refs_coverage_for;
+    use crate::constants::{
+        SCIP_REFS_COVERAGE_COMPLETE, SCIP_REFS_COVERAGE_LAZY, SCIP_REFS_COVERAGE_PARTIAL,
+    };
+    for (precomputed, clean, expected) in [
+        (true, true, SCIP_REFS_COVERAGE_COMPLETE),
+        (true, false, SCIP_REFS_COVERAGE_PARTIAL),
+        (false, true, SCIP_REFS_COVERAGE_LAZY),
+        (false, false, SCIP_REFS_COVERAGE_LAZY),
+    ] {
+        assert_eq!(
+            refs_coverage_for(precomputed, clean),
+            expected,
+            "precomputed={precomputed} clean={clean}"
+        );
+    }
+}
+
+#[test]
+fn ref_prewarm_runs_only_without_precomputed_references() {
+    use super::csharp::ref_prewarm_needed;
+    use crate::constants::{
+        SCIP_REFS_COVERAGE_COMPLETE, SCIP_REFS_COVERAGE_LAZY, SCIP_REFS_COVERAGE_PARTIAL,
+    };
+    for (coverage, needed) in [
+        (Some(SCIP_REFS_COVERAGE_COMPLETE), false),
+        (Some(SCIP_REFS_COVERAGE_PARTIAL), false),
+        (Some(SCIP_REFS_COVERAGE_LAZY), true),
+        (None, true),
+        (Some("unknown"), true),
+    ] {
+        assert_eq!(
+            ref_prewarm_needed(coverage),
+            needed,
+            "coverage={coverage:?}"
+        );
+    }
 }
