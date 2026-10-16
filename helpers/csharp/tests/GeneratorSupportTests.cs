@@ -1,5 +1,3 @@
-using System.Diagnostics;
-using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
 using Xunit;
@@ -16,68 +14,15 @@ namespace ScipCsharp.Tests;
 [Collection("msbuild-workspace")]
 public class GeneratorSupportTests
 {
-    private static readonly object RegistrationLock = new();
-    private static bool _msbuildRegistered;
-
-    private static MSBuildWorkspace CreateWorkspace()
-    {
-        lock (RegistrationLock)
-        {
-            if (!_msbuildRegistered)
-            {
-                var instances = MSBuildLocator.QueryVisualStudioInstances().ToList();
-                var sdk = instances.FirstOrDefault(i => i.DiscoveryType == DiscoveryType.DotNetSdk)
-                          ?? instances.OrderByDescending(i => i.Version).First();
-                MSBuildLocator.RegisterInstance(sdk);
-                Environment.SetEnvironmentVariable("MSBUILD_EXE_PATH", sdk.MSBuildPath);
-                _msbuildRegistered = true;
-            }
-        }
-
-        return MSBuildWorkspace.Create(WorkspaceLoad.GlobalProperties());
-    }
-
     private static async Task<(Project Project, MSBuildWorkspace Workspace)> OpenFixtureAsync()
     {
-        var projectPath = Path.Combine(AppContext.BaseDirectory, "Fixtures", "BlazorLib", "BlazorLib.csproj");
+        var projectPath = MsbuildTestWorkspace.FixturePath("BlazorLib", "BlazorLib.csproj");
         Assert.True(File.Exists(projectPath), $"fixture not copied to test output: {projectPath}");
-        await RestoreFixtureIfNeededAsync(projectPath);
+        await MsbuildTestWorkspace.RestoreIfNeededAsync(projectPath);
 
-        var workspace = CreateWorkspace();
-        // Design-time builds emit benign MSBuild warnings; surface, don't fail.
-        workspace.WorkspaceFailed += (_, e) =>
-            Console.Error.WriteLine($"[INFO] test workspace: {e.Diagnostic.Message}");
+        var workspace = MsbuildTestWorkspace.Create();
         var project = await workspace.OpenProjectAsync(projectPath);
         return (project, workspace);
-    }
-
-    private static async Task RestoreFixtureIfNeededAsync(string projectPath)
-    {
-        var assets = Path.Combine(Path.GetDirectoryName(projectPath)!, "obj", "project.assets.json");
-        if (File.Exists(assets))
-            return;
-
-        var psi = new ProcessStartInfo("dotnet", $"restore \"{projectPath}\"")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        using var process = Process.Start(psi)!;
-        var stderrTask = process.StandardError.ReadToEndAsync();
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        if (!process.WaitForExit(180_000))
-        {
-            process.Kill(entireProcessTree: true);
-            throw new InvalidOperationException($"dotnet restore timed out for {projectPath}");
-        }
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException(
-                $"dotnet restore failed for {projectPath}:\n{await stderrTask}");
-        }
-        _ = await stdoutTask;
     }
 
     [Fact]

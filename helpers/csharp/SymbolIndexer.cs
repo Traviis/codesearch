@@ -4,9 +4,11 @@ using Microsoft.CodeAnalysis.MSBuild;
 namespace ScipCsharp;
 
 /// <summary>
-/// Walks Roslyn compilation symbols and produces a ScipIndex with only definition
-/// occurrences (no references). References are resolved lazily at find_impact time
-/// by the `find-refs` subcommand, giving 10–50× faster rebuild on large solutions.
+/// Walks Roslyn compilation symbols and produces a ScipIndex: definition
+/// occurrences per document plus, on a full run, every reference to those
+/// definitions, collected in one pass over all documents
+/// (<see cref="ReferencePass"/>) instead of one FindReferencesAsync per symbol.
+/// A `--filter-project` run emits definitions only (References is null).
 /// </summary>
 public sealed class SymbolIndexer
 {
@@ -43,6 +45,10 @@ public sealed class SymbolIndexer
         // vs the full-rebuild paths ("src/ExampleProject.Dam/Caches/ICache.cs"),
         // causing duplicate definitions in find_impact results.
         var projectRoot = FindCommonRoot(solution.Projects.Select(p => p.FilePath).Where(p => p != null).Cast<string>());
+        var referencePass = string.IsNullOrEmpty(projectFilter)
+            ? new ReferencePass(projectRoot, solution.Projects.Select(p => p.AssemblyName))
+            : null;
+        var referencesSw = new System.Diagnostics.Stopwatch();
 
         // Materialize project list once so we can log progress (i / total).
         var projectList = projects as IReadOnlyList<Project> ?? projects.ToList();
@@ -94,6 +100,17 @@ public sealed class SymbolIndexer
             CollectSymbols(compilation.GlobalNamespace, symbolMap);
             Console.Error.WriteLine(
                 $"  [{i + 1}/{totalProjects}] Compiled {project.Name} in {StageTiming.Seconds(projectSw.Elapsed)}");
+
+            // Runs here so the compilation is reused while alive; only key
+            // strings and positions outlive the iteration.
+            if (referencePass is not null)
+            {
+                compileSw.Stop();
+                referencesSw.Start();
+                await referencePass.CollectAsync(compilation).ConfigureAwait(false);
+                referencesSw.Stop();
+                compileSw.Start();
+            }
         }
         compileSw.Stop();
         foreach (var (_, line) in erroringProjects.OrderByDescending(e => e.Count))
@@ -105,10 +122,8 @@ public sealed class SymbolIndexer
 
         var definitionsSw = System.Diagnostics.Stopwatch.StartNew();
 
-        // Walk symbols and emit definition occurrences only.
-        // References are intentionally omitted here; they are resolved lazily
-        // on first `find_impact` call via `scip-csharp find-refs` and then
-        // cached in LMDB so subsequent calls are instant.
+        // Documents carry definition occurrences only; references go to
+        // index.References, never into Documents[].Occurrences.
         var occurrenceMap = new Dictionary<string, List<ScipOccurrence>>();
 
         foreach (var (symbol, scipName) in symbolMap)
@@ -160,6 +175,16 @@ public sealed class SymbolIndexer
         }
 
         StageTiming.Log("definitions", definitionsSw.Elapsed);
+
+        if (referencePass is not null)
+        {
+            referencesSw.Start();
+            index.References = referencePass.Build(symbolMap);
+            referencesSw.Stop();
+            Console.Error.WriteLine(
+                $"Reference pass: {index.References.Count} reference(s) across {referencePass.FileCount} file(s)");
+            StageTiming.Log("references", referencesSw.Elapsed);
+        }
         return index;
     }
 
@@ -295,7 +320,7 @@ public sealed class SymbolIndexer
     /// (Foo`1 vs Foo, M`1 vs M), nested types carry their full containing-type
     /// chain (Outer1.Inner vs Outer2.Inner) and parameter types are fully
     /// qualified (A.P vs B.P). Any change here must bump the index version
-    /// (ScipModels "2.0") and SCIP_KEY_FORMAT so old indexes rebuild.
+    /// (ScipMetadata.Version) and SCIP_KEY_FORMAT so old indexes rebuild.
     /// </summary>
     internal static string SymbolToScipName(ISymbol symbol)
     {

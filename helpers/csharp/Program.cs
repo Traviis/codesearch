@@ -237,6 +237,9 @@ public static class Program
         Console.Error.WriteLine($"  Documents: {index.Documents.Count}");
         Console.Error.WriteLine($"  Occurrences: {index.Documents.Sum(d => d.Occurrences.Count)}");
         Console.Error.WriteLine($"  Symbols: {index.ExternalSymbols.Count}");
+        Console.Error.WriteLine(index.References is null
+            ? "  References: skipped (--filter-project)"
+            : $"  References: {index.References.Count}");
 
         StageTiming.Log("total", totalSw.Elapsed);
         return 0;
