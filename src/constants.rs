@@ -1014,6 +1014,11 @@ pub const ALWAYS_SKIP_FILENAME_SUFFIXES: &[&str] = &[
     // Generated GraphQL
     ".generated.ts",
     ".generated.graphql",
+    // Generated C# (Razor gen, WPF/WinForms designers, source generators).
+    // The watch-layer comment historically claimed .designer.cs was skipped;
+    // it never was until now.
+    ".g.cs",
+    ".designer.cs",
     // Snapshot test output
     ".snap",
     // Editor swap / backup
@@ -1043,6 +1048,12 @@ pub const ALWAYS_EXCLUDED: &[&str] = &[
     "dist",
     "build",
     "out",
+    // .NET build output — always generated (project.assets.json, generated
+    // sources like *_razor.g.cs). Excluded by NAME so a repo whose
+    // .gitignore misses obj/ still cannot leak generated code into the
+    // index. `bin` is deliberately NOT here: several ecosystems keep real
+    // scripts in a bin/ directory.
+    "obj",
     // Python
     "__pycache__",
     ".pytest_cache",
@@ -1211,5 +1222,29 @@ mod tests {
             repos_path,
             "CODESEARCH_REPOS_CONFIG must win over CODESEARCH_HOME"
         );
+    }
+
+    /// Razor markup must ride the text fallback (Html variant), never the
+    /// C# parser, and generated C# must not leak into the index — the
+    /// *_razor.g.cs coverage that once made component refs findable was an
+    /// accident of obj/ not being excluded, not a feature.
+    #[test]
+    fn razor_indexable_and_generated_csharp_excluded() {
+        assert!(ALWAYS_EXCLUDED.contains(&"obj"));
+        assert!(!ALWAYS_EXCLUDED.contains(&"bin"));
+
+        for name in ["Counter.razor.g.cs", "Index.cshtml.g.cs", "Foo.designer.cs"] {
+            let lower = name.to_ascii_lowercase();
+            assert!(
+                ALWAYS_SKIP_FILENAME_SUFFIXES
+                    .iter()
+                    .any(|s| lower.ends_with(s)),
+                "{name} must be skipped as generated"
+            );
+        }
+        // Real source must not match the suffix patterns.
+        assert!(!ALWAYS_SKIP_FILENAME_SUFFIXES
+            .iter()
+            .any(|s| "program.cs".ends_with(s)));
     }
 }
