@@ -44,6 +44,7 @@
     <Compile Include="..\GeneratorSupport.cs" Link="GeneratorSupport.cs" />
     <Compile Include="..\WorkspaceLoad.cs" Link="WorkspaceLoad.cs" />
     <Compile Include="..\WorkspaceNoise.cs" Link="WorkspaceNoise.cs" />
+    <Compile Include="..\StageTiming.cs" Link="StageTiming.cs" />
     <Compile Include="..\ReferenceResolver.cs" Link="ReferenceResolver.cs" />
     <Compile Include="..\RestorePolicy.cs" Link="RestorePolicy.cs" />
     <Compile Include="..\RestoreGate.cs" Link="RestoreGate.cs" />

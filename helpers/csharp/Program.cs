@@ -164,13 +164,17 @@ public static class Program
 
     private static async Task<int> RunIndexAsync(string[] args)
     {
+        var totalSw = Stopwatch.StartNew();
         var parsed = ParseIndexArgs(args);
         if (parsed is null) return 1;
 
+        var stageSw = Stopwatch.StartNew();
         if (!TryRegisterMsBuild(parsed.Value.SolutionPath, out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
+        StageTiming.Log("msbuild_register", stageSw.Elapsed);
 
         using var workspace = CreateTolerantWorkspace();
 
+        stageSw.Restart();
         try
         {
             if (!string.IsNullOrEmpty(parsed.Value.SolutionPath))
@@ -217,17 +221,24 @@ public static class Program
                 return 1;
             }
         }
+        finally
+        {
+            StageTiming.Log("workspace_open", stageSw.Elapsed);
+        }
 
         var indexer = new SymbolIndexer();
         var index = await indexer.IndexAsync(workspace, parsed.Value.ProjectFilter).ConfigureAwait(false);
 
+        stageSw.Restart();
         await OutputWriter.WriteAsync(index, parsed.Value.OutputPath).ConfigureAwait(false);
+        StageTiming.Log("write_output", stageSw.Elapsed);
 
         Console.Error.WriteLine($"Index written to: {parsed.Value.OutputPath}");
         Console.Error.WriteLine($"  Documents: {index.Documents.Count}");
         Console.Error.WriteLine($"  Occurrences: {index.Documents.Sum(d => d.Occurrences.Count)}");
         Console.Error.WriteLine($"  Symbols: {index.ExternalSymbols.Count}");
 
+        StageTiming.Log("total", totalSw.Elapsed);
         return 0;
     }
 

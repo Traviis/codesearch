@@ -58,6 +58,7 @@ public sealed class SymbolIndexer
         {
             var project = projectList[i];
             Console.Error.WriteLine($"  [{i + 1}/{totalProjects}] Compiling: {project.Name}");
+            var projectSw = System.Diagnostics.Stopwatch.StartNew();
             var (compilation, _) =
                 await GeneratorSupport.GetCompilationWithGeneratorsAsync(project).ConfigureAwait(false);
             if (compilation is null)
@@ -91,14 +92,18 @@ public sealed class SymbolIndexer
             }
 
             CollectSymbols(compilation.GlobalNamespace, symbolMap);
+            Console.Error.WriteLine(
+                $"  [{i + 1}/{totalProjects}] Compiled {project.Name} in {StageTiming.Seconds(projectSw.Elapsed)}");
         }
         compileSw.Stop();
         foreach (var (_, line) in erroringProjects.OrderByDescending(e => e.Count))
         {
             Console.Error.WriteLine(line);
         }
-        Console.Error.WriteLine($"Compiled {totalProjects} project(s) in {compileSw.Elapsed.TotalSeconds:F1}s");
+        StageTiming.Log("compile", compileSw.Elapsed);
         Console.Error.WriteLine($"Collected {symbolMap.Count} project-internal symbols — building definition index...");
+
+        var definitionsSw = System.Diagnostics.Stopwatch.StartNew();
 
         // Walk symbols and emit definition occurrences only.
         // References are intentionally omitted here; they are resolved lazily
@@ -154,6 +159,7 @@ public sealed class SymbolIndexer
             });
         }
 
+        StageTiming.Log("definitions", definitionsSw.Elapsed);
         return index;
     }
 
