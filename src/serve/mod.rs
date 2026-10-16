@@ -714,6 +714,13 @@ impl ServeState {
             .is_none()
     }
 
+    /// The latest precomputed status snapshot, or `None` before the first
+    /// background pass completes. Read endpoints answer from this — never
+    /// by measuring inline (the /status timeout fix).
+    pub(crate) fn latest_status_snapshot(&self) -> Option<Arc<status_snapshot::StatusSnapshot>> {
+        self.status_snapshot.get()
+    }
+
     /// Return the instant when serve started, used to compute uptime.
     pub(crate) fn started_at(&self) -> std::time::Instant {
         self.started_at

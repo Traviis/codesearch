@@ -78,7 +78,32 @@ impl CodesearchService {
                 // Count the virtual "all" group when repos are registered, so the
                 // summary doesn't read "0 group(s)" while `all` is actually available.
                 let group_count = config.groups.len() + if config.repos.is_empty() { 0 } else { 1 };
-                let statuses = serve_state.repo_statuses_lightweight();
+                // From the background snapshot, never an inline measure: under a
+                // rebuild wave the snapshot task is the ONLY thing allowed to
+                // touch the filesystem (the GET /status timeout fix) — and this
+                // tool must always answer too. Pre-first-pass answers "starting".
+                let Some(snap) = serve_state.latest_status_snapshot() else {
+                    let response = IndexStatusResponse {
+                        indexed: repo_count > 0,
+                        status: "starting".to_string(),
+                        status_message:
+                            "serve is computing its first status snapshot; retry in a few seconds"
+                                .to_string(),
+                        total_chunks: 0,
+                        total_files: 0,
+                        model: self.model_type.short_name().to_string(),
+                        dimensions: 0,
+                        max_chunk_id: 0,
+                        db_path: format!("({} repos)", repo_count),
+                        project_path: format!("serve mode — {} repo(s)", repo_count),
+                        error_message: None,
+                        mode: self.mcp_mode(),
+                    };
+                    let json =
+                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
+                };
+                let statuses = &snap.repos;
                 let open_count = statuses
                     .iter()
                     .filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Open))
