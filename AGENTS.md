@@ -265,4 +265,4 @@ Older entries: see `CHANGELOG.md`.
 Razor (.razor/.cshtml) doorzoekbaar maken (todo #254): mapping naar de Html-variant in Language::from_extension - Html heeft geen extractor, dus rides de text-fallback chunker; watcher/indexer-gate volgen via is_indexable(). Daarnaast bewust: ALWAYS_EXCLUDED + "obj" (.NET build-output, dekt het *_razor.g.cs-lek), ALWAYS_SKIP_FILENAME_SUFFIXES + ".g.cs"/".designer.cs" (watch-comment beweerde dat al, lijst niet). bin bewust NIET geexcluded (echte scripts in andere ecosystemen).
 
 1. [x] Stage 1: mapping + exclusies + unit tests (detection + membership)
-2. [ ] Stage 2: CHANGELOG + highlights + full validation
+2. [x] Stage 2: CHANGELOG + highlights + full validation
