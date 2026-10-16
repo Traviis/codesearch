@@ -21,6 +21,14 @@ use super::{RepoStatusInfo, ServeState};
 /// One computed status pass. Cheap to clone (handlers get an `Arc`).
 pub(crate) struct StatusSnapshot {
     pub(crate) repos: Vec<(String, RepoStatusInfo)>,
+    /// Precomputed per-repo project-list payload (metadata reads, store
+    /// stats via try_read, lock probes) — list_projects answers from this
+    /// for the same reason /status does: the request path never measures.
+    pub(crate) projects: Vec<crate::mcp::types::RepoInfo>,
+    /// Warnings captured while computing `projects` (per-repo stats
+    /// failures). Re-emitted verbatim on each projects answer so a repo
+    /// that failed to report stays visible.
+    pub(crate) projects_warnings: Vec<String>,
     pub(crate) active_sessions: u64,
     pub(crate) cpu_percent: String,
     pub(crate) csharp_helper: bool,

@@ -3855,8 +3855,13 @@ impl ServeState {
             .map(|i| i.is_available())
             .unwrap_or(false);
 
+        let (snapshot_projects, snapshot_projects_warnings) =
+            crate::mcp::compute_projects_snapshot(self);
+
         status_snapshot::StatusSnapshot {
             repos,
+            projects: snapshot_projects,
+            projects_warnings: snapshot_projects_warnings,
             active_sessions,
             cpu_percent: cpu,
             csharp_helper,
