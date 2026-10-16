@@ -561,6 +561,61 @@ fn restore_pending_flag_round_trips_through_the_trait_method() {
 }
 
 #[test]
+fn symbol_index_status_reports_restore_pending_over_a_ready_index() {
+    use super::SymbolIndexer as _;
+    use crate::constants::{
+        INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_KEY_FORMAT,
+        SCIP_KEY_FORMAT_KEY, SCIP_META_DB_NAME, SCIP_REBUILD_TIMESTAMP_KEY,
+        SCIP_REFS_COVERAGE_COMPLETE, SCIP_REFS_COVERAGE_KEY,
+    };
+
+    struct PendingFlag(PathBuf);
+    impl Drop for PendingFlag {
+        fn drop(&mut self) {
+            restore_pending_flag_clear(&self.0);
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Status.sln"), "").unwrap();
+    let db = dir.path().join("db");
+    {
+        let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+            .open_database(&wtxn, Some(SCIP_META_DB_NAME))
+            .unwrap()
+            .unwrap();
+        for (key, value) in [
+            (SCIP_REBUILD_TIMESTAMP_KEY, "0"),
+            (SCIP_KEY_FORMAT_KEY, SCIP_KEY_FORMAT),
+            (SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_COMPLETE),
+        ] {
+            meta.put(&mut wtxn, key, value).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+    assert!(super::csharp::CSharpSymbolIndexer::new().index_matches_builder(&db));
+
+    let registry = super::SymbolIndexerRegistry::new();
+    let csharp_state = || {
+        super::symbol_index_status(&registry, dir.path(), &db)
+            .into_iter()
+            .find(|s| s.language == "csharp")
+            .expect("csharp status entry")
+            .state
+    };
+
+    let flag = PendingFlag(db.clone());
+    restore_pending_flag_set(&db);
+    assert_eq!(csharp_state(), "restore-pending");
+
+    drop(flag);
+    assert_eq!(csharp_state(), "ready");
+}
+
+#[test]
 fn helper_restore_pending_exit_matches_csharp_exit_codes() {
     // A drifted exit code would demote restore-pending to a generic helper failure.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/helpers/csharp/RestoreGate.cs");

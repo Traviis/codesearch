@@ -3020,8 +3020,9 @@ mod tests {
     /// fallback); `find-refs` writes a fixed warnings-bearing JSON to its
     /// `--output` path, mirroring a helper that survived a partial failure.
     /// With `CS_FAKE_INDEX` set, `index` writes [`FAKE_INDEX_DOCUMENTS`] in
-    /// that flavour; with `CS_FAKE_MARKER` set, every other subcommand except
-    /// `--version` appends its name to that file first.
+    /// that flavour, plus `CS_FAKE_EXTRA_KEY` (when set) defined in
+    /// `src/Long.cs` and referenced once; with `CS_FAKE_MARKER` set, every
+    /// other subcommand except `--version` appends its name to that file first.
     const FAKE_HELPER_SRC: &str = r##"fn main() {
     if std::env::var("CS_FAKE_HELPER_MODE").as_deref() == Ok("exit75") {
         std::process::exit(75);
@@ -3049,16 +3050,29 @@ mod tests {
         .and_then(|i| args.get(i + 1));
     if sub == "index" {
         let flavour = std::env::var("CS_FAKE_INDEX").expect("index needs CS_FAKE_INDEX");
+        let (docs, rows) = match std::env::var("CS_FAKE_EXTRA_KEY") {
+            Ok(key) => (
+                format!(
+                    r#"{}, {{"relative_path": "src/Long.cs", "occurrences": [{{"range": [2, 0, 2, 5], "symbol": "{key}", "symbol_roles": 1, "kind": "definition"}}]}}]"#,
+                    DOCS.strip_suffix(']').unwrap()
+                ),
+                format!(
+                    r#"{}, {{"symbol": "{key}", "file": "src/B.cs", "start_line": 4, "end_line": 4, "kind": "reference"}}]"#,
+                    REFS.strip_suffix(']').unwrap()
+                ),
+            ),
+            Err(_) => (DOCS.to_string(), REFS.to_string()),
+        };
         let (version, refs) = match flavour.as_str() {
             "2.0" => ("2.0", String::new()),
             "2.1-null" => ("2.1", r#", "references": null"#.to_string()),
-            _ => ("2.1", format!(r#", "references": {REFS}"#)),
+            _ => ("2.1", format!(r#", "references": {rows}"#)),
         };
         if flavour == "2.1-warn" {
             eprintln!("[WARN] Workspace error: project Broken could not be loaded");
         }
         let json = format!(
-            r#"{{"metadata": {{"version": "{version}", "tool_info": "fake"}}, "documents": {DOCS}, "external_symbols": []{refs}}}"#
+            r#"{{"metadata": {{"version": "{version}", "tool_info": "fake"}}, "documents": {docs}, "external_symbols": []{refs}}}"#
         );
         std::fs::write(out.expect("index needs --output"), json).unwrap();
         return;
@@ -3295,13 +3309,14 @@ mod tests {
     }
 
     fn ref_cache_keys(db: &Path) -> Vec<String> {
+        table_keys(db, SCIP_REF_CACHE_DB_NAME)
+    }
+
+    fn table_keys(db: &Path, table: &str) -> Vec<String> {
         let env = crate::symbols::get_shared_scip_env(db).unwrap();
         let rtxn = env.read_txn().unwrap();
-        let cache: Database<Str, Bytes> = env
-            .open_database(&rtxn, Some(SCIP_REF_CACHE_DB_NAME))
-            .unwrap()
-            .unwrap();
-        let mut keys: Vec<String> = cache
+        let entries: Database<Str, Bytes> = env.open_database(&rtxn, Some(table)).unwrap().unwrap();
+        let mut keys: Vec<String> = entries
             .iter(&rtxn)
             .unwrap()
             .map(|e| e.unwrap().0.to_string())
@@ -3381,6 +3396,71 @@ mod tests {
                 .lookup_warnings(&run.db, FAKE_REFERENCED)
                 .is_empty(),
             "a warning from before the rebuild must not replay against the new cache"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn full_rebuild_skips_an_oversized_precomputed_key_and_caches_the_rest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let max_key = crate::symbols::get_shared_scip_env(&dir.path().join("db"))
+            .unwrap()
+            .max_key_size();
+        let oversized = format!("csharp Ns . A#Long({}).", "x".repeat(max_key));
+        let _extra = crate::testing::EnvRestore::set(&[("CS_FAKE_EXTRA_KEY", &oversized)]);
+        let run = rebuild_with_fake_index(dir.path(), "2.1", RebuildScope::Full);
+
+        let emitted = dir.path().join("emitted.json");
+        let status = std::process::Command::new(std::env::var(HELPER_ENV_VAR).unwrap())
+            .args(["index", "--output"])
+            .arg(&emitted)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let input = scip_parse::parse_json_index(&std::fs::read(&emitted).unwrap()).unwrap();
+        assert!(input.definitions.contains_key(&oversized));
+        assert!(input
+            .references
+            .is_some_and(|refs| refs.contains_key(&oversized)));
+
+        assert_eq!(
+            run.indexer.refs_coverage(&run.db).as_deref(),
+            Some(crate::constants::SCIP_REFS_COVERAGE_COMPLETE)
+        );
+        assert_eq!(run.summary.symbols_indexed, 2);
+        assert_eq!(run.summary.references_stored, 4);
+        let normal = vec![FAKE_UNREFERENCED.to_string(), FAKE_REFERENCED.to_string()];
+        assert_eq!(ref_cache_keys(&run.db), normal);
+        assert_eq!(table_keys(&run.db, SCIP_DB_NAME), normal);
+        assert_eq!(
+            table_keys(&run.db, SCIP_POSITION_DB_NAME),
+            vec!["src/A.cs:1".to_string(), "src/A.cs:5".to_string()]
+        );
+
+        let referenced = run
+            .indexer
+            .find_references_for_key(&run.db, FAKE_REFERENCED)
+            .unwrap();
+        assert_eq!(
+            located(&referenced),
+            vec![
+                loc("src/A.cs", 1, 1, "definition"),
+                loc("src/B.cs", 3, 3, "reference"),
+                loc("src/C.cs", 7, 8, "reference"),
+            ]
+        );
+        let unreferenced = run
+            .indexer
+            .find_references_for_key(&run.db, FAKE_UNREFERENCED)
+            .unwrap();
+        assert_eq!(
+            located(&unreferenced),
+            vec![loc("src/A.cs", 5, 5, "definition")]
+        );
+        assert!(
+            !run.marker.exists(),
+            "no helper call besides index: {:?}",
+            std::fs::read_to_string(&run.marker)
         );
     }
 
