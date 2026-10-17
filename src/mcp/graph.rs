@@ -453,7 +453,7 @@ impl CodesearchService {
 
                         out.push(DependentItem {
                             path: ctx.prefix_sourced_path(&f.alias, &chunk.path),
-                            line: chunk.start_line + 1,
+                            line: chunk.start_line,
                             import_statement,
                         });
                     }
@@ -509,7 +509,7 @@ impl CodesearchService {
 
                                 out.push(DependentItem {
                                     path: chunk.path,
-                                    line: chunk.start_line + 1,
+                                    line: chunk.start_line,
                                     import_statement,
                                 });
 
@@ -669,8 +669,8 @@ impl CodesearchService {
                                 all_results.push(SearchResultItem {
                                     chunk_id: Some(r.id),
                                     path: ctx.prefix_sourced_path(alias, &r.path),
-                                    start_line: r.start_line + 1,
-                                    end_line: r.end_line + 1,
+                                    start_line: r.start_line,
+                                    end_line: r.end_line,
                                     kind: r.kind,
                                     score: r.score,
                                     signature: r.signature,
@@ -726,8 +726,8 @@ impl CodesearchService {
                             .map(|r| SearchResultItem {
                                 chunk_id: Some(r.id),
                                 path: r.path,
-                                start_line: r.start_line + 1,
-                                end_line: r.end_line + 1,
+                                start_line: r.start_line,
+                                end_line: r.end_line,
                                 kind: r.kind,
                                 score: r.score,
                                 signature: r.signature,

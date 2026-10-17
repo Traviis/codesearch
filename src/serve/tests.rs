@@ -5287,7 +5287,7 @@ async fn seed_collision_repo(
     {
         let mut vs = stores.vector_store.write().await;
         let mut chunk =
-            crate::chunker::Chunk::new(content.to_string(), 0, 4, kind, rel_path.to_string());
+            crate::chunker::Chunk::new(content.to_string(), 1, 4, kind, rel_path.to_string());
         chunk.signature = signature.map(str::to_string);
         vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
             chunk,
@@ -5415,7 +5415,7 @@ async fn group_find_definition_attributes_hit_to_origin_repo_on_id_collision() {
     assert_eq!(items[0]["kind"], "Interface", "got: {text}");
     assert_eq!(
         items[0]["line"], 1,
-        "responses must emit 1-based editor lines (chunk starts at 0-based line 0): {text}"
+        "responses must emit 1-based editor lines (the interface sits on editor line 1): {text}"
     );
 }
 
@@ -5444,7 +5444,8 @@ async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
     .unwrap();
 
     // Repo A: five filler chunks (ids 0..=4) then the target at id 5,
-    // spanning 0-based lines [2, 4] of the file above.
+    // spanning editor lines [3, 5] of the file above (chunk lines are
+    // 1-based — the same convention the real chunker emits).
     let db_a = root_a.join(DB_DIR_NAME);
     std::fs::create_dir_all(&db_a).unwrap();
     std::fs::write(
@@ -5470,8 +5471,8 @@ async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
         }
         let mut target = crate::chunker::Chunk::new(
             "TARGET LINE THREE\nTARGET LINE FOUR\nTARGET LINE FIVE".to_string(),
-            2,
-            4,
+            3,
+            5,
             crate::chunker::ChunkKind::Function,
             "src/service/TargetService.java".to_string(),
         );
@@ -5550,13 +5551,121 @@ async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
         "context above must come from the owning repo's real file: {text}"
     );
     assert_eq!(
-        parsed["context_after"], "TARGET LINE FIVE\nline six",
+        parsed["context_after"], "line six\nline seven",
         "context below must come from the owning repo's real file: {text}"
     );
     assert!(
         parsed.get("note").is_none(),
         "the context read resolved — no fallback note expected, got: {text}"
     );
+}
+
+/// End-to-end line-convention tie: a chunk produced by the REAL chunker
+/// (1-based editor lines) must come back through get_chunk with that same
+/// line — no emit boundary may re-convert it. The PR #308 merge paired
+/// develop's 1-based chunker with the PR's +1 emits and every response
+/// reported line N as N+1; the two green-but-contradictory halves (the
+/// chunker's own test vs response fixtures hand-building 0-based chunks)
+/// could not see it. This test ties producer to emitter so they cannot
+/// drift apart again.
+#[tokio::test]
+async fn get_chunk_reports_the_real_chunker_editor_line_unchanged() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("solo");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = "// line one\n// line two\nfn target_fn() {\n    let _ = 1;\n}\n";
+    std::fs::write(root.join("lib.rs"), source).unwrap();
+
+    // Real chunker: whatever editor line it says the fn starts on is the
+    // truth the response must repeat (its 1-based-ness is pinned by the
+    // chunker's own tests).
+    let mut chunker = crate::chunker::SemanticChunker::new(100, 4000, 2);
+    let chunks = chunker
+        .chunk_semantic(
+            crate::file::Language::Rust,
+            std::path::Path::new("lib.rs"),
+            source,
+        )
+        .expect("real chunker must parse the source");
+    let target = chunks
+        .iter()
+        .find(|c| c.content.contains("fn target_fn"))
+        .expect("the fn must be chunked");
+    let true_line = target.start_line;
+    let source_lines: Vec<&str> = source.lines().collect();
+    let expected_before = if true_line >= 2 {
+        Some(source_lines[true_line - 2])
+    } else {
+        None
+    };
+
+    // Store it exactly as the indexer would.
+    let db_path = root.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            target.clone(),
+            vec![0.5, 0.5],
+        )])
+        .expect("insert chunk");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(
+            0,
+            &target.content,
+            &target.path,
+            target.signature.as_deref(),
+            &format!("{:?}", target.kind),
+        )
+        .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root.clone(), Some("solo".to_string()))
+        .unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 0,
+        chunk_ref: None,
+        context_lines: Some(1),
+        project: None,
+        group: None,
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("get_chunk must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert_eq!(
+        parsed["start_line"], true_line,
+        "the emitted line must equal the chunker's 1-based editor line, got: {text}"
+    );
+    if let Some(expected_before) = expected_before {
+        assert_eq!(
+            parsed["context_before"], expected_before,
+            "context_before must be the editor line above the chunk, got: {text}"
+        );
+    }
 }
 
 // ═══ Interactive fan-outs skip busy stores instead of queueing behind the
