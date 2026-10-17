@@ -38,6 +38,10 @@ pub struct FtsResult {
     pub score: f32,
 }
 
+/// Shared prefix of every commit-failure message `FtsStore::commit` returns;
+/// scopes the transient-error classifier to commit failures.
+const FTS_COMMIT_FAILED_CONTEXT: &str = "FTS commit failed";
+
 enum CommitAttempt {
     Committed,
     PrepareFailed(String),
@@ -465,6 +469,23 @@ impl FtsStore {
             || error.contains("IoError")
     }
 
+    /// Whether this failure is the transient Windows new-segment race: an
+    /// indexer (Defender / Search) holds the freshly created segment file
+    /// while tantivy opens it for the commit write (os error 5/32/33).
+    /// Only a failure of THIS class justifies redoing the whole indexing
+    /// pass — a commit retry on the same writer is never safe (a
+    /// half-joined pipeline must not be recommitted, see `commit_once`).
+    ///
+    /// Scoped to `commit()` failures (`FTS_COMMIT_FAILED_CONTEXT`): the same
+    /// OS errors from a store open, or a killed writer, are not this race.
+    pub fn is_transient_fts_commit_error(error: &str) -> bool {
+        error.contains(FTS_COMMIT_FAILED_CONTEXT)
+            && (error.contains("Access is denied")
+                || error.contains("os error 5")
+                || error.contains("os error 32")
+                || error.contains("os error 33"))
+    }
+
     /// One commit attempt, split so a failure in `prepare_commit` is told
     /// apart from a failure while publishing an already-prepared commit.
     ///
@@ -639,7 +660,9 @@ impl FtsStore {
             Ok(q) => q,
             Err(_) => {
                 let escaped = query.replace(
-                    [':', '(', ')', '[', ']', '{', '}', '^', '"', '~', '*', '?', '\\', '/'],
+                    [
+                        ':', '(', ')', '[', ']', '{', '}', '^', '"', '~', '*', '?', '\\', '/',
+                    ],
                     " ",
                 );
                 query_parser.parse_query(&escaped)?
@@ -789,12 +812,14 @@ impl FtsStore {
     }
 
     /// Clear the entire index
-    #[allow(dead_code)] // Reserved for index reset
     pub fn clear(&mut self) -> Result<()> {
         self.ensure_writer()?;
         let writer = self.writer.as_mut().unwrap();
         writer.delete_all_documents()?;
-        writer.commit()?;
+        // classifier scope: is_transient_fts_commit_error matches only this prefix
+        writer
+            .commit()
+            .map_err(|e| anyhow!("{FTS_COMMIT_FAILED_CONTEXT}: {e}"))?;
         self.reader.reload()?;
         Ok(())
     }
@@ -811,6 +836,51 @@ pub struct FtsStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classifier must match the AV/new-segment race shapes seen in the
+    /// field (the exact logged incident message included) and refuse
+    /// everything a full-pass retry cannot fix.
+    #[test]
+    fn transient_fts_commit_classifier_matches_the_av_race_only() {
+        let logged = "FTS commit failed while flushing indexing workers: Failed to open \
+             file for write: 'IoError { io_error: Os { code: 5, kind: PermissionDenied, \
+             message: \"Access is denied.\" }, filepath: \"55fb.pos\" }'";
+        assert!(FtsStore::is_transient_fts_commit_error(logged));
+        assert!(FtsStore::is_transient_fts_commit_error(
+            "FTS commit failed: Failed to open file (os error 5)"
+        ));
+        assert!(FtsStore::is_transient_fts_commit_error(
+            "FTS commit failed: Failed to open file (os error 32)"
+        ));
+        assert!(FtsStore::is_transient_fts_commit_error(
+            "FTS commit failed after 5 retries: Failed to open file (os error 33)"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error(
+            "writer was killed"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error(
+            "Access is denied (os error 5)"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error(
+            "FTS writer was killed during commit: Access is denied. os error 5"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error(
+            "FTS commit after recovery failed: Access is denied. (os error 5)"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error("schema error"));
+    }
+
+    #[test]
+    fn clear_removes_committed_documents() -> Result<()> {
+        let mut store = FtsStore::new_in_memory()?;
+        store.add_chunk(1, "fn hello() {}", "src/main.rs", Some("hello"), "function")?;
+        store.commit()?;
+        assert_eq!(store.stats()?.num_documents, 1);
+
+        store.clear()?;
+        assert_eq!(store.stats()?.num_documents, 0);
+        Ok(())
+    }
 
     #[test]
     fn test_fts_basic() -> Result<()> {

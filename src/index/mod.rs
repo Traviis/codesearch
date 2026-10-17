@@ -611,6 +611,19 @@ pub async fn index(
                      to finish warming up."
                 ));
             }
+            Err(DelegateError::Failed(reason)) if reason.contains("already in progress") => {
+                // The serve's 409 proves the work is IN FLIGHT (the first
+                // POST landed; its 202 just never reached this client).
+                // Two writers on one index are proven broken in the field
+                // (the CLI died on the Tantivy lockfile mid-reindex) —
+                // report and stop; the serve finishes the pass.
+                return Err(anyhow::anyhow!(
+                    "codesearch serve is running but could not delegate: {reason}\n\
+                     The serve is already reindexing this alias — let it finish \
+                     (check `codesearch status`). Indexing locally now would fight \
+                     the in-flight pass for the LMDB/FTS locks."
+                ));
+            }
             Err(DelegateError::Failed(reason)) => {
                 eprintln!(
                     "{}",
@@ -1644,6 +1657,18 @@ pub async fn add_to_index(
                 "codesearch serve is running but did not become ready within the wait \
                  budget (~2 min). Stop serve first to add locally, or wait for it to \
                  finish warming up."
+            ));
+        }
+        Err(DelegateError::Failed(reason)) if reason.contains("already in progress") => {
+            // The serve's 409 proves the add/reindex is IN FLIGHT (the first
+            // POST landed; its 202 just never reached this client). Two
+            // writers on one index are proven broken in the field — report
+            // and stop; the serve finishes the work.
+            return Err(anyhow::anyhow!(
+                "serve is running but could not delegate the add: {reason}\n\
+                 The serve is already indexing this alias — let it finish (check \
+                 `codesearch status`). Adding locally now would fight the in-flight \
+                 pass for the LMDB/FTS locks."
             ));
         }
         Err(DelegateError::Failed(reason)) => {

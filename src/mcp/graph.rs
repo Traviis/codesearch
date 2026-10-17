@@ -172,8 +172,7 @@ impl CodesearchService {
                 // cross-repo id collisions.
                 let mut resolved: Vec<ImportItem> = Vec::new();
                 for hit in &all_hits {
-                    let Some(origin_idx) =
-                        import_aliases.iter().position(|a| *a == hit.alias)
+                    let Some(origin_idx) = import_aliases.iter().position(|a| *a == hit.alias)
                     else {
                         continue;
                     };
@@ -190,10 +189,8 @@ impl CodesearchService {
                     match store.get_chunk(hit.result.chunk_id) {
                         Ok(Some(chunk)) => {
                             if crate::cache::normalize_path_str(&chunk.path) == normalized {
-                                resolved.extend(parse_import_lines(
-                                    &chunk.content,
-                                    chunk.start_line,
-                                ));
+                                resolved
+                                    .extend(parse_import_lines(&chunk.content, chunk.start_line));
                             }
                         }
                         Ok(None) => continue,
@@ -369,7 +366,10 @@ impl CodesearchService {
             // resolution block below.
             let mut run = |r: anyhow::Result<Vec<crate::fts::FtsResult>>| match r {
                 Ok(hits) => {
-                    let alias = ctx.project_alias.clone().unwrap_or_else(|| "local".to_string());
+                    let alias = ctx
+                        .project_alias
+                        .clone()
+                        .unwrap_or_else(|| "local".to_string());
                     hits.into_iter()
                         .map(|hit| SourcedResult::new(alias.clone(), hit))
                         .collect()
@@ -646,8 +646,7 @@ impl CodesearchService {
             // (store, id): a bare id collides across repos and would drop a
             // whole repo's neighbours whenever another repo reused the id.
             let mut all_results: Vec<SearchResultItem> = Vec::new();
-            let mut seen_ids: HashSet<(usize, u32)> =
-                HashSet::new();
+            let mut seen_ids: HashSet<(usize, u32)> = HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
                 let alias = aliases
                     .get(store_idx)

@@ -10,6 +10,7 @@
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
+mod status_snapshot;
 mod tui;
 mod tui_common;
 mod tui_remote;
@@ -38,10 +39,11 @@ use crate::constants::{
     ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV,
     CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
     DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH,
-    FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT,
-    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, MCP_IDLE_SESSION_SECS,
-    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV,
-    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_MARKER_HEARTBEAT_SECS, INDEXING_PATH,
+    LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH,
+    MCP_IDLE_SESSION_SECS, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
+    STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
@@ -93,10 +95,12 @@ pub(crate) enum CSharpIndexStatus {
     None,
     /// Helper available and index built successfully.
     Ready,
-    /// Index built, but the helper survived workspace/MSBuild failures —
-    /// definitions are present while cross-project references may be
-    /// missing. Rendered red (`C#⚠`) in the TUI; the failures are in the
-    /// info panel and on every find_impact answer from this index.
+    /// Index built, but degraded or stale: the helper survived
+    /// workspace/MSBuild failures (definitions present while cross-project
+    /// references may be missing), or a rebuild was abandoned because
+    /// `dotnet restore` never finished (the previous index stays live).
+    /// Rendered yellow (`C#⚠`) in the TUI; the failures are in the info
+    /// panel and on every find_impact answer from this index.
     Partial,
     /// Index exists but had errors or is stale.
     Error,
@@ -119,6 +123,52 @@ fn csharp_success_outcome(index_warnings: &[String]) -> (CSharpIndexStatus, Opti
             .collect::<Vec<_>>()
             .join(" | ");
         (CSharpIndexStatus::Partial, Some(detail))
+    }
+}
+
+/// Symbol-index status shown for a repo: a running build wins over any cached
+/// value (a stale `Ready` must not outlive a rebuild), otherwise the cache,
+/// otherwise a fresh probe. Pure so the precedence is testable.
+pub(crate) fn resolve_csharp_status(
+    cached: Option<CSharpIndexStatus>,
+    indexing: bool,
+    probe: impl FnOnce() -> CSharpIndexStatus,
+) -> CSharpIndexStatus {
+    if indexing {
+        CSharpIndexStatus::Indexing
+    } else {
+        cached.unwrap_or_else(probe)
+    }
+}
+
+/// Classification of a FAILED symbol rebuild, deciding how the serve layer
+/// renders the outcome. Pure so the contract is table-testable without
+/// running a helper (same reason as [`csharp_success_outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolRebuildFailureKind {
+    /// `dotnet restore` never finished within the retry cap: the previous
+    /// index stays live — warning (Partial), never a red error.
+    RestoreExhausted,
+    /// LMDB storage-format corruption: wipe + recovery path.
+    LmdbCorruption,
+    /// Any other failure: red Error.
+    Generic,
+}
+
+/// Restore-exhaustion is checked FIRST: the typed error carries its own
+/// contract (LMDB untouched, previous index live) that the corruption
+/// matcher must not override.
+fn classify_symbol_rebuild_failure(
+    msg: &str,
+    e: &anyhow::Error,
+    is_csharp: bool,
+) -> SymbolRebuildFailureKind {
+    if is_csharp && csharp::is_restore_exhausted(e) {
+        SymbolRebuildFailureKind::RestoreExhausted
+    } else if ServeState::is_lmdb_format_corruption(msg) {
+        SymbolRebuildFailureKind::LmdbCorruption
+    } else {
+        SymbolRebuildFailureKind::Generic
     }
 }
 
@@ -221,6 +271,9 @@ pub(crate) enum IndexingOwner {
     /// Watcher-triggered SCIP symbol rebuild (`trigger_symbol_rebuild`).
     Symbol,
 }
+
+/// Per-alias indexing markers: owner → when it last started or renewed.
+type ActiveReindexes = DashMap<String, std::collections::HashMap<IndexingOwner, Instant>>;
 
 /// A tracked background indexing task.
 ///
@@ -328,7 +381,7 @@ pub(crate) struct ServeState {
     /// capture a cheap clone that **shares** the underlying map (a bare
     /// `DashMap::clone()` is a deep copy and would silently disconnect the
     /// file-watcher callback from this field).
-    active_reindexes: Arc<DashMap<String, std::collections::HashMap<IndexingOwner, Instant>>>,
+    active_reindexes: Arc<ActiveReindexes>,
     /// Per-repo change count since serve started (incremented by index/reindex operations).
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
@@ -413,6 +466,12 @@ pub(crate) struct ServeState {
     reload_count: std::sync::atomic::AtomicUsize,
     /// Instant when ServeState was created — used to compute uptime for TUI header.
     started_at: std::time::Instant,
+    /// Precomputed status snapshot the read endpoints answer from: a
+    /// background task measures (filesystem probes, sysinfo), handlers
+    /// never do. Under a heavy rebuild wave the measuring workers are
+    /// OS-starved; inline measurement made /status itself take tens of
+    /// seconds across the fleet (the "status must always answer" fix).
+    status_snapshot: Arc<status_snapshot::StatusSnapshotHandle>,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -497,6 +556,7 @@ impl ServeState {
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
             started_at: std::time::Instant::now(),
+            status_snapshot: Arc::new(status_snapshot::StatusSnapshotHandle::new()),
         }
     }
 
@@ -655,6 +715,13 @@ impl ServeState {
             .is_none()
     }
 
+    /// The latest precomputed status snapshot, or `None` before the first
+    /// background pass completes. Read endpoints answer from this — never
+    /// by measuring inline (the /status timeout fix).
+    pub(crate) fn latest_status_snapshot(&self) -> Option<Arc<status_snapshot::StatusSnapshot>> {
+        self.status_snapshot.get()
+    }
+
     /// Return the instant when serve started, used to compute uptime.
     pub(crate) fn started_at(&self) -> std::time::Instant {
         self.started_at
@@ -665,10 +732,11 @@ impl ServeState {
     /// The notifier captures `Arc` clones of the two status maps so it can be sent
     /// into the file-watcher background task without holding a reference to `&self`.
     /// The watcher calls it with [`SymbolRebuildSignal::Started`] just before a
-    /// rebuild runs (→ `Indexing`) and again with `Succeeded`/`Failed` when it
-    /// finishes (→ `Ready`/`Error`), updating `csharp_index_status` /
-    /// `csharp_index_error` — making both the in-progress and terminal states
-    /// visible in the TUI and in `/status` without any extra polling.
+    /// rebuild runs (→ `Indexing`) and again with `Succeeded`/`Abandoned`/
+    /// `Failed` when it finishes (→ `Ready`/`Partial`/`Error`), updating
+    /// `csharp_index_status` / `csharp_index_error` — making both the
+    /// in-progress and terminal states visible in the TUI and in `/status`
+    /// without any extra polling.
     fn make_csharp_notifier(&self, alias: &str) -> CSharpRebuildNotifier {
         let status_map = Arc::clone(&self.csharp_index_status);
         let error_map = Arc::clone(&self.csharp_index_error);
@@ -690,6 +758,13 @@ impl ServeState {
                 } else {
                     error_map.remove(&alias_key);
                 }
+            }
+            SymbolRebuildSignal::Abandoned(msg) => {
+                // Restore never finished within the retry cap: the previous
+                // index stays live, so a warning (yellow C#⚠ + detail) —
+                // never a red Error. Not Ready either: the index is stale.
+                error_map.insert(alias_key.clone(), msg);
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Partial);
             }
             SymbolRebuildSignal::Failed(msg) => {
                 error_map.insert(alias_key.clone(), msg);
@@ -792,6 +867,18 @@ impl ServeState {
             .entry(alias.to_string())
             .or_default()
             .insert(owner, Instant::now());
+    }
+
+    /// Refresh `owner`'s marker only while it still exists. Unlike
+    /// [`Self::renew_indexing`] it never re-inserts, so a heartbeat tick that
+    /// races `end_indexing` cannot resurrect a finished marker (which would
+    /// block the reaper and every `begin_indexing` for a full timeout).
+    fn refresh_indexing_if_held(&self, alias: &str, owner: IndexingOwner) {
+        if let Some(mut owners) = self.active_reindexes.get_mut(alias) {
+            if let Some(ts) = owners.get_mut(&owner) {
+                *ts = Instant::now();
+            }
+        }
     }
 
     /// True iff an error chain indicates LMDB storage-format corruption —
@@ -1124,6 +1211,29 @@ impl ServeState {
         any_left
     }
 
+    /// Any TEXT-indexing owner (warmup, watcher, reindex) holds a marker for
+    /// `alias`. Only these flows rewrite the text index, so only these own
+    /// the general "Indexing" status; a symbol-only marker keeps the repo on
+    /// its resting state and drives the language columns instead.
+    ///
+    /// Read-only by design: call after [`Self::is_indexing`], which evicts
+    /// stale markers, so a dead marker cannot light the status here.
+    fn has_text_indexing_marker(&self, alias: &str) -> bool {
+        self.active_reindexes
+            .get(alias)
+            .map(|owners| owners.keys().any(|o| *o != IndexingOwner::Symbol))
+            .unwrap_or(false)
+    }
+
+    /// A symbol (SCIP) rebuild holds its marker for `alias` — drives the
+    /// C#/TS columns, never the general status.
+    fn has_symbol_indexing_marker(&self, alias: &str) -> bool {
+        self.active_reindexes
+            .get(alias)
+            .map(|owners| owners.contains_key(&IndexingOwner::Symbol))
+            .unwrap_or(false)
+    }
+
     /// Reap the tracked index task for `alias` once its handle has finished.
     ///
     /// Called after stale markers are evicted (there is no live task by
@@ -1442,9 +1552,7 @@ impl ServeState {
         // rebuild automatically — the version path on every binary change,
         // the degraded path once per serve process so a still-broken
         // environment cannot loop; the next serve start retries once.
-        if indexer.index_builder_version(db_path).as_deref()
-            != Some(crate::constants::INDEX_BUILDER_VERSION)
-        {
+        if !indexer.index_matches_builder(db_path) {
             return RebuildDecision::ChangedSinceLastBuild;
         }
         if !indexer.index_warnings(db_path).is_empty()
@@ -1799,7 +1907,11 @@ impl ServeState {
                 if !decision.needs_rebuild() {
                     // A fresh C# index flips the TUI C# indicator to Ready;
                     // other languages have no status map, nothing to update.
-                    if decision == RebuildDecision::Fresh && lang.as_str() == LANG_CSHARP {
+                    // Skipped while a build runs: Ready would mask it.
+                    if decision == RebuildDecision::Fresh
+                        && lang.as_str() == LANG_CSHARP
+                        && !self.is_indexing(alias)
+                    {
                         let mut status = self
                             .csharp_index_status
                             .get(alias)
@@ -1859,12 +1971,20 @@ impl ServeState {
             handles.push(tokio::spawn(async move {
                 let permit = match sem.acquire_owned().await {
                     Ok(p) => p,
-                    Err(_) => return,
+                    Err(_) => {
+                        if lang.as_str() == LANG_CSHARP {
+                            state.csharp_index_status.remove(&alias);
+                        }
+                        return;
+                    }
                 };
                 info!("phase-2: starting '{}' ({})", alias, lang);
                 let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
                     Some(p) => p,
                     None => {
+                        if lang.as_str() == LANG_CSHARP {
+                            state.csharp_index_status.remove(&alias);
+                        }
                         drop(permit);
                         return;
                     }
@@ -1878,6 +1998,11 @@ impl ServeState {
                         alias,
                         path.display()
                     );
+                    // Skip paths drop the queue pre-mark: no rebuild will
+                    // start, so the row must not keep showing indexing.
+                    if lang.as_str() == LANG_CSHARP {
+                        state.csharp_index_status.remove(&alias);
+                    }
                     drop(permit);
                     return;
                 }
@@ -1895,8 +2020,9 @@ impl ServeState {
 
     /// Phase 3: background pre-warm of reference cache for C# repos.
     ///
-    /// After Phase 2 finishes indexing definitions, Phase 3 runs
-    /// `scip-csharp batch-find-refs` for each repo to resolve references
+    /// For each repo whose index carries no precomputed references
+    /// (`refs_coverage` lazy or absent), Phase 3 runs
+    /// `scip-csharp batch-find-refs` to resolve references
     /// for all uncached symbols in a single workspace session.
     /// This amortizes the 30-60s workspace open cost across thousands of
     /// symbols, making subsequent `find_impact` calls instant (LMDB cache hit).
@@ -1951,6 +2077,20 @@ impl ServeState {
                 .unwrap_or(false);
 
             if !applies {
+                continue;
+            }
+
+            let coverage = self.symbol_registry.get(LANG_CSHARP).and_then(|i| {
+                i.as_any()
+                    .downcast_ref::<csharp::CSharpSymbolIndexer>()
+                    .and_then(|c| c.refs_coverage(&path.join(DB_DIR_NAME)))
+            });
+            if !csharp::ref_prewarm_needed(coverage.as_deref()) {
+                info!(
+                    "phase-3: skip '{}' — references precomputed at index (coverage={})",
+                    alias,
+                    coverage.as_deref().unwrap_or_default()
+                );
                 continue;
             }
 
@@ -2032,9 +2172,12 @@ impl ServeState {
                 // Restore Ready status regardless of pre-warm outcome: the SCIP
                 // definitions index (built in Phase 2) remains valid even if
                 // ref-cache pre-warm fails. TUI returns to "C#·" (ready).
-                state
-                    .csharp_index_status
-                    .insert(alias_owned, CSharpIndexStatus::Ready);
+                // Not while a build runs: it sets the final status itself.
+                if !state.is_indexing(&alias_owned) {
+                    state
+                        .csharp_index_status
+                        .insert(alias_owned, CSharpIndexStatus::Ready);
+                }
             }));
         }
 
@@ -3048,14 +3191,25 @@ impl ServeState {
             let alias_hb = alias.to_string();
             Arc::new(move || state.renew_indexing(&alias_hb, IndexingOwner::Warmup))
         };
-        let refreshed = IndexManager::perform_incremental_refresh_with_stores(
-            &path,
-            &db_path,
-            &stores,
-            &CancellationToken::new(),
-            Some(&pool),
-            Some(&heartbeat),
-        )
+        // Same transient-FTS redrive as the add/reindex paths: the warmup
+        // commit is just as exposed to the AV/Search-Indexer lock race, and
+        // a warmup failure without a retry leaves the repo re-embedded but
+        // uncommitted (field incident: a warmup refresh, 15 Oct 2026).
+        const FTS_TRANSIENT_BACKOFFS: [std::time::Duration; 2] = [
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(20),
+        ];
+        let refreshed = IndexManager::retry_on_transient_fts(&FTS_TRANSIENT_BACKOFFS, || async {
+            IndexManager::perform_incremental_refresh_with_stores(
+                &path,
+                &db_path,
+                &stores,
+                &CancellationToken::new(),
+                Some(&pool),
+                Some(&heartbeat),
+            )
+            .await
+        })
         .await;
         self.end_indexing(alias, IndexingOwner::Warmup);
         if let Err(e) = refreshed {
@@ -3744,6 +3898,87 @@ impl ServeState {
         warnings
     }
 
+    /// Per-language symbol-index status for the info surfaces — the same
+    /// shared collector find_impact answers carry, so the TUI, REST and MCP
+    /// surfaces cannot disagree about what "ready" means. Needs the project
+    /// path (applicability) next to the db path.
+    pub(crate) fn collect_symbol_index_status(
+        &self,
+        project_path: &Path,
+        db_path: &Path,
+    ) -> Vec<crate::symbols::SymbolIndexStatus> {
+        crate::symbols::symbol_index_status(&self.symbol_registry, project_path, db_path)
+    }
+
+    /// Record a failed first build for a newly added repo: log the error
+    /// with the heal command and release the Reindex marker. Deliberately
+    /// does NOT unregister — a vanished repo (the old rollback) is
+    /// unfixable by the operator who cannot even see it; a registered one
+    /// heals via reindex.
+    pub(crate) fn note_add_index_failure(
+        &self,
+        alias: &str,
+        project_path: &Path,
+        error: &anyhow::Error,
+    ) {
+        tracing::error!(
+            "Index creation failed for '{}' ({}): {error:#} — the repo stays \
+             registered with a partial index; reindex it to heal: \
+             `codesearch index reindex {alias}` (or POST /repos/{alias}/reindex)",
+            alias,
+            project_path.display()
+        );
+        self.end_indexing(alias, IndexingOwner::Reindex);
+    }
+
+    /// Compute one full status pass for the background snapshot task —
+    /// the ONLY place that measures (filesystem probes, sysinfo refresh).
+    /// Runs on the blocking pool via [`status_snapshot::spawn`]; the
+    /// read endpoints answer from the stored result and must never call
+    /// this on the request path.
+    pub(crate) fn compute_status_snapshot(&self) -> status_snapshot::StatusSnapshot {
+        let repos = self.repo_statuses_lightweight();
+        let active_sessions = self.active_session_count();
+
+        // CPU usage — reuse shared System instance so cpu_usage() can compute delta
+        let cpu = (|| -> Option<String> {
+            use sysinfo::ProcessesToUpdate;
+            let pid = sysinfo::get_current_pid().ok()?;
+            let mut sys = self.sysinfo_system.lock().ok()?;
+            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+            let proc = sys.process(pid)?;
+            let num_cpus = sys.cpus().len().max(1) as f32;
+            Some(format!("{:.0}%", proc.cpu_usage() / num_cpus))
+        })()
+        .unwrap_or_else(|| "—".to_string());
+
+        let csharp_helper = self
+            .symbol_registry
+            .get(LANG_CSHARP)
+            .map(|i| i.is_available())
+            .unwrap_or(false);
+
+        let ts_helper = self
+            .symbol_registry
+            .get(LANG_TYPESCRIPT)
+            .map(|i| i.is_available())
+            .unwrap_or(false);
+
+        let (snapshot_projects, snapshot_projects_warnings) =
+            crate::mcp::compute_projects_snapshot(self);
+
+        status_snapshot::StatusSnapshot {
+            repos,
+            projects: snapshot_projects,
+            projects_warnings: snapshot_projects_warnings,
+            active_sessions,
+            cpu_percent: cpu,
+            csharp_helper,
+            ts_helper,
+            generated_at: std::time::Instant::now(),
+        }
+    }
+
     /// Get lightweight repo statuses WITHOUT opening any databases.
     /// Returns a list of (alias, status_info) where status is derived from DashMap state only.
     pub(crate) fn repo_statuses_lightweight(&self) -> Vec<(String, RepoStatusInfo)> {
@@ -3757,25 +3992,14 @@ impl ServeState {
             let db_path = path.join(DB_DIR_NAME);
             let db_exists = db_path.exists();
 
-            let label = if self.is_indexing(alias) {
-                RepoStateLabel::Indexing
-            } else {
-                match self.repos.get(alias) {
-                    Some(entry) => match entry.value() {
-                        RepoState::Write { .. } => RepoStateLabel::Open,
-                        RepoState::Warm { .. } => RepoStateLabel::Warm,
-                        RepoState::Readonly { .. } => RepoStateLabel::Readonly,
-                        RepoState::Conflicted => RepoStateLabel::Error,
-                    },
-                    None => {
-                        if !db_exists {
-                            RepoStateLabel::NoIndex
-                        } else {
-                            RepoStateLabel::Idle
-                        }
-                    }
-                }
-            };
+            // Evict stale markers first (side effect the owner-scoped reads
+            // below rely on); the any-owner boolean itself is no longer the
+            // label key.
+            self.is_indexing(alias);
+            // Owner-scoped: only text-indexing flows light the general
+            // "Indexing" label; symbol rebuilds own the language columns.
+            let text_indexing = self.has_text_indexing_marker(alias);
+            let symbol_indexing = self.has_symbol_indexing_marker(alias);
 
             let changes = match self.repos.get(alias) {
                 Some(entry) => match entry.value() {
@@ -3805,24 +4029,31 @@ impl ServeState {
                 .map(|c| c.load(Ordering::Relaxed))
                 .unwrap_or(0);
 
-            // C# index status: check cached value first, then probe
-            let csharp_index = self
-                .csharp_index_status
-                .get(alias)
-                .map(|e| *e.value())
-                .unwrap_or_else(|| {
-                    // Probe: helper available + index exists → Ready
-                    let registry = &self.symbol_registry;
-                    let has_helper = registry
+            // The repo-level indexing flag only shows as a language's `Indexing`
+            // where that language applies; elsewhere (e.g. a Rust-only repo) the
+            // symbol column keeps its normal None/probe result. A cached status
+            // exists only for repos where a rebuild ran, so it also counts.
+            let cached_csharp = self.csharp_index_status.get(alias).map(|e| *e.value());
+            let csharp_building = symbol_indexing
+                && (cached_csharp.is_some()
+                    || self
+                        .symbol_registry
                         .get(LANG_CSHARP)
-                        .map(|i| i.is_available())
-                        .unwrap_or(false);
-                    if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
-                        CSharpIndexStatus::Ready
-                    } else {
-                        CSharpIndexStatus::None
-                    }
-                });
+                        .map(|i| i.applies_to(path))
+                        .unwrap_or(false));
+            let csharp_index = resolve_csharp_status(cached_csharp, csharp_building, || {
+                // Probe: helper available + index exists → Ready
+                let registry = &self.symbol_registry;
+                let has_helper = registry
+                    .get(LANG_CSHARP)
+                    .map(|i| i.is_available())
+                    .unwrap_or(false);
+                if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
+                    CSharpIndexStatus::Ready
+                } else {
+                    CSharpIndexStatus::None
+                }
+            });
 
             let csharp_error = if matches!(
                 csharp_index,
@@ -3841,7 +4072,14 @@ impl ServeState {
             // exists → Ready; otherwise None. The TUI icon reflects "an index
             // exists", which is exactly what matters for discoverability.
             let registry = &self.symbol_registry;
-            let typescript_index = {
+            let ts_building = symbol_indexing
+                && registry
+                    .get(LANG_TYPESCRIPT)
+                    .map(|i| i.applies_to(path) && i.is_available())
+                    .unwrap_or(false);
+            let typescript_index = if ts_building {
+                CSharpIndexStatus::Indexing
+            } else {
                 let has_ts_helper = registry
                     .get(LANG_TYPESCRIPT)
                     .map(|i| i.is_available())
@@ -3850,6 +4088,32 @@ impl ServeState {
                     CSharpIndexStatus::Ready
                 } else {
                     CSharpIndexStatus::None
+                }
+            };
+
+            // Only TEXT-indexing flows light the general label. A queued or
+            // running symbol rebuild (phase-2 pre-mark, watcher SCIP pass)
+            // shows in the C#/TS columns only — a pure SCIP pass never made
+            // the text index busy, and "Indexing" there read as "the normal
+            // index is stuck". Both owner reads run after is_indexing's
+            // stale eviction.
+            let label = if text_indexing {
+                RepoStateLabel::Indexing
+            } else {
+                match self.repos.get(alias) {
+                    Some(entry) => match entry.value() {
+                        RepoState::Write { .. } => RepoStateLabel::Open,
+                        RepoState::Warm { .. } => RepoStateLabel::Warm,
+                        RepoState::Readonly { .. } => RepoStateLabel::Readonly,
+                        RepoState::Conflicted => RepoStateLabel::Error,
+                    },
+                    None => {
+                        if !db_exists {
+                            RepoStateLabel::NoIndex
+                        } else {
+                            RepoStateLabel::Idle
+                        }
+                    }
                 }
             };
 
@@ -4058,25 +4322,30 @@ impl ServeState {
     ///
     /// Closes DB handles, stops FSW, and releases memory. The repo will be
     /// automatically re-opened (and re-warmed) on the next query.
-    /// Active reindexes are never evicted.
+    /// Active reindexes are never evicted, and their idle clock restarts on
+    /// every sweep they are seen indexing.
     pub(crate) fn evict_idle_repos(&self) {
         let timeout = self.idle_timeout();
         let now = std::time::Instant::now();
 
-        // Collect aliases to evict (can't mutate DashMap while iterating)
-        let to_evict: Vec<String> = self
+        // Snapshot first: refreshing `last_access` below must not run while the
+        // map is being iterated (an insert on a read-locked shard deadlocks).
+        let snapshot: Vec<(String, Instant)> = self
             .last_access
             .iter()
-            .filter(|entry| {
-                let alias = entry.key();
-                // Don't evict repos that are being reindexed
-                if self.is_indexing(alias) {
-                    return false;
-                }
-                now.duration_since(*entry.value()) >= timeout
-            })
-            .map(|entry| entry.key().clone())
+            .map(|entry| (entry.key().clone(), *entry.value()))
             .collect();
+        let mut to_evict: Vec<String> = Vec::new();
+        for (alias, last) in &snapshot {
+            if self.is_indexing(alias) {
+                // Never evict a repo mid-build, and restart its idle clock: a
+                // build longer than the timeout would otherwise leave the repo
+                // "idle" the instant it finishes and evict it on the next sweep.
+                self.touch_access(alias);
+            } else if now.duration_since(*last) >= timeout {
+                to_evict.push(alias.clone());
+            }
+        }
 
         // Log reaper status even when nothing to evict (for debugging idle eviction)
         if !self.last_access.is_empty() {
@@ -4259,15 +4528,33 @@ async fn indexing_handler(
 
 /// Status handler: GET /status
 ///
-/// Returns a JSON snapshot of all repo states, active sessions, and CPU usage.
-/// Used by the standalone TUI (`codesearch serve tui`) to poll server state.
+/// Answers from the precomputed [`status_snapshot::StatusSnapshot`] — the
+/// measuring runs on a background task, so this handler is O(1) no matter
+/// how loaded the machine is (the old inline version took tens of seconds
+/// across the fleet during a rebuild wave; clients timed out). First ticks
+/// after startup get an immediate minimal answer with `"status": "starting"`.
+/// Every answer carries `snapshot_age_secs`; the `load` object counts the
+/// busy repos so calling agents can throttle themselves.
 async fn status_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
 ) -> AxumJson<serde_json::Value> {
-    let repos = state.repo_statuses_lightweight();
-    let active_sessions = state.active_session_count();
+    let uptime_secs = state.started_at().elapsed().as_secs();
+    let version = env!("CARGO_PKG_VERSION");
 
-    let repo_json: Vec<serde_json::Value> = repos
+    let Some(snap) = state.status_snapshot.get() else {
+        return AxumJson(json!({
+            "version": version,
+            "status": "starting",
+            "repos": [],
+            "active_sessions": 0,
+            "cpu_percent": "—",
+            "snapshot_age_secs": serde_json::Value::Null,
+            "uptime_secs": uptime_secs,
+        }));
+    };
+
+    let repo_json: Vec<serde_json::Value> = snap
+        .repos
         .iter()
         .map(|(alias, info)| {
             let status_str = match info.status {
@@ -4312,73 +4599,44 @@ async fn status_handler(
         })
         .collect();
 
-    let uptime_secs = state.started_at().elapsed().as_secs();
-
-    // Serve-wide default model for newly created indexes (`serve --model`).
-    // `null` means the built-in default.
-    let default_model = state.default_model().map(|m| m.short_name());
-
-    // CPU usage — reuse shared System instance so cpu_usage() can compute delta
-    let cpu = {
-        use sysinfo::ProcessesToUpdate;
-        let pid = match sysinfo::get_current_pid() {
-            Ok(p) => p,
-            Err(_) => {
-                return AxumJson(json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "repos": repo_json,
-                    "active_sessions": active_sessions,
-                    "default_model": default_model,
-                    "cpu_percent": "—",
-                    "uptime_secs": uptime_secs,
-                }));
-            }
-        };
-        let mut sys = match state.sysinfo_system.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                return AxumJson(json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "repos": repo_json,
-                    "active_sessions": active_sessions,
-                    "default_model": default_model,
-                    "cpu_percent": "—",
-                    "uptime_secs": uptime_secs,
-                }));
-            }
-        };
-        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-        match sys.process(pid) {
-            Some(proc) => {
-                let num_cpus = sys.cpus().len().max(1) as f32;
-                let pct = proc.cpu_usage() / num_cpus;
-                format!("{:.0}%", pct)
-            }
-            None => "—".to_string(),
-        }
-    };
-
-    let csharp_helper = state
-        .symbol_registry
-        .get(LANG_CSHARP)
-        .map(|i| i.is_available())
-        .unwrap_or(false);
-
-    let ts_helper = state
-        .symbol_registry
-        .get(LANG_TYPESCRIPT)
-        .map(|i| i.is_available())
-        .unwrap_or(false);
+    // Load summary for calling agents: how busy is this serve right now.
+    // Symbol columns count separately from the text label — a pure SCIP
+    // wave never lights "indexing" at the repo level (v1.5.31 semantics).
+    let text_indexing = snap
+        .repos
+        .iter()
+        .filter(|(_, i)| i.status == RepoStateLabel::Indexing)
+        .count();
+    let symbol_indexing = snap
+        .repos
+        .iter()
+        .filter(|(_, i)| {
+            matches!(i.csharp_index, CSharpIndexStatus::Indexing)
+                || matches!(i.typescript_index, CSharpIndexStatus::Indexing)
+        })
+        .count();
+    let errored = snap
+        .repos
+        .iter()
+        .filter(|(_, i)| i.status == RepoStateLabel::Error)
+        .count();
 
     AxumJson(json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": version,
         "repos": repo_json,
-        "active_sessions": active_sessions,
-        "default_model": default_model,
-        "cpu_percent": cpu,
-        "csharp_helper": csharp_helper,
-        "ts_helper": ts_helper,
+        "active_sessions": snap.active_sessions,
+        "default_model": state.default_model().map(|m| m.short_name()),
+        "cpu_percent": snap.cpu_percent,
+        "csharp_helper": snap.csharp_helper,
+        "ts_helper": snap.ts_helper,
         "uptime_secs": uptime_secs,
+        "snapshot_age_secs": snap.age_secs(),
+        "load": {
+            "text_indexing": text_indexing,
+            "symbol_indexing": symbol_indexing,
+            "errored": errored,
+            "refresh_interval_secs": status_snapshot::refresh_interval().as_secs(),
+        },
     }))
 }
 
@@ -4521,6 +4779,10 @@ async fn info_handler(
     // Durable symbol-index warnings, read fresh from the on-disk meta
     // (shared with the TUI info overlay so the two cannot drift).
     let symbol_warnings = state.collect_symbol_warnings(&db_path);
+    // Per-language symbol-index status — the same shared collector the TUI
+    // overlay and find_impact answers use, so a consumer can tell a working
+    // symbol index from an absent/stale/degraded one before trusting it.
+    let symbol_index = state.collect_symbol_index_status(&project_path, &db_path);
 
     AxumJson(json!({
         "path": db_path.display().to_string(),
@@ -4535,6 +4797,12 @@ async fn info_handler(
         // Durable record of a degraded symbol index (see the TUI's C#⚠):
         // build-environment failures the helper survived during rebuild.
         "symbol_warnings": symbol_warnings,
+        // Per-language symbol-index status (ready/degraded/stale/
+        // restore-pending/absent/not-applicable): is there a usable SCIP
+        // index at all, and is it THIS build's? The chunk fields above say
+        // nothing about it — that gap made agents trust "0 references"
+        // from a repo with no symbol index.
+        "symbol_index": symbol_index,
         // Is the HNSW graph built and committed? A non-zero `chunks` with
         // `indexed: false` is a searchable-looking but silently dead index:
         // `VectorStore::search` refuses to run without the graph. The cloud
@@ -4601,6 +4869,59 @@ async fn doctor_handler(
     AxumJson(json!({ "results": results })).into_response()
 }
 
+/// Holds `owner`'s indexing marker for `alias` and keeps it fresh until
+/// dropped, however the run exits (success, error, panic, cancelled future).
+///
+/// A flow with no per-batch progress hook (the SCIP rebuild is one opaque
+/// blocking call) would otherwise age out at `MAX_INDEXING_SECS`, letting the
+/// idle reaper evict the repo mid-build.
+struct IndexingMarkerGuard {
+    state: Arc<ServeState>,
+    alias: String,
+    owner: IndexingOwner,
+    /// `Some` only when this guard acquired the marker; an inert guard (another
+    /// owner already holds the alias) neither renews nor ends anything.
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl IndexingMarkerGuard {
+    /// Must be called inside a tokio runtime (the heartbeat is a spawned task).
+    fn begin(
+        state: &Arc<ServeState>,
+        alias: &str,
+        owner: IndexingOwner,
+        heartbeat_every: Duration,
+    ) -> Self {
+        let heartbeat = state.begin_indexing(alias, owner).then(|| {
+            let state = Arc::clone(state);
+            let alias = alias.to_string();
+            tokio::spawn(async move {
+                let start = tokio::time::Instant::now() + heartbeat_every;
+                let mut tick = tokio::time::interval_at(start, heartbeat_every);
+                loop {
+                    tick.tick().await;
+                    state.refresh_indexing_if_held(&alias, owner);
+                }
+            })
+        });
+        Self {
+            state: Arc::clone(state),
+            alias: alias.to_string(),
+            owner,
+            heartbeat,
+        }
+    }
+}
+
+impl Drop for IndexingMarkerGuard {
+    fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+            self.state.end_indexing(&self.alias, self.owner);
+        }
+    }
+}
+
 /// Trigger a symbol index rebuild for a repo in one language (C#, TypeScript).
 ///
 /// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the
@@ -4636,6 +4957,12 @@ async fn trigger_symbol_rebuild(
             "🔬 symbol reindex skipped for '{}': not applicable (no .sln / tsconfig.json)",
             alias
         );
+        // A queued pre-mark (phase-2) can outlive its applicability window
+        // (e.g. the .sln vanished while the task waited for its slot): drop
+        // it — no rebuild will start here to overwrite it.
+        if is_csharp {
+            state.csharp_index_status.remove(alias);
+        }
         return;
     }
 
@@ -4661,16 +4988,21 @@ async fn trigger_symbol_rebuild(
     // for the same alias simultaneously, each path ends only its own marker,
     // so neither can flip the TUI back to Warm/Open while the other still
     // runs. (Stale entries from a crashed task self-heal via `is_indexing`.)
-    // The return value is deliberately ignored: nested callers (the reindex
-    // and add-repo background tasks) legitimately hold the alias's Reindex
-    // marker while triggering this.
-    let _ = state.begin_indexing(alias, IndexingOwner::Symbol);
+    // Nested callers (the reindex and add-repo background tasks) legitimately
+    // hold the alias's Reindex marker while triggering this; the guard is then
+    // inert and that marker covers the run.
+    let marker = IndexingMarkerGuard::begin(
+        state,
+        alias,
+        IndexingOwner::Symbol,
+        Duration::from_secs(INDEXING_MARKER_HEARTBEAT_SECS),
+    );
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
     let alias_owned = alias.to_string();
     let lang_owned = lang.to_string();
     let registry = state.symbol_registry.clone();
-    match tokio::task::spawn_blocking(move || {
+    let rebuilt = tokio::task::spawn_blocking(move || {
         let Some(indexer) = registry.get(&lang_owned) else {
             return Err(anyhow::anyhow!(
                 "No symbol indexer registered for '{lang_owned}'"
@@ -4683,8 +5015,11 @@ async fn trigger_symbol_rebuild(
         }
         indexer.rebuild(&rp, &dp, RebuildScope::Full)
     })
-    .await
-    {
+    .await;
+    // Released before the outcome handling: format recovery enqueued below
+    // reindexes through `begin_indexing`, which a live Symbol marker rejects.
+    drop(marker);
+    match rebuilt {
         Ok(Ok(summary)) => {
             tracing::info!(
                 "✅ Symbol rebuild complete for '{}': {} symbols, {} refs in {}ms",
@@ -4693,7 +5028,6 @@ async fn trigger_symbol_rebuild(
                 summary.references_stored,
                 summary.duration_ms
             );
-            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             if is_csharp {
                 let (status, detail) = csharp_success_outcome(&summary.index_warnings);
                 state
@@ -4716,50 +5050,66 @@ async fn trigger_symbol_rebuild(
             // SCIP puts wrap their errors (table + key size), and plain `{}`
             // would hide the `MDB_*` code the classifier below matches on.
             let msg = format!("{e:#}");
-            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             if is_csharp {
                 state
                     .csharp_index_error
                     .insert(alias_owned.clone(), msg.clone());
             }
-            if ServeState::is_lmdb_format_corruption(&msg)
-                && state.enqueue_format_recovery(&alias_owned)
-            {
-                tracing::warn!(
-                    "⚠️ LMDB storage-format corruption for '{}' — queueing sequential wipe + \
-                     full rebuild. Raw error: {}",
-                    alias_owned,
-                    msg
-                );
-                // Recovery owns the outcome from here: show in-progress rather
-                // than Error; it flips to Ready on success or Error on failure.
-                if is_csharp {
+            match classify_symbol_rebuild_failure(&msg, &e, is_csharp) {
+                SymbolRebuildFailureKind::RestoreExhausted => {
+                    // Restore never finished within the retry cap: the previous
+                    // index stays live — warning (yellow C#⚠ + detail), not a red
+                    // Error, and no touch_last_scip: the index is stale, the next
+                    // rebuild attempt must not be gated as fresh.
+                    tracing::warn!(
+                        "⚠️ Symbol rebuild abandoned for '{}': dotnet restore did not finish \
+                         within the retry cap — previous index stays live",
+                        alias_owned
+                    );
                     state
                         .csharp_index_status
-                        .insert(alias_owned, CSharpIndexStatus::Indexing);
+                        .insert(alias_owned, CSharpIndexStatus::Partial);
                 }
-            } else if ServeState::is_lmdb_format_corruption(&msg) {
-                // A wipe already happened for this alias in this process, so the
-                // data was written by the running binary: the error is write-side
-                // (LMDB rejects an empty or >511-byte key), not an old format.
-                // Wiping again would only restart a multi-hour reindex loop.
-                tracing::error!(
-                    "❌ Symbol rebuild for '{}' hit an LMDB key/value-size error AFTER a format \
-                     wipe — refusing a second wipe, this is a bug in the writer: {}",
-                    alias_owned,
-                    msg
-                );
-                if is_csharp {
-                    state
-                        .csharp_index_status
-                        .insert(alias_owned, CSharpIndexStatus::Error);
+                SymbolRebuildFailureKind::LmdbCorruption => {
+                    if state.enqueue_format_recovery(&alias_owned) {
+                        tracing::warn!(
+                            "⚠️ LMDB storage-format corruption for '{}' — queueing sequential wipe + \
+                             full rebuild. Raw error: {}",
+                            alias_owned,
+                            msg
+                        );
+                        // Recovery owns the outcome from here: show in-progress rather
+                        // than Error; it flips to Ready on success or Error on failure.
+                        if is_csharp {
+                            state
+                                .csharp_index_status
+                                .insert(alias_owned, CSharpIndexStatus::Indexing);
+                        }
+                    } else {
+                        // A wipe already happened for this alias in this process, so the
+                        // data was written by the running binary: the error is write-side
+                        // (LMDB rejects an empty or >511-byte key), not an old format.
+                        // Wiping again would only restart a multi-hour reindex loop.
+                        tracing::error!(
+                            "❌ Symbol rebuild for '{}' hit an LMDB key/value-size error AFTER a format \
+                             wipe — refusing a second wipe, this is a bug in the writer: {}",
+                            alias_owned,
+                            msg
+                        );
+                        if is_csharp {
+                            state
+                                .csharp_index_status
+                                .insert(alias_owned, CSharpIndexStatus::Error);
+                        }
+                    }
                 }
-            } else {
-                tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
-                if is_csharp {
-                    state
-                        .csharp_index_status
-                        .insert(alias_owned, CSharpIndexStatus::Error);
+                SymbolRebuildFailureKind::Generic => {
+                    tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
+                    if is_csharp {
+                        state
+                            .csharp_index_status
+                            .insert(alias_owned, CSharpIndexStatus::Error);
+                    }
                 }
             }
         }
@@ -4769,7 +5119,6 @@ async fn trigger_symbol_rebuild(
                 alias_owned,
                 e
             );
-            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             if is_csharp {
                 state
                     .csharp_index_error
@@ -4911,6 +5260,23 @@ async fn reload_handler(
 /// - `symbols=true` — also rebuild the symbol index (C# SCIP) after text reindex.
 ///
 /// Returns 202 Accepted immediately; the reindex runs in the background.
+/// Shared tail of every FORCE reindex — the HTTP handler and the TUI `n`
+/// task both end here, so the two paths cannot drift on whether (or in
+/// which order) the symbol pass runs. The pass is FORCED, and the force
+/// branch carries no flag: "rebuild everything this repo has" is not a
+/// decision a caller (or a future refactor) can opt out of. The explicit
+/// no-force symbol-only trigger is `?symbols=true` on the plain reindex.
+pub(crate) async fn finish_force_reindex(
+    state: &Arc<ServeState>,
+    alias: &str,
+    project_path: &Path,
+    db_path: &Path,
+    stores: Arc<SharedStores>,
+) {
+    state.restart_fsw(alias, stores).await;
+    maybe_rebuild_symbols(alias, project_path, db_path, state, true).await;
+}
+
 async fn reindex_handler(
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -5000,10 +5366,6 @@ async fn reindex_handler(
     // Ensure the guard is removed when we return early or the background task finishes.
     let guard_alias = alias_bg.clone();
     let guard_state = state.clone();
-
-    // `symbols=true` forces a symbol rebuild; without it the rebuild is
-    // gate-driven (missing/stale indexes are still healed).
-    let do_symbols = symbols;
 
     if force {
         // Force rebuild: stop FSW -> clear data in-place -> full reindex -> restart FSW.
@@ -5128,12 +5490,8 @@ async fn reindex_handler(
                 return;
             }
 
-            // 3. Restart FSW with fresh IndexManager.
-            g_state.restart_fsw(&g_alias, stores).await;
-
-            // 4. Symbol index rebuild — gate-driven for every installed
-            // language; `symbols=true` forces it (previous behaviour).
-            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, do_symbols).await;
+            // 3. Shared tail: fresh FSW + FORCED symbol pass.
+            finish_force_reindex(&g_state, &g_alias, &project_path, &db_path, stores).await;
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
@@ -5214,8 +5572,11 @@ async fn reindex_handler(
             }
 
             // Symbol index rebuild — gate-driven for every installed
-            // language; `symbols=true` forces it (previous behaviour).
-            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, do_symbols).await;
+            // language; the explicit `symbols=true` query param forces it
+            // (the no-force, symbol-only trigger). The FORCE branch above
+            // carries no flag at all: it ends in `finish_force_reindex`,
+            // which is always forced — there is no decision left to revert.
+            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, symbols).await;
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
@@ -5534,20 +5895,14 @@ async fn add_repo_handler(
                     state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
                     return;
                 }
-                tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
-                // Clean up: remove from repos and config
-                state_bg.repos.remove(&alias_bg);
-                state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
-                if let Ok(mut config) = state_bg.config.write() {
-                    config.unregister_alias(&alias_bg);
-                    if let Err(e) = state_bg.persist_config(&config) {
-                        tracing::warn!(
-                            "Failed to persist config after add-repo index failure for '{}': {}",
-                            alias_bg,
-                            e
-                        );
-                    }
-                }
+                // KEEP the repo registered on a failed first build. The old
+                // rollback (repos.remove + unregister + persist_config)
+                // turned one build crash into a vanishing repo: the 202 was
+                // the caller's last word, repos.json lost the entry, and
+                // self-cleanup then deleted the DB dir. A half-built store
+                // heals on the next reindex (it clears and rebuilds
+                // in-place), so the failure must be loud, not destructive.
+                state_bg.note_add_index_failure(&alias_bg, &project_path, &e);
                 return;
             }
         }
@@ -6340,8 +6695,7 @@ fn keep_warm_foreign_target(ping_url: &str, self_host: &str) -> Option<String> {
 // indefinitely (observed active_sessions=4 with a single client).
 pub(crate) fn session_manager_with_idle_reap() -> LocalSessionManager {
     let mut manager = LocalSessionManager::default();
-    manager.session_config.keep_alive =
-        Some(std::time::Duration::from_secs(MCP_IDLE_SESSION_SECS));
+    manager.session_config.keep_alive = Some(std::time::Duration::from_secs(MCP_IDLE_SESSION_SECS));
     manager
 }
 
@@ -6570,6 +6924,12 @@ pub async fn run_serve(
     // it. In particular the embedded TUI must NOT derive a poll cadence from it
     // — it never polls a federated peer on a timer at all.
     let serve_state = Arc::new(ServeState::new(config, None).with_default_model(default_model));
+
+    // The status snapshot refresher: only this task measures. Read
+    // endpoints (GET /status, MCP status) answer from its stored result,
+    // so they respond in microseconds even while a rebuild wave starves
+    // the machine — the failure mode that made /status itself time out.
+    status_snapshot::spawn(serve_state.clone());
 
     // One line that answers "why is it slower / less parallel than before?"
     // without grepping the code: the effective heavy-work budget.
@@ -6979,6 +7339,13 @@ pub async fn run_serve(
             info!("⚠️  Shutdown deadline reached — forcing exit (open sessions dropped)");
         }
     }
+
+    // Kill in-flight helper children (one-shot rebuilds + resident
+    // workspaces): an orphaned scip-csharp holds the helper exe locked for
+    // minutes after 'q' — the deploy blocker — and keeps computing for a
+    // dead host.
+    csharp::kill_live_helper_children();
+    crate::symbols::resident::WORKSPACE_POOL.kill_all();
 
     // Wait for the TUI task to finish cleanup (restore terminal).
     // The TUI's Drop guard restores the terminal, so we need to give it

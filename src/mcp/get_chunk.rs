@@ -12,6 +12,12 @@ use rmcp::{
 #[tool_router(router = get_chunk_router, vis = "pub(crate)")]
 impl CodesearchService {
     #[tool(
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Retrieve the full content of a specific chunk by its ID, plus optional surrounding lines for context.\nUse this after search or explore to read the actual code without loading the whole file.\n\nUSE FOR: reading a specific function/class body after finding it via search.\nSet context_lines (default 0, max 20) to include lines before and after the chunk.\n\nIMPORTANT (multi-repo): chunk_ids are local to each repository and are NOT globally unique.\nWhen `project` is omitted in multi-repo mode, the tool scans all repositories for the chunk_id.\nIf found in exactly one repo, it is returned automatically. If found in multiple repos, an `ambiguous_chunk_id` error lists the candidates so you can retry with `project`."
     )]
     pub(crate) async fn get_chunk(
@@ -199,11 +205,7 @@ impl CodesearchService {
                         // path-root matching, which never matches a
                         // project-relative stored path, so the group-scoped
                         // answer used to ship unprefixed.
-                        let root = ctx
-                            .alias_roots
-                            .get(alias)
-                            .map(String::as_str)
-                            .unwrap_or("");
+                        let root = ctx.alias_roots.get(alias).map(String::as_str).unwrap_or("");
                         match store.as_ref().map(|s| s.get_chunk(request.chunk_id)) {
                             Some(Ok(Some(mut c))) => {
                                 owner_alias = Some(alias.clone());
@@ -315,9 +317,7 @@ impl CodesearchService {
         // below, captured before display prefixing rewrites chunk.path. The
         // group's unique-owner arm already rewrote its chunk's path inside
         // itself, so it publishes the pre-prefix copy via `stored_path_raw`.
-        let stored_path = stored_path_raw
-            .take()
-            .unwrap_or_else(|| chunk.path.clone());
+        let stored_path = stored_path_raw.take().unwrap_or_else(|| chunk.path.clone());
 
         // Prefix path with alias for multi-repo identification
         chunk.path = ctx.prefix_result_path(&chunk.path);
@@ -347,8 +347,11 @@ impl CodesearchService {
                 Ok(src) => {
                     let lines: Vec<&str> = src.lines().collect();
                     if !lines.is_empty() {
-                        let before_start = chunk.start_line.saturating_sub(context_lines);
-                        let before_end = chunk.start_line.min(lines.len());
+                        // Chunk lines are 1-based; slices need the 0-based
+                        // row before the chunk's first line.
+                        let before_end = chunk.start_line.saturating_sub(1);
+                        let before_start = before_end.saturating_sub(context_lines);
+                        let before_end = before_end.min(lines.len());
                         if before_start < before_end {
                             context_before = Some(lines[before_start..before_end].join("\n"));
                         }

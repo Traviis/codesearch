@@ -165,6 +165,10 @@ pub(crate) struct MultiReadOutcome<R> {
     pub(crate) failures: Vec<(String, String)>,
 }
 
+/// Message for the "rebuild running" override shared by the single- and
+/// multi-store status paths.
+const REBUILD_RUNNING_MESSAGE: &str = "A rebuild (FTS, vector and symbol indexes) is running — results may be incomplete until it completes.";
+
 /// Decide the `status`/`status_message` pair for a multi-store
 /// `status(kind="index"|"projects")` response.
 ///
@@ -185,6 +189,7 @@ pub(crate) fn index_status_summary(
     failed_count: usize,
     total_chunks: usize,
     all_indexed: bool,
+    indexing: bool,
 ) -> (String, String) {
     if total_repos > 0 && failed_count >= total_repos {
         (
@@ -211,6 +216,8 @@ pub(crate) fn index_status_summary(
                 "Chunks are indexed across {total_repos} repo(s) but the vector index is not built yet — searches may fail until indexing completes."
             ),
         )
+    } else if indexing {
+        ("building".to_string(), REBUILD_RUNNING_MESSAGE.to_string())
     } else if failed_count > 0 {
         (
             "ready".to_string(),
@@ -270,8 +277,14 @@ pub(crate) fn aggregate_serve_index_status(
 /// fails with "Index not built" — so it must not read as `ready`. During a
 /// rebuild there is a window where chunks are inserted but `build_index()` has
 /// not run yet, which is exactly when an operator asks "is the migration done?".
-pub(crate) fn single_index_status(total_chunks: usize, indexed: bool) -> (String, String) {
-    if total_chunks == 0 {
+pub(crate) fn single_index_status(
+    total_chunks: usize,
+    indexed: bool,
+    indexing: bool,
+) -> (String, String) {
+    if indexing {
+        ("building".to_string(), REBUILD_RUNNING_MESSAGE.to_string())
+    } else if total_chunks == 0 {
         (
             "building".to_string(),
             "Index is being built in the background. Searches may fail until indexing completes. Please check back in a few minutes.".to_string(),

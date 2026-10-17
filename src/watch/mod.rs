@@ -291,6 +291,21 @@ impl FileWatcher {
             }
         }
 
+        // C# restore inputs (Directory.Packages.props etc.) are not an
+        // indexable language, but the watcher must still see them: a change
+        // invalidates NuGet restore state for the whole solution and drives
+        // a full C# symbol rebuild (issue #225). Checked before the
+        // 0-byte/language gates — an empty NuGet.config is a meaningful
+        // restore input too.
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if crate::constants::CSHARP_RESTORE_INPUT_FILES
+                .iter()
+                .any(|f| name.eq_ignore_ascii_case(f))
+            {
+                return true;
+            }
+        }
+
         // Skip 0-byte files (empty build artifacts)
         if path.metadata().map(|m| m.len() == 0).unwrap_or(false) {
             return false;
@@ -734,6 +749,35 @@ mod tests {
         // SHOULD watch (special files)
         assert!(watcher.is_watchable(Path::new("/tmp/Dockerfile")));
         assert!(watcher.is_watchable(Path::new("/tmp/Makefile")));
+    }
+
+    /// The restore-input admission gate: an EMPTY NuGet.config is a
+    /// meaningful restore input, so the name gate must sit BEFORE the
+    /// 0-byte skip — and .props is not an indexable language, so without the
+    /// gate the file would never reach the full-rebuild flush at all.
+    #[test]
+    #[serial]
+    fn restore_inputs_are_watchable_even_empty_and_lookalikes_are_not() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("NuGet.config"), "").unwrap();
+        fs::write(root.join("Directory.Packages.props.bak"), "x").unwrap();
+
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
+
+        assert!(
+            watcher.is_watchable(&root.join("NuGet.config")),
+            "an empty nuget.config must stay watchable: the restore-input gate precedes the 0-byte skip"
+        );
+        assert!(
+            watcher.is_watchable(&root.join("Directory.Packages.props")),
+            ".props is not indexable — only the restore-input gate admits it"
+        );
+        assert!(
+            !watcher.is_watchable(&root.join("Directory.Packages.props.bak")),
+            ".bak lookalike must not pass the name gate"
+        );
     }
 
     #[test]

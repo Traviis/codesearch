@@ -134,7 +134,8 @@ impl Chunk {
 
     /// Get the number of lines in this chunk
     pub fn line_count(&self) -> usize {
-        self.end_line.saturating_sub(self.start_line)
+        // 1-based inclusive end minus 1-based start, +1: the true line count.
+        self.end_line.saturating_sub(self.start_line) + 1
     }
 
     /// Get the size of this chunk in bytes

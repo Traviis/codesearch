@@ -236,12 +236,24 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|---|
-| *(none)* | |
 
 ---
 
 ## Changelog highlights (recent)
 
+- **v1.5.33 (pending)** — MCP tools declare `readOnlyHint` annotations: Claude Code plan mode auto-allows all six tools instead of prompting every call
+- **v1.5.33 (pending)** — force reindex (`n`, `index -f`) rebuilds the SCIP symbol indexes too — shared `finish_force_reindex` tail for HTTP + TUI; `?symbols=true` stays symbol-only, plain reindex stays gate-driven
+- **v1.5.33 (pending)** — Razor searchable: `.razor`/`.cshtml` via text chunking (Html variant); `obj/`, `.g.cs`, `.designer.cs` excluded as generated
+- **v1.5.33 (pending)** — /status + MCP status answer from a background snapshot (never measure inline): always responsive under rebuild waves, with `snapshot_age_secs` + a `load` summary for calling agents (`CODESEARCH_STATUS_REFRESH_SECS`, default 2s)
+- **v1.5.31 (pending)** — scip-csharp VS-MSBuild restore fallback: NETSDK1045-class CLI SDK gaps (hollow SDK dir, net10-only-in-VS) retry via vswhere + `MSBuild -t:restore`, and MSBuild registration picks a VS instance when no CLI SDK can target the repo
+- **v1.5.31 (pending)** — serve TUI status: `Indexing` only for real text indexing (pure SCIP rebuilds drive the C#/TS columns only); resting repos read `Idle` again
+- **v1.5.16 (pending)** — C# restore-pending retries 20×60s → 3 attempts with exponential backoff; restore exhaustion renders as yellow C#⚠ partial on every serve path instead of a red error
+- **v1.5.6 (pending)** — scip-csharp demotes MSBuild check advisories + BuildHost shutdown chatter from index warnings
+- **v1.5.15 (pending)** — CLI add/reindex refuse to build locally when the serve reports the alias already indexing (409 two-writer case); other delegation failures keep the local fallback
+- **v1.5.14 (pending)** — db dir marked hidden on Windows: the Search indexer no longer crawls `.codesearch.db` (structural fix for the scanner race on fresh Tantivy segments)
+- **v1.5.13 (pending)** — symbol-index status (ready/stale/degraded/absent) on REST info, both TUIs and every find_impact answer; vanishing-repo fix: transient FTS commit race gets one full-pass retry and failed first builds keep the repo registered
+- **v1.5.5** — serve TUI: symbol-index warnings wrap instead of clipping and `c` copies them to the clipboard
+- **v1.5.4** — restore gate: CPM-aware restore freshness (Directory.Packages.props etc.), restore-pending exit 75 with host-side bounded retry, previous index stays live during restore, watcher fires full C# rebuild on restore-input changes
 - **v1.4.4** — resident C# workspace pool no longer serves stale `find_impact` results after a rebuild: `WorkspacePool::evict` bumps a per-solution generation counter closing a spawn-in-flight race, and `scip_ref_cache` is now cleared unconditionally on both full and incremental rebuilds
 - **v1.3.37** — per-index embedding models end-to-end: serve queries, `POST /repos` and CLI index/stats/status honour the model each index records in its `metadata.json`; `serve --model` sets the default for newly created indexes; unrecorded indexes are queried with the built-in model plus a caller-facing warning; mid-rebuild indexes no longer report ready (PR #248)
 - **v1.3.23–v1.3.36** — dependency + platform wave: rmcp 3.3, fastembed 6.1 + ort rc.13, tantivy 0.26, axum 0.8, ratatui 0.30 + crossterm 0.29, thiserror 2, notify 8, tree-sitter 0.27, dirs/sha2/scip/sysinfo refresh + dependabot (weekly); clears the open Aikido/RUSTSEC advisories

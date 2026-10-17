@@ -578,7 +578,11 @@ pub fn is_model_in_cache(model: ModelType) -> bool {
         if !snapshot.join(&info.model_file).exists() {
             continue;
         }
-        if info.additional_files.iter().all(|f| snapshot.join(f).exists()) {
+        if info
+            .additional_files
+            .iter()
+            .all(|f| snapshot.join(f).exists())
+        {
             return true;
         }
     }

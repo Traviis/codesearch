@@ -17,6 +17,12 @@ impl CodesearchService {
 
     /// Unified search tool — dispatches to semantic or literal search based on `mode`.
     #[tool(
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nSet `min_score` to drop weak hits and answer with an explicit refusal (empty results + note) instead of nearest-neighbour noise; the score scale depends on `semantic_mode` — cosine similarity for \"semantic\", RRF points (rarely above 0.2) otherwise. Federated group/project queries forward `min_score` to every leg and surface each leg's refusal note in `warnings`. Not supported in `literal` mode — passing `min_score` with mode=\"literal\" returns an explicit error naming the field.\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     pub(crate) async fn search(
@@ -595,7 +601,12 @@ impl CodesearchService {
 
             let mut results = self
                 .resolve_fts_to_search_results_multi(
-                    &all_fts, limit, &stores, aliases, alias_roots, &mut lexical_warnings,
+                    &all_fts,
+                    limit,
+                    &stores,
+                    aliases,
+                    alias_roots,
+                    &mut lexical_warnings,
                 )
                 .await;
 
@@ -680,18 +691,14 @@ impl CodesearchService {
                             {
                                 Ok(Ok(e)) => e,
                                 Ok(Err(e)) => {
-                                    return Ok(CallToolResult::success(vec![
-                                        ContentBlock::text(format!(
-                                            "Error embedding query: {e:#}"
-                                        )),
-                                    ]));
+                                    return Ok(CallToolResult::success(vec![ContentBlock::text(
+                                        format!("Error embedding query: {e:#}"),
+                                    )]));
                                 }
                                 Err(e) => {
-                                    return Ok(CallToolResult::success(vec![
-                                        ContentBlock::text(format!(
-                                            "Embedding task failed: {e}"
-                                        )),
-                                    ]));
+                                    return Ok(CallToolResult::success(vec![ContentBlock::text(
+                                        format!("Embedding task failed: {e}"),
+                                    )]));
                                 }
                             };
                             by_model.insert(model, embedding.clone());
@@ -705,11 +712,9 @@ impl CodesearchService {
                             continue;
                         }
                         Err(e) => {
-                            return Ok(CallToolResult::success(vec![ContentBlock::text(
-                                format!(
-                                    "Error initializing embedding service for '{alias}': {e:#}"
-                                ),
-                            )]));
+                            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                                "Error initializing embedding service for '{alias}': {e:#}"
+                            ))]));
                         }
                     },
                 };
@@ -930,8 +935,7 @@ impl CodesearchService {
             .iter()
             .map(|hit| {
                 let mut r = hit.result.clone();
-                r.id =
-                    intern_group_chunk_id(&mut interned, (hit.alias.clone(), r.id));
+                r.id = intern_group_chunk_id(&mut interned, (hit.alias.clone(), r.id));
                 r
             })
             .collect();
@@ -982,21 +986,20 @@ impl CodesearchService {
         // Fused ids that came from the vector half resolve by direct lookup;
         // FTS-only hits are resolved in their ORIGIN store — never "the
         // first store that answers this id".
-        let by_synth: std::collections::HashMap<u32, &SourcedResult<crate::vectordb::SearchResult>> =
-            vector_results
-                .iter()
-                .map(|hit| (interned[&(hit.alias.clone(), hit.result.id)], hit))
-                .collect();
+        let by_synth: std::collections::HashMap<
+            u32,
+            &SourcedResult<crate::vectordb::SearchResult>,
+        > = vector_results
+            .iter()
+            .map(|hit| (interned[&(hit.alias.clone(), hit.result.id)], hit))
+            .collect();
 
         let mut mapped: Vec<crate::vectordb::SearchResult> = Vec::new();
         for f in fused.into_iter().take(limit) {
             let Some((alias, real_id)) = origins.get(f.chunk_id as usize).cloned() else {
                 continue;
             };
-            let root = alias_roots
-                .get(&alias)
-                .map(String::as_str)
-                .unwrap_or("");
+            let root = alias_roots.get(&alias).map(String::as_str).unwrap_or("");
             if let Some(hit) = by_synth.get(&f.chunk_id) {
                 let mut r = hit.result.clone();
                 r.id = real_id;

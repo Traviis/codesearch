@@ -14,6 +14,12 @@ use rmcp::{
 impl CodesearchService {
     /// Unified symbol navigation — dispatches based on `kind`.
     #[tool(
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find call-sites of a symbol via LEXICAL TEXT matching — hits may be docs/comments rather than code references; ranking puts source files first and a `note` field flags the precise upgrade path when one exists. On C#/TypeScript projects ALWAYS prefer `find_impact` for usages — it returns exact SCIP references, while this kind is only a text fallback\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     pub(crate) async fn find(
@@ -135,7 +141,10 @@ impl CodesearchService {
                 // resolution block below reads it in both modes); the routed
                 // project alias is the honest origin when one exists.
                 Ok(r) => {
-                    let alias = ctx.project_alias.clone().unwrap_or_else(|| "local".to_string());
+                    let alias = ctx
+                        .project_alias
+                        .clone()
+                        .unwrap_or_else(|| "local".to_string());
                     r.into_iter()
                         .map(|hit| SourcedResult::new(alias.clone(), hit))
                         .collect()
@@ -359,7 +368,10 @@ impl CodesearchService {
                 // Single store — tagged for uniformity with the resolution
                 // block below (see find_definition).
                 Ok(r) => {
-                    let alias = ctx.project_alias.clone().unwrap_or_else(|| "local".to_string());
+                    let alias = ctx
+                        .project_alias
+                        .clone()
+                        .unwrap_or_else(|| "local".to_string());
                     r.into_iter()
                         .map(|hit| SourcedResult::new(alias.clone(), hit))
                         .collect()

@@ -95,6 +95,20 @@ fn test_tool_registration_exposes_exactly_the_six_tools() {
         names, expected,
         "tools/list must expose exactly the consolidated 6-tool surface"
     );
+    // Issue #339: every tool is a read-only index query — the declared
+    // readOnlyHint is what lets Claude Code plan mode auto-allow the call.
+    for tool in router.list_all() {
+        let read_only = tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint)
+            .unwrap_or(false);
+        assert!(
+            read_only,
+            "tool {} must declare annotations.read_only_hint = true",
+            tool.name
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -505,6 +519,25 @@ fn test_path_prefix_mixed_separators() {
 fn test_path_prefix_no_alias() {
     let result = super::prefix_path_with_alias("C:/repo/src/main.rs", None, "C:/repo");
     assert_eq!(result, "src/main.rs");
+}
+
+#[test]
+fn test_strip_alias_prefix_variants() {
+    // The inbound counterpart of prefix_path_with_alias: find_impact
+    // position queries arrive as find reports them — alias-prefixed.
+    let alias = "myrepo".to_string();
+    assert_eq!(
+        super::strip_alias_prefix("myrepo/src/main.rs", Some(&alias)),
+        "src/main.rs"
+    );
+    assert_eq!(
+        super::strip_alias_prefix("other/src/main.rs", Some(&alias)),
+        "other/src/main.rs"
+    );
+    assert_eq!(
+        super::strip_alias_prefix("src/main.rs", None),
+        "src/main.rs"
+    );
 }
 
 #[test]
@@ -2240,8 +2273,7 @@ fn relaxed_gate_counts_signature_only_matches() {
         context_next: None,
         searchable_text: "fn transfer_overdue_process()\nFunction\nlet x = compute();".to_string(),
     };
-    let terms =
-        super::literal_search::significant_query_terms("transfer overdue process");
+    let terms = super::literal_search::significant_query_terms("transfer overdue process");
 
     // The signature carries all three terms; the gate over searchable_text
     // must keep this candidate...
@@ -2275,8 +2307,7 @@ fn relaxed_gate_falls_back_to_content_for_legacy_blobs() {
         context_next: None,
         searchable_text: String::new(),
     };
-    let terms =
-        super::literal_search::significant_query_terms("transfer overdue process");
+    let terms = super::literal_search::significant_query_terms("transfer overdue process");
 
     assert!(super::literal_search::chunk_covers_significant_terms(
         super::literal_search::relaxed_gate_text(&chunk),
@@ -2308,8 +2339,7 @@ fn build_remote_search_body_forwards_min_score_to_peers() {
         project: None,
         group: None,
     };
-    let body =
-        super::CodesearchService::build_remote_search_body(&request, "semantic", Some(50));
+    let body = super::CodesearchService::build_remote_search_body(&request, "semantic", Some(50));
     let got = body["min_score"]
         .as_f64()
         .expect("min_score must be numeric in the peer body");
@@ -2386,19 +2416,14 @@ fn mixed_model_group_warning_fires_only_for_genuinely_mixed_groups() {
         "a single-model group must not warn"
     );
     assert!(
-        super::mixed_model_group_warning([
-            ModelType::AllMiniLML6V2Q,
-            ModelType::AllMiniLML6V2Q,
-        ])
-        .is_none(),
+        super::mixed_model_group_warning([ModelType::AllMiniLML6V2Q, ModelType::AllMiniLML6V2Q,])
+            .is_none(),
         "the same model across repos is still one scale"
     );
 
-    let warning = super::mixed_model_group_warning([
-        ModelType::AllMiniLML6V2Q,
-        ModelType::BGESmallENV15,
-    ])
-    .expect("a genuinely mixed group must warn");
+    let warning =
+        super::mixed_model_group_warning([ModelType::AllMiniLML6V2Q, ModelType::BGESmallENV15])
+            .expect("a genuinely mixed group must warn");
     assert!(
         warning.contains("NOT comparable"),
         "the warning must say the scores are not comparable: {warning}"
@@ -2457,8 +2482,14 @@ async fn search_refuses_min_score_in_literal_mode_by_name() {
         Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
         other => panic!("expected text content, got {other:?}"),
     };
-    assert!(text.contains("min_score"), "refusal must name the field: {text}");
-    assert!(text.contains("literal"), "refusal must name the mode: {text}");
+    assert!(
+        text.contains("min_score"),
+        "refusal must name the field: {text}"
+    );
+    assert!(
+        text.contains("literal"),
+        "refusal must name the mode: {text}"
+    );
 }
 
 // === status(kind="index") multi-store summary ==========================
@@ -2470,14 +2501,14 @@ async fn search_refuses_min_score_in_literal_mode_by_name() {
 
 #[test]
 fn index_status_summary_reports_building_before_anything_failed() {
-    let (status, message) = super::index_status_summary(3, 0, 0, true);
+    let (status, message) = super::index_status_summary(3, 0, 0, true, false);
     assert_eq!(status, "building");
     assert!(!message.contains("failed"), "got: {message}");
 }
 
 #[test]
 fn index_status_summary_reports_clean_ready_with_no_failures() {
-    let (status, message) = super::index_status_summary(3, 0, 500, true);
+    let (status, message) = super::index_status_summary(3, 0, 500, true, false);
     assert_eq!(status, "ready");
     assert!(!message.contains("failed"), "got: {message}");
     assert!(message.contains("3 repo(s)"), "got: {message}");
@@ -2487,7 +2518,7 @@ fn index_status_summary_reports_clean_ready_with_no_failures() {
 fn index_status_summary_surfaces_a_degraded_group_as_ready_with_a_count() {
     // This is the exact case that used to be indistinguishable from
     // "index still warming": some data is in, one store didn't answer.
-    let (status, message) = super::index_status_summary(3, 1, 500, true);
+    let (status, message) = super::index_status_summary(3, 1, 500, true, false);
     assert_eq!(
         status, "ready",
         "the two healthy stores must not be masked by the one that failed"
@@ -2507,7 +2538,7 @@ fn index_status_summary_reports_error_when_every_store_failed() {
     // this fix, `total_chunks == 0` was checked first and this rendered as
     // "building" — byte-identical to "not indexed yet" — even though every
     // store actively failed. `failed_count >= total_repos` must win.
-    let (status, message) = super::index_status_summary(3, 3, 0, true);
+    let (status, message) = super::index_status_summary(3, 3, 0, true, false);
     assert_eq!(
         status, "error",
         "a group where every store failed must not read as merely 'still building'"
@@ -2668,10 +2699,7 @@ fn into_results_routes_failures_into_warnings() {
         .collect();
     assert_eq!(
         unwrapped,
-        vec![
-            ("inriver".to_string(), 1),
-            ("example-repo".to_string(), 2)
-        ]
+        vec![("inriver".to_string(), 1), ("example-repo".to_string(), 2)]
     );
     assert_eq!(
         warnings,
@@ -3255,7 +3283,7 @@ fn readonly_or_require_ready_never_creates_a_missing_index() {
 /// failed with "Index not built. Call build_index() after inserting chunks."
 #[test]
 fn index_status_summary_reports_building_when_chunks_exist_but_graph_is_not_built() {
-    let (status, message) = super::index_status_summary(3, 0, 500, false);
+    let (status, message) = super::index_status_summary(3, 0, 500, false, false);
     assert_eq!(
         status, "building",
         "chunks without a built vector index are not searchable"
@@ -3266,28 +3294,50 @@ fn index_status_summary_reports_building_when_chunks_exist_but_graph_is_not_buil
         "message must still name the scope, got: {message}"
     );
     // A stats() failure on some stores must NOT be misread as "not built".
-    let (status, _) = super::index_status_summary(3, 1, 500, true);
+    let (status, _) = super::index_status_summary(3, 1, 500, true, false);
     assert_eq!(
         status, "ready",
         "a failed store is surfaced as degraded-ready"
     );
 }
 
+/// A running rebuild turns every would-be "ready" into "building"; states that
+/// already carry a more specific verdict (all stores failed) are left alone.
+#[test]
+fn index_status_summary_reports_building_while_a_rebuild_runs() {
+    // (total_repos, failed, chunks, all_built, indexing) -> expected status
+    let cases = [
+        ((3, 0, 500, true, true), "building"),
+        ((3, 1, 500, true, true), "building"),
+        ((3, 0, 500, true, false), "ready"),
+        ((3, 3, 0, true, true), "error"),
+    ];
+    for ((repos, failed, chunks, built, indexing), expected) in cases {
+        let (status, message) = super::index_status_summary(repos, failed, chunks, built, indexing);
+        assert_eq!(
+            status, expected,
+            "case ({repos},{failed},{chunks},{built},{indexing}): {message}"
+        );
+    }
+    let (_, message) = super::index_status_summary(3, 0, 500, true, true);
+    assert!(message.contains("rebuild"), "got: {message}");
+}
+
 /// Single-store counterpart: the same `total_chunks > 0` shortcut reported
 /// `ready` for a store whose graph was never built (`indexed == false`).
 #[test]
 fn single_index_status_requires_a_built_graph_to_report_ready() {
-    let (status, message) = super::single_index_status(403, false);
+    let (status, message) = super::single_index_status(403, false, false);
     assert_eq!(
         status, "building",
         "403 chunks with no built graph are not searchable"
     );
     assert!(message.contains("not built"), "got: {message}");
 
-    let (status, _) = super::single_index_status(403, true);
+    let (status, _) = super::single_index_status(403, true, false);
     assert_eq!(status, "ready");
 
-    let (status, _) = super::single_index_status(0, false);
+    let (status, _) = super::single_index_status(0, false, false);
     assert_eq!(status, "building");
 }
 
@@ -3323,9 +3373,7 @@ async fn vector_fan_out_skips_write_locked_store_instead_of_waiting() {
 
     let outcome = service
         .with_vector_store_read_multi(
-            |_alias, _store| {
-                Ok::<_, anyhow::Error>(Vec::<crate::vectordb::SearchResult>::new())
-            },
+            |_alias, _store| Ok::<_, anyhow::Error>(Vec::<crate::vectordb::SearchResult>::new()),
             vec![stores_a.clone(), stores_b.clone()],
             &["alpha".to_string(), "beta".to_string()],
         )
@@ -3494,4 +3542,26 @@ async fn lexical_group_search_degrades_per_repo_when_a_store_is_write_locked() {
         warnings_text.contains("alpha") && warnings_text.contains("store busy"),
         "warnings must name the skipped repo and why: {warnings_text}"
     );
+}
+
+/// A running rebuild overrides "ready": the stores are still being rewritten
+/// even though the previous generation's graph reports built.
+#[test]
+fn single_index_status_reports_building_while_a_rebuild_runs() {
+    // (total_chunks, indexed, indexing) -> expected status
+    let cases = [
+        ((403, true, true), "building"),
+        ((403, false, true), "building"),
+        ((0, false, true), "building"),
+        ((403, true, false), "ready"),
+    ];
+    for ((chunks, indexed, indexing), expected) in cases {
+        let (status, message) = super::single_index_status(chunks, indexed, indexing);
+        assert_eq!(
+            status, expected,
+            "case ({chunks},{indexed},{indexing}): {message}"
+        );
+    }
+    let (_, message) = super::single_index_status(403, true, true);
+    assert!(message.contains("rebuild"), "got: {message}");
 }

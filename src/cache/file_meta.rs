@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::constants::FILE_META_DB_NAME;
-use crate::vectordb::{
-    is_transient_rename_error, RENAME_RETRY_ATTEMPTS, RENAME_RETRY_DELAY_MS,
-};
+use crate::vectordb::{is_transient_rename_error, RENAME_RETRY_ATTEMPTS, RENAME_RETRY_DELAY_MS};
 
 // ─── CANONICAL PATH POLICY ────────────────────────────────────────────────────
 //
@@ -338,11 +336,30 @@ impl FileMetaStore {
         }
         .unwrap_or_else(|| Self::new(model_name.to_string(), dimensions));
 
-        // Check if model changed - if so, invalidate everything
+        // Check if model changed - if so, invalidate everything.
+        // warn_print!: stderr + quiet-aware — a raw println would corrupt the
+        // serve TUI's screen (observed live when the builder-version wipe
+        // below fired for the whole fleet).
         if store.model_name != model_name || store.dimensions != dimensions {
-            println!(
+            crate::warn_print!(
                 "⚠️  Model changed ({} -> {}), full re-index required",
-                store.model_name, model_name
+                store.model_name,
+                model_name
+            );
+            store = Self::new(model_name.to_string(), dimensions);
+        }
+
+        // Check if another build produced these records — its chunker
+        // conventions (line bases, key shapes) are not ours.
+        if store.builder_version != crate::constants::INDEX_BUILDER_VERSION {
+            crate::warn_print!(
+                "⚠️  Indexer version changed ({} -> {}), full re-index required",
+                if store.builder_version.is_empty() {
+                    "pre-stamp".to_string()
+                } else {
+                    store.builder_version.clone()
+                },
+                crate::constants::INDEX_BUILDER_VERSION
             );
             store = Self::new(model_name.to_string(), dimensions);
         }

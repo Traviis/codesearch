@@ -14,6 +14,102 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.33]
+
+### Fixed
+
+- **MCP tools now declare `readOnlyHint` annotations, so Claude Code plan mode auto-allows them.** None of the six tools (`search`, `find`, `explore`, `get_chunk`, `status`, `find_impact`) set rmcp `annotations`, and plan mode only auto-allows MCP tools that declare `readOnlyHint: true` — every codesearch call in plan mode was blocked or prompted (in `-p` mode it failed outright), in the main session and in subagents alike. All six are read-only index queries; they now declare `read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false`, and the 6-tool registration test pins the hint so a future tool cannot ship without it.
+
+- **A force reindex now rebuilds the SCIP symbol indexes too.** `n` in the serve TUI and `codesearch index -f` promised "rebuild everything" but dated from before the symbol indexes existed: the HTTP handler forced the symbol pass only behind the separate `?symbols=true` flag (so a fresh SCIP gate — no `.cs` changes — skipped it), and the TUI's force reindex never ran a symbol pass at all. Field effect: after Razor joined the text index, `find_impact` kept answering from ~19-hour-old references. Force now implies symbols (`finish_force_reindex` is the shared tail of the HTTP and TUI force paths: fresh FSW, then a forced, gate-bypassing symbol pass); `?symbols=true` stays the explicit no-force symbol-only trigger, and a plain reindex stays gate-driven. Local CLI builds (`index -f --local` / delegation failure) still build no symbols — serve owns the symbol pipeline there.
+
+- **Razor markup is now indexed: `.razor` / `.cshtml` ride the text-fallback chunker.** Neither extension had a language mapping, so every Razor file was skipped — field test 2026-10-16 on a customer MVC repo: 9 `.cshtml` files on disk, 0 in the index, and component usage findable only through generated `obj/**/*_razor.g.cs` lines. Both extensions now map to the Html variant (no extractor → text chunking): directives (`@model`, `@inject`, `@page`) and component tags become searchable, without running the C# tree-sitter parser on markup. The watcher and indexer gates key off the same mapping, so incremental reindex covers Razor automatically. Existing indexes keep their chunks until the next reindex. Related deliberate exclusions: `obj/` is now always excluded (always .NET build output — generated code can no longer leak in even when a repo's `.gitignore` misses it), and `.g.cs` / `.designer.cs` suffixes are skipped as generated (the watch layer always claimed `.designer.cs` was excluded; the list never had it). `bin/` is deliberately **not** excluded — several ecosystems keep real scripts there — so the accidental `.g.cs` coverage disappears by design: the real `.razor` files are searchable now.
+
+- **`GET /status` and the MCP `status` tool always answer, even under a heavy rebuild wave.** They used to measure inline in the request path: per registered repo several filesystem probes plus a SCIP LMDB env open and a sysinfo refresh, synchronous on async workers that a rebuild wave (dotnet restore + scip-csharp children) starves — with 28 repos one call took tens of seconds and polling clients (remote TUI, calling agents) piled up and timed out; the project list died the same death. Now a single background task measures (on the blocking pool, one pass at a time — under load the cadence stretches instead of piling measuring tasks onto a starved machine) and stores a snapshot whose readers answer in microseconds. Every answer carries `snapshot_age_secs` (staleness is visible, never a hang) and a `load` summary (`text_indexing` / `symbol_indexing` / `errored` / `refresh_interval_secs`) so calling agents can throttle themselves; before the first pass completes they answer `"starting"` immediately. Cadence: `CODESEARCH_STATUS_REFRESH_SECS`, default 2s.
+
+## [1.5.31]
+
+### Changed
+
+- **scip-csharp retries the solution restore with the VS MSBuild when the CLI SDK set cannot target the repo.** When `dotnet restore` fails on SDK resolution (NETSDK1045 — CLI SDKs older than the repo's TFM — or an unsatisfiable `global.json`; detection reads stdout AND stderr, because NETSDK1045 prints to stdout on current hosts), the helper locates the newest VS MSBuild via vswhere and retries the restore once with `MSBuild -t:restore` — VS ships its own MSBuild + SDK targets independent of `C:\Program Files\dotnet`, so it restores solutions the CLI cannot even evaluate. Timeout keeps the existing pending-marker/gated-exit-75 contract (a hung VS restore is never killed); on VS failure the per-project fallback still runs. The workspace-load MSBuild registration is now capability-aware too: when every CLI SDK instance is older than the repo's raw-text TFM floor (max over all `TargetFrameworks` + the nearest `global.json` major), the highest VS instance is registered instead — otherwise an SDK 8 instance would evaluate net10 projects into certain NETSDK1045 load failures even with fresh assets. On healthy machines the choice is unchanged (single-SDK machines byte-identical; multi-SDK machines now deterministically take the highest qualifying SDK, was first-enumerated). Motivated by the 2026-10-15 field incident: a hollow `10.0.101` SDK dir left the CLI blind to net10 on a machine where VS built fine, degrading every net10 repo's symbol index to "0 projects loaded".
+
+- **The serve TUI status column no longer shows `Indexing` for a pure symbol (SCIP) rebuild.** Only text-indexing flows (startup warmup, file-watcher batches, explicit reindex) light the general repo label; a C#/TypeScript symbol rebuild — including a long restore-pending retry loop — drives only the language columns, so a busy C# pass can no longer read as "the normal index is stuck behind the SCIP index". A queued phase-2 rebuild stays visible in the C# column only. The `/status` wire vocabulary is unchanged. A repo whose index is on disk but which is not loaded renders `Idle` again — the interim `idx` rendering read as active indexing on done, non-SCIP repos.
+
+- **C# `find_impact` answers from precomputed references.** References are computed at index time (index format 2.1) instead of a slow lazy lookup on every query.
+
+## [1.5.30]
+
+### Fixed
+
+- **File metadata is persisted once per index batch instead of once per pass.** The vector and FTS stores already commit per batch, but the file-meta cache was only written at the very end of a refresh pass — a serve restart (or a failed FTS commit) mid-pass left the meta empty while chunks existed, and the next open then wiped the whole store and re-embedded everything again. The meta now follows the stores' own commit granularity, and `save()` writes atomically (tmp + rename) so a crash mid-write can never truncate the file.
+
+### Changed
+
+- **find_impact position queries that resolve to no symbol now return an error with a hint.** Previously they returned an empty references list, which looked like "no callers".
+
+## [1.5.29]
+
+### Fixed
+
+- **Index caches are no longer wiped on every binary swap.** The chunk file-meta cache and the SCIP symbol meta were stamped with the full package version (`CARGO_PKG_VERSION_FULL`), which the bump-bot moves on every merged PR — so every rebuilt binary treated every repo's indexes as foreign and re-embedded/re-built the whole fleet at each serve restart (field incident 14–15 Oct 2026: ten patch bumps in one day). The stamp is now a hand-bumped generation marker (`2026-10.1`) that changes ONLY when chunker or SCIP conventions actually change; one final full rebuild migrates existing caches. The transient Windows FTS-commit lock race (AV/Search-Indexer holding fresh Tantivy segment files) also gets a second, longer redrive (5s then 20s, was a single 5s pass) and now covers the warmup incremental refresh as well — the two paths whose builds died in the field, leaving repos registered with 0 chunks.
+
+## [1.5.16]
+
+### Fixed
+
+- **The serve TUI/`/status` repo label no longer flips to `idle` while a rebuild is still queued.** Phase-2 pre-marks queued C# rebuilds in the per-language status cache, but the repo-level label waited for the `active_reindexes` marker that only appears when the task actually starts — so during a startup rebuild wave most repos read `idle` with only the C# column showing indexing. A resolved `Indexing` language status now also holds the repo label at `indexing`; it returns to idle/open when the rebuild completes. Queued pre-marks are cleared on the phase-2 skip paths (unresolvable/missing repo) so a skipped rebuild cannot show indexing forever.
+
+- **C# restore-pending retries capped at 3 attempts with exponential backoff, and restore exhaustion renders as a warning instead of an error.** A hung `dotnet restore` burned 20 retries × 60s before the rebuild gave up — and then flagged the index red as if broken. Now: 3 attempts with doubling waits (60s + 120s by default, base tunable via `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS`), after which the rebuild stops with a typed `RestoreExhaustedError`, LMDB stays untouched and the previous index keeps serving. Exhaustion surfaces as yellow `C#⚠ partial` with the reason on every serve path (reindex trigger, FSW full and grouped incremental rebuilds); a real failure still renders red, and a later clean rebuild clears the warning back to Ready.
+
+## [1.5.15]
+
+### Fixed
+
+- **`index add` / `index reindex` stop instead of building locally when the serve reports the alias is already indexing.** A transport-level delegation failure can mean the first POST landed and its 202 never reached the client (field case: the follow-up call got 409 "reindex already in progress", then the CLI built locally anyway and died on the Tantivy lockfile while the serve's own pass was running). On that specific 409 the CLI now exits with "let it finish" guidance; other delegation failures keep the previous local fallback (a registered-but-idle repo indexes locally fine — the pre-push gate depends on it). `--local` remains the explicit escape hatch.
+
+- **Status no longer reports "ready" while a rebuild is running.** MCP `status` (project and group) answers "building" during a rebuild, and the TUI C#/TypeScript indicators show indexing instead of "ready" from an old on-disk index; the fresh-index route and pre-warm no longer set Ready mid-build.
+
+## [1.5.14]
+
+### Fixed
+
+- **The index database directory is now marked hidden on Windows.** The dot in `.codesearch.db` means nothing to Windows: the Search indexer crawled it like any folder, and its scanner holding a freshly created Tantivy segment file is the transient commit race behind the field incidents (os error 5). The indexer skips hidden directories (the `.git` convention), so `SharedStores` now marks the db dir hidden on creation and on every read-write open — existing directories are fixed on the next serve start, best-effort and idempotent.
+
+## [1.5.13]
+
+### Fixed
+
+- **Vanishing repos: failed first builds keep the registration and the transient FTS commit race gets one full-pass retry.** Two field incidents traced to the same root: an indexer (Defender/Search) holds a freshly created Tantivy segment file while the commit opens it (os error 5/32/33), and the add-repo task then silently unregistered the repo and let self-cleanup delete its DB dir — the 202 response was the operator's last word. Now: (1) a full reindex pass is redriven once after a 5s backoff when it fails on exactly that transient class (a pass is idempotent — clear + rebuild — where a commit retry on a half-joined writer is never safe); (2) a failed first build keeps the repo registered with a loud, actionable error (`codesearch index reindex <alias>` heals in place) instead of vanishing.
+
+### Added
+
+- **Symbol-index status surfaces.** The chunk fields on `/repos/:alias/info` and the Info overlay said nothing about the SCIP index that `find_impact` uses, so an agent could not tell a working symbol index from an absent/stale/degraded one before trusting `references: []`. Every info surface now carries `symbol_index[]` — per language a `state` (`ready` / `degraded` / `stale` / `restore-pending` / `absent` / `not-applicable`), the index age and applicability — composed from the same on-disk meta the rebuild gates act on (new shared collector `symbol_index_status`, C# freshness override `index_matches_builder` mirroring the rebuild gate). `find_impact` resolved/empty answers embed the same array (applicable languages only) and the tool description tells agents to check it before concluding "no callers"; both serve TUIs render the status lines with state coloring. Remote-TUI deserialization tolerates older peers (missing field → empty section; null age → unknown).
+
+## [1.5.9]
+
+### Fixed
+
+- **scip-csharp: projects already loaded through a ProjectReference are no longer added twice.** The per-project fallback re-opened them, causing `already part of the workspace` failures and cross-project references missing from the index.
+- **NuGet feed failures and the BuildHost `XMakeElements` crash are logged as `[INFO]`, not index warnings.** They are environment issues; an affected project is skipped in the index and the INFO line records it.
+- **Serve: `q` quits while a C# rebuild waits for `dotnet restore`.** The restore wait polls the shutdown flag and the runtime gives blocking tasks a 5 s grace, instead of joining a rebuild parked for up to 20 minutes.
+
+## [1.5.6]
+
+### Fixed
+
+- **scip-csharp: MSBuild check advisories and BuildHost shutdown chatter no longer surface as index warnings.** Two more noise classes were observed pinning the serve TUI's ⚠ on healthy-but-advised repos: MSBuild check advisories escalated to load "failures" (live: the Grpc.Net.ClientFactory 2.63 version check — product guidance, the project loads fine and the index is unaffected) and BuildHost crash aftermath (`[BuildHost PID N] Exception while shutting down…` / `…not responding`, which trail the failure the load exception already reports and double-count it). Both demote to `[INFO]` in the WorkspaceFailed handler, extending the audit-advisory policy: the index-warning channel carries index health only. The live shapes are pinned verbatim in WorkspaceNoiseTests.
+
+## [1.5.5]
+
+### Fixed
+
+- **Serve TUI: symbol-index warnings are fully readable and copyable.** The Info overlay (`i`) clipped long warning lines at the modal border — the exact feed URLs that explain a degraded C# index were cut off mid-address. Modal content now wraps instead of clipping (the modal grows with the wrapped rows, capped at the terminal), and the key-hint footer moved to the border's bottom title so it stays visible even when wrapped content fills the screen. A new `c` key on the Info overlay copies the repo alias plus every stored warning line to the OS clipboard (PowerShell `Set-Clipboard` with explicit UTF-8 stdin on Windows, `pbcopy`/`wl-copy`/`xclip`/`xsel` elsewhere — no new dependency), with the outcome shown as a feedback line in the overlay. Works in both the embedded serve TUI and the standalone remote TUI.
+
+## [1.5.4]
+
+### Fixed
+
+- **C# indexes are never built while a NuGet restore is still running, and restore freshness now honours central package management.** Under CPM a version bump in `Directory.Packages.props` left `obj/project.assets.json` looking fresh, Roslyn missed the package assemblies, and the degraded index stored CS0246 cascades (seen live on `Azure.Response` unresolved). `NeedsRestore` now treats assets as stale when any `Directory.Packages.props`, `Directory.Build.props`, `Directory.Build.targets`, `NuGet.config` or `global.json` found walking up from the project to the repo root is newer than the assets. When the bounded restore wait expires, the helper no longer loads the workspace degraded: it records the still-running restore in an out-of-repo marker, prints one `[RESTORE-PENDING]` line, writes no output, and exits 75 — and the Rust host maps that to a distinct outcome that retries the same rebuild scope with a bounded backoff (interval tunable via `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS`), leaving the previous good index live and LMDB untouched. `find_impact` answers from the previous index with one explicit "restore in progress" warning; lazy find-refs during a pending restore persists an INCOMPLETE warning and caches nothing; the serve file watcher now triggers a full C# rebuild when a restore input changes, and a resident workspace refuses to come up mid-restore so no answer from a workspace loaded during a restore can be cached. A restore that itself fails (non-zero exit) is not pending: the previous degraded-with-warning behaviour stays.
+
 ## [1.5.3]
 
 ### Fixed
@@ -38,6 +134,7 @@ finalized in place with a date — no renaming/migration step needed.
 - **Visible shutdown notice after q.** q is the only graceful-exit trigger — no SIGINT/SIGTERM handler exists, and while the TUI holds raw mode Ctrl-C is not even delivered as a signal. After q, axum waits out open MCP SSE sessions (long-lived, they never close on their own) until the 3 s forced-exit deadline, which from the restored terminal reads as a hung process; the natural reflex — a second Ctrl-C, delivered once raw mode is off — hard-kills serve mid-drain. The TUI now prints right after restoring the terminal how many sessions are being drained and that the process exits by itself, so the pause is visibly bounded.
 - **Ignore-sensitive tests are hermetic against a developer's global .codesearchignore.** The walker and watcher tests walk tempdirs and assert exact file sets and matcher presence, but FileWalker/FileWatcher also load the machine's global ignore — so a developer who actually customizes that file got permanent red local runs (the pilot's list starts with *.bin, which pruned test.bin before the binary check ever ran, and any global file at all broke the no-matcher assertion) while CI, with a clean home, stayed green. Both test families now pin CODESEARCH_HOME and its HOME/USERPROFILE fallback to fresh empty directories via the crate's #[serial] + EnvRestore idiom.
 - **Serve no longer parks 9 tantivy OS threads per warm repo (~4.5k resident threads on a 500-repo pool).** Every open store held an eager IndexWriter — 3 indexing workers sized from the CPU count, a segment updater and a 4-thread merge pool that NoMergePolicy never schedules — plus a reader-side meta.json poller waking ~2x/s, all idle forever in a search-only pool while observability tools (ps -M, sample) choked on the thread census. The FTS writer is lazy again: it materializes only on the first actual write; readers of self-owned stores switch to ReloadPolicy::Manual because every commit path already reloads its own reader explicitly, and only genuinely externally-written readonly stores keep the OnCommitWithDelay watcher; a created writer now runs one worker and one merge thread instead of tantivy's derived defaults. Cross-process locking is unchanged (the codesearch-level .writer.lock still guards the database), and this process's own commits stay immediately visible to its searches.
+- **Blazor/Razor projects no longer produce false "Compilation errors" index warnings.** The workspace load never ran source generators, so Razor components' generated partial halves were missing and every code-behind use of an `@code` member collapsed into CS0103/CS0115 cascades while `dotnet build` stayed clean. `scip-csharp` now drives the project's source generators itself (with a tolerant loader for analyzers built against a newer Roslyn than the pinned one) and indexes the generated output compilation; a failed generator pipeline falls back to the plain compilation and downgrades the resulting diagnostics to INFO notes instead of warnings. The index-warning lead entry no longer asserts a user-fixable build problem — it distinguishes real breaks from tool-side gaps — and error specimens are truncated at word boundaries instead of mid-identifier.
 
 ## [1.5.2] - 2026-10-05
 

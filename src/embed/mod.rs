@@ -2,6 +2,7 @@ mod batch;
 mod cache;
 mod embedder;
 
+use anyhow::Result;
 pub use batch::{BatchEmbedder, EmbeddedChunk};
 pub use cache::{
     CacheStats, CachedBatchEmbedder, PersistentCacheStats, PersistentEmbeddingCache, QueryCache,
@@ -10,7 +11,6 @@ pub use cache::{
 pub use embedder::{
     is_model_in_cache, load_default_model, save_default_model, FastEmbedder, ModelType,
 };
-use anyhow::Result;
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -393,7 +393,10 @@ impl EmbeddingServicePool {
         let cache_dir = self.cache_dir.clone();
         std::thread::spawn(move || {
             // The receiver may already be gone on timeout — nothing to do.
-            let _ = tx.send(EmbeddingService::with_cache_dir(model, cache_dir.as_deref()));
+            let _ = tx.send(EmbeddingService::with_cache_dir(
+                model,
+                cache_dir.as_deref(),
+            ));
         });
         match rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
             Ok(Ok(service)) => Ok(service),
@@ -507,7 +510,9 @@ mod tests {
     fn get_if_cached_reports_fresh_pool_as_unloaded() {
         let pool = EmbeddingServicePool::new(None);
         assert!(pool.get_if_cached(ModelType::default()).is_none());
-        assert!(pool.get_if_cached(ModelType::EmbeddingGemma300MQ4).is_none());
+        assert!(pool
+            .get_if_cached(ModelType::EmbeddingGemma300MQ4)
+            .is_none());
     }
 
     #[test]

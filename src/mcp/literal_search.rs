@@ -279,7 +279,10 @@ impl CodesearchService {
                     // Single store — tagged for uniformity with the
                     // resolution block below.
                     Ok(r) => {
-                        let alias = ctx.project_alias.clone().unwrap_or_else(|| "local".to_string());
+                        let alias = ctx
+                            .project_alias
+                            .clone()
+                            .unwrap_or_else(|| "local".to_string());
                         r.into_iter()
                             .map(|hit| SourcedResult::new(alias.clone(), hit))
                             .collect()
@@ -333,8 +336,10 @@ impl CodesearchService {
                         .await
                     {
                         Ok(r) => {
-                            let alias =
-                                ctx.project_alias.clone().unwrap_or_else(|| "local".to_string());
+                            let alias = ctx
+                                .project_alias
+                                .clone()
+                                .unwrap_or_else(|| "local".to_string());
                             r.into_iter()
                                 .map(|hit| SourcedResult::new(alias.clone(), hit))
                                 .collect()
@@ -374,7 +379,13 @@ impl CodesearchService {
                     };
                     let looked_up = store.get_chunk(fts_hit.result.chunk_id);
                     if let Err(ref e) = looked_up {
-                        note_store_failure(&mut literal_warnings, sa, origin_idx, "chunk lookup", e);
+                        note_store_failure(
+                            &mut literal_warnings,
+                            sa,
+                            origin_idx,
+                            "chunk lookup",
+                            e,
+                        );
                     }
                     if let Some(chunk) = looked_up.ok().flatten() {
                         if relaxed_fallback
@@ -386,8 +397,7 @@ impl CodesearchService {
                             continue 'outer;
                         }
                         if let Some(ref lang) = lang_filter {
-                            let file_lang =
-                                Language::from_path(std::path::Path::new(&chunk.path));
+                            let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
                             if file_lang.name() != lang {
                                 continue 'outer;
                             }
@@ -634,12 +644,79 @@ impl CodesearchService {
 /// domain terms — otherwise "на кого ставится задача по ..." needs a chunk
 /// containing "на" and "по" to reach the 60% bar.
 const LITERAL_STOPWORDS: &[&str] = &[
-    "и", "в", "во", "с", "со", "к", "у", "о", "об", "от", "до", "из", "за", "на", "по", "для",
-    "как", "что", "кто", "кого", "кому", "чем", "чему", "где", "когда", "или", "же", "бы", "ли",
-    "а", "но", "да", "это", "этот", "эта", "эти", "там", "так", "такой", "тоже", "уже", "еще",
-    "ещё", "был", "была", "быть", "есть", "the", "a", "an", "of", "to", "in", "on", "for", "and",
-    "or", "is", "are", "was", "were", "be", "been", "with", "from", "by", "at", "as", "that",
-    "this", "it", "its", "there",
+    "и",
+    "в",
+    "во",
+    "с",
+    "со",
+    "к",
+    "у",
+    "о",
+    "об",
+    "от",
+    "до",
+    "из",
+    "за",
+    "на",
+    "по",
+    "для",
+    "как",
+    "что",
+    "кто",
+    "кого",
+    "кому",
+    "чем",
+    "чему",
+    "где",
+    "когда",
+    "или",
+    "же",
+    "бы",
+    "ли",
+    "а",
+    "но",
+    "да",
+    "это",
+    "этот",
+    "эта",
+    "эти",
+    "там",
+    "так",
+    "такой",
+    "тоже",
+    "уже",
+    "еще",
+    "ещё",
+    "был",
+    "была",
+    "быть",
+    "есть",
+    "the",
+    "a",
+    "an",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "and",
+    "or",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "with",
+    "from",
+    "by",
+    "at",
+    "as",
+    "that",
+    "this",
+    "it",
+    "its",
+    "there",
 ];
 
 /// Split a query into deduplicated lowercase terms the same way the FTS
