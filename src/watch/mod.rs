@@ -672,6 +672,7 @@ impl GitHeadWatcher {
 mod tests {
 
     #[test]
+    #[serial]
     fn include_list_gates_the_watcher() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("keep.rs"), "fn a() {}").unwrap();
@@ -683,7 +684,7 @@ mod tests {
         )
         .unwrap();
 
-        let watcher = FileWatcher::new(dir.path().to_path_buf());
+        let watcher = watcher_with_isolated_home(dir.path().to_path_buf());
         assert!(
             watcher.is_watchable(&dir.path().join("keep.rs")),
             "whitelisted file must be watchable"
@@ -696,7 +697,7 @@ mod tests {
         // Absent include list: everything the ignore rules allow.
         let dir2 = tempfile::TempDir::new().unwrap();
         std::fs::write(dir2.path().join("drop.py"), "print(1)").unwrap();
-        let watcher2 = FileWatcher::new(dir2.path().to_path_buf());
+        let watcher2 = watcher_with_isolated_home(dir2.path().to_path_buf());
         assert!(
             watcher2.is_watchable(&dir2.path().join("drop.py")),
             "no include list = historical behavior"

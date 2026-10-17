@@ -498,7 +498,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn include_list_whitelists_matching_files_only() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("keep.rs"), "fn a() {}").unwrap();
         fs::write(dir.path().join("drop.py"), "print(1)").unwrap();
@@ -522,7 +524,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn include_list_negation_unincludes_again() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("keep.rs"), "fn a() {}").unwrap();
         fs::write(dir.path().join("gen.rs"), "generated").unwrap();
@@ -540,7 +544,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn no_include_file_indexes_everything() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
         fs::write(dir.path().join("b.py"), "print(1)").unwrap();
@@ -551,7 +557,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn include_list_ancestor_negation_unincludes_again() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src").join("keep.rs"), "fn a() {}").unwrap();
@@ -579,7 +587,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn include_list_present_but_empty_indexes_everything() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
         fs::write(dir.path().join("b.py"), "print(1)").unwrap();

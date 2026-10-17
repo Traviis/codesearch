@@ -5668,6 +5668,80 @@ async fn get_chunk_reports_the_real_chunker_editor_line_unchanged() {
     }
 }
 
+/// The no-download model gate: with an empty model cache, a semantic search
+/// must answer the explicit refusal (naming `codesearch setup`) instead of
+/// turning the query into an unbounded network fetch — the whole-night serve
+/// stall this gate exists to prevent.
+#[tokio::test]
+#[serial]
+async fn semantic_search_refuses_when_the_model_is_not_cached() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("solo");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = root.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    drop(stores);
+
+    // Empty model cache: no model files anywhere under CODESEARCH_HOME.
+    let scratch = tempfile::tempdir().unwrap();
+    let cs_home = scratch.path().join("cs-home");
+    let bare_home = scratch.path().join("bare-home");
+    std::fs::create_dir_all(&cs_home).unwrap();
+    std::fs::create_dir_all(&bare_home).unwrap();
+    let _env = crate::testing::EnvRestore::set(&[
+        (
+            crate::constants::CODESEARCH_HOME_ENV,
+            cs_home.to_str().unwrap(),
+        ),
+        ("HOME", bare_home.to_str().unwrap()),
+        ("USERPROFILE", bare_home.to_str().unwrap()),
+    ]);
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root.clone(), Some("solo".to_string()))
+        .unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let req = crate::mcp::types::SearchRequest {
+        query: "anything".to_string(),
+        mode: Some("semantic".to_string()),
+        compact: None,
+        semantic_mode: None,
+        filter_path: None,
+        min_score: None,
+        regex: None,
+        phrase: None,
+        file_glob: None,
+        language: None,
+        format: None,
+        limit: None,
+        project: Some("solo".to_string()),
+        group: None,
+    };
+    let res = service
+        .search(Parameters(req))
+        .await
+        .expect("search must answer, not error");
+    let text = tool_text(&res);
+    assert!(
+        text.contains("not available locally") && text.contains("codesearch setup"),
+        "semantic search with an empty model cache must answer the no-download \
+         refusal naming the setup hint, got: {text}"
+    );
+}
+
 // ═══ Interactive fan-outs skip busy stores instead of queueing behind the
 // write lock (review cluster B). The priming call opens the group's stores
 // so `get_opened_stores` hands back the SAME SharedStores the handlers
