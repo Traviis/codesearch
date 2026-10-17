@@ -475,13 +475,23 @@ fn find_project_root(start_path: &Path) -> Option<PathBuf> {
 /// leaked stores into `$HOME` on machines that keep codesearch artifacts
 /// elsewhere (the pilot's machine runs everything under `CODESEARCH_HOME`).
 fn global_dbs_root() -> Result<PathBuf> {
-    if let Some(home) = dirs::home_dir() {
+    global_dbs_root_for(
+        dirs::home_dir().as_deref(),
+        &crate::constants::codesearch_home()?,
+    )
+}
+
+/// Decision core of [`global_dbs_root`], split out so tests can drive the
+/// legacy-vs-relocated choice: Windows `dirs::home_dir()` reads the profile
+/// from the OS, not the environment, so no env override can redirect it.
+fn global_dbs_root_for(home: Option<&Path>, cs_home: &Path) -> Result<PathBuf> {
+    if let Some(home) = home {
         let legacy = home.join(".codesearch.dbs");
         if legacy.exists() {
             return Ok(legacy);
         }
     }
-    Ok(crate::constants::codesearch_home()?.join("dbs"))
+    Ok(cs_home.join("dbs"))
 }
 
 /// Per-project directory name inside [`global_dbs_root`].
@@ -507,7 +517,12 @@ fn global_store_slug(canonical_path: &Path) -> String {
 /// Tries the historic `<file_name>` layout first so indexes from older
 /// binaries keep resolving; new projects get the collision-proof slug.
 fn global_db_dir_for(canonical_path: &Path) -> Result<PathBuf> {
-    let root = global_dbs_root()?;
+    global_db_dir_in(&global_dbs_root()?, canonical_path)
+}
+
+/// [`global_db_dir_for`] against an explicit root — the testable seam for
+/// the legacy-layout preference (see [`global_dbs_root_for`]).
+fn global_db_dir_in(root: &Path, canonical_path: &Path) -> Result<PathBuf> {
     let legacy_name = canonical_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -3588,8 +3603,11 @@ mod remove_order_tests {
 
     /// Stores written by older binaries into the hardcoded `~/.codesearch.dbs`
     /// keep resolving after the fix — the legacy layout wins when present.
+    ///
+    /// Windows `dirs::home_dir()` reads the profile from the OS, not the
+    /// environment, so the decision is driven through the injected seam
+    /// ([`global_dbs_root_for`] / [`global_db_dir_in`]) with a simulated home.
     #[test]
-    #[serial]
     fn global_db_path_prefers_legacy_home_layout_when_it_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let old_home = tmp.path().join("old-home");
@@ -3598,28 +3616,21 @@ mod remove_order_tests {
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::create_dir_all(legacy_root.join("foo").join(".codesearch.db")).unwrap();
         let cs_home = tmp.path().join("cs-home");
-        std::fs::create_dir_all(&cs_home).unwrap();
-        let _env = EnvRestore::set(&[
-            ("HOME", old_home.to_str().unwrap()),
-            (
-                crate::constants::CODESEARCH_HOME_ENV,
-                cs_home.to_str().unwrap(),
-            ),
-            (
-                crate::constants::REPOS_CONFIG_ENV,
-                tmp.path().join("repos.json").to_str().unwrap(),
-            ),
-        ]);
 
         let canonical = crate::cache::safe_canonicalize(&proj).unwrap();
-        let (db, _) = super::get_global_db_path(Some(canonical)).unwrap();
+        let root = super::global_dbs_root_for(Some(old_home.as_path()), &cs_home).unwrap();
+        assert_eq!(
+            root, legacy_root,
+            "an existing legacy store must keep resolving from ~/.codesearch.dbs"
+        );
+        let db = super::global_db_dir_in(&root, &canonical).unwrap();
         assert!(
             db.starts_with(&legacy_root),
             "an existing legacy store must keep resolving from ~/.codesearch.dbs, got {}",
             db.display()
         );
         assert_eq!(
-            db.parent().unwrap().file_name().unwrap(),
+            db.file_name().unwrap(),
             "foo",
             "legacy layout uses the bare project name"
         );

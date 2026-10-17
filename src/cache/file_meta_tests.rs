@@ -445,8 +445,11 @@ fn builder_version_stamp_is_a_generation_marker_not_the_package_version() {
 }
 
 /// save() must replace atomically (tmp + rename): the store is written once
-/// per index batch now, so a crash mid-write must never truncate the file —
-/// and a leftover .tmp from a crashed write must not confuse the next load.
+/// per index batch now, so a crash mid-write must never truncate the file.
+/// Temp names are pid+counter-unique (the refresh task and the FSW update
+/// path may save concurrently), so a crashed writer's leftover .tmp is
+/// never consumed by the next save — the invariant is that leftovers are
+/// ignored on load, while the save's own tmp is consumed by its rename.
 #[test]
 fn save_replaces_atomically_and_leaves_no_tmp_behind() {
     let dir = tempdir().unwrap();
@@ -459,12 +462,29 @@ fn save_replaces_atomically_and_leaves_no_tmp_behind() {
     store.update_file(&test_file, "a.txt", vec![1, 2]).unwrap();
     store.save(db_path).unwrap();
 
-    // A crashed write left a garbage .tmp behind: the next save must
-    // overwrite it and the load must see the real content.
-    let tmp = db_path.join(format!("{}.tmp", crate::constants::FILE_META_DB_NAME));
-    fs::write(&tmp, "{ not json").unwrap();
+    // A crashed write left a garbage .tmp behind (another pid's unique
+    // name): the next save must not touch it, the load must ignore it, and
+    // the real content must survive.
+    let leftover = db_path.join(format!(
+        "{}.999999.0.tmp",
+        crate::constants::FILE_META_DB_NAME
+    ));
+    fs::write(&leftover, "{ not json").unwrap();
     store.save(db_path).unwrap();
-    assert!(!tmp.exists(), "save must consume the tmp file via rename");
+
+    let own_tmp_left = std::fs::read_dir(db_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with(&format!("{}.", crate::constants::FILE_META_DB_NAME))
+                && name.ends_with(".tmp")
+                && name != leftover.file_name().unwrap().to_string_lossy()
+        });
+    assert!(
+        !own_tmp_left,
+        "save must consume its own tmp file via rename"
+    );
 
     let loaded = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
     assert_eq!(loaded.files.len(), 1, "second save must fully replace");

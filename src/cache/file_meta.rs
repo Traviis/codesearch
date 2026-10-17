@@ -272,6 +272,12 @@ pub struct FileMetaStore {
     pub last_full_index: Option<u64>,
     /// Version for format compatibility
     version: u32,
+    /// Chunker/SCIP conventions stamp of the build that produced these
+    /// records. A foreign builder's conventions (line bases, key shapes)
+    /// are not ours — same invalidation policy as the model-name check.
+    /// `#[serde(default)]` keeps pre-stamp stores loadable.
+    #[serde(default)]
+    builder_version: String,
 }
 
 impl FileMetaStore {
@@ -286,6 +292,7 @@ impl FileMetaStore {
             dimensions,
             last_full_index: None,
             version: Self::CURRENT_VERSION,
+            builder_version: crate::constants::INDEX_BUILDER_VERSION.to_string(),
         }
     }
 
