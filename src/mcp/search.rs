@@ -1322,8 +1322,8 @@ impl CodesearchService {
                 path: r.path,
                 // Chunks store 0-indexed lines; every response emits 1-based
                 // editor lines, so the conversion happens once, here.
-                start_line: r.start_line + 1,
-                end_line: r.end_line + 1,
+                start_line: r.start_line,
+                end_line: r.end_line,
                 kind: r.kind,
                 score: r.score,
                 signature: r.signature,

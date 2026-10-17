@@ -347,12 +347,11 @@ impl CodesearchService {
                 Ok(src) => {
                     let lines: Vec<&str> = src.lines().collect();
                     if !lines.is_empty() {
-                        // Chunk lines are 0-based (the 1-based conversion
-                        // happens once at the emit boundary below); the
-                        // slice ends at the row before the chunk's first
-                        // line, which is start_line itself.
-                        let before_end = chunk.start_line.min(lines.len());
+                        // Chunk lines are 1-based; slices need the 0-based
+                        // row before the chunk's first line.
+                        let before_end = chunk.start_line.saturating_sub(1);
                         let before_start = before_end.saturating_sub(context_lines);
+                        let before_end = before_end.min(lines.len());
                         if before_start < before_end {
                             context_before = Some(lines[before_start..before_end].join("\n"));
                         }
@@ -375,8 +374,8 @@ impl CodesearchService {
         let response = GetChunkResponse {
             chunk_id: request.chunk_id,
             path: chunk.path,
-            start_line: chunk.start_line + 1,
-            end_line: chunk.end_line + 1,
+            start_line: chunk.start_line,
+            end_line: chunk.end_line,
             kind: chunk.kind,
             signature: chunk.signature,
             content: chunk.content,
