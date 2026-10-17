@@ -977,7 +977,7 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
                 imported,
                 // `start_line` is the chunk's 0-based first line and `offset`
                 // is 0-based within it; the response emits 1-based lines.
-                line: start_line + offset + 1,
+                line: start_line + offset,
                 kind,
             });
         }

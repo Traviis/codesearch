@@ -1320,8 +1320,8 @@ impl CodesearchService {
             .map(|r| SearchResultItem {
                 chunk_id: Some(r.id),
                 path: r.path,
-                // Chunks store 0-indexed lines; every response emits 1-based
-                // editor lines, so the conversion happens once, here.
+                // Chunks store 1-based editor lines; responses pass them
+                // through unchanged.
                 start_line: r.start_line,
                 end_line: r.end_line,
                 kind: r.kind,

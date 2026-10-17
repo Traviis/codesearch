@@ -5936,14 +5936,14 @@ async fn group_literal_search_relaxed_fallback_covers_partial_term_hits() {
             let mut vs = stores.vector_store.write().await;
             let rich = crate::chunker::Chunk::new(
                 "create package documents quickly".to_string(),
-                0,
+                1,
                 3,
                 crate::chunker::ChunkKind::Comment,
                 "docs/create.md".to_string(),
             );
             let poor = crate::chunker::Chunk::new(
                 "package".to_string(),
-                0,
+                1,
                 1,
                 crate::chunker::ChunkKind::Comment,
                 "docs/other.md".to_string(),
@@ -6016,7 +6016,7 @@ async fn group_literal_search_relaxed_fallback_covers_partial_term_hits() {
     assert_eq!(items[0]["path"], "partial/docs/create.md", "got: {text}");
     assert_eq!(
         items[0]["start_line"], 1,
-        "responses must emit 1-based editor lines (chunk starts at 0-based line 0): {text}"
+        "responses must emit 1-based editor lines (the chunk starts on editor line 1): {text}"
     );
     assert_eq!(
         parsed["relaxed_fallback"],

@@ -135,7 +135,7 @@ impl CodesearchService {
                             &effective_query,
                             snippet_regex.as_ref(),
                         ) {
-                            let match_line = chunk.start_line + match_offset + 1;
+                            let match_line = chunk.start_line + match_offset;
                             items.push(LiteralSearchResultItem {
                                 path: ctx.prefix_sourced_path(alias, &chunk.path),
                                 start_line: match_line,
@@ -189,7 +189,7 @@ impl CodesearchService {
                                     &effective_query,
                                     snippet_regex.as_ref(),
                                 ) {
-                                    let match_line = chunk.start_line + match_offset + 1;
+                                    let match_line = chunk.start_line + match_offset;
                                     items.push(LiteralSearchResultItem {
                                         path: chunk.path,
                                         start_line: match_line,
@@ -423,7 +423,7 @@ impl CodesearchService {
                         let (match_offset, snippet) = match_info.unwrap_or_else(|| {
                             (0, chunk.content.lines().next().unwrap_or("").to_string())
                         });
-                        let match_line = chunk.start_line + match_offset + 1;
+                        let match_line = chunk.start_line + match_offset;
                         items.push(LiteralSearchResultItem {
                             path: ctx.prefix_sourced_path(&fts_hit.alias, &chunk.path),
                             start_line: match_line,
@@ -506,7 +506,7 @@ impl CodesearchService {
                                     let (match_offset, snippet) = match_info.unwrap_or_else(|| {
                                         (0, chunk.content.lines().next().unwrap_or("").to_string())
                                     });
-                                    let match_line = chunk.start_line + match_offset + 1;
+                                    let match_line = chunk.start_line + match_offset;
                                     Some(LiteralSearchResultItem {
                                         path: chunk.path,
                                         start_line: match_line,
