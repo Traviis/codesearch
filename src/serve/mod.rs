@@ -5151,6 +5151,23 @@ async fn reload_handler(
 /// - `symbols=true` — also rebuild the symbol index (C# SCIP) after text reindex.
 ///
 /// Returns 202 Accepted immediately; the reindex runs in the background.
+/// Shared tail of every FORCE reindex — the HTTP handler and the TUI `n`
+/// task both end here, so the two paths cannot drift on whether (or in
+/// which order) the symbol pass runs. The pass is FORCED, and the force
+/// branch carries no flag: "rebuild everything this repo has" is not a
+/// decision a caller (or a future refactor) can opt out of. The explicit
+/// no-force symbol-only trigger is `?symbols=true` on the plain reindex.
+pub(crate) async fn finish_force_reindex(
+    state: &Arc<ServeState>,
+    alias: &str,
+    project_path: &Path,
+    db_path: &Path,
+    stores: Arc<SharedStores>,
+) {
+    state.restart_fsw(alias, stores).await;
+    maybe_rebuild_symbols(alias, project_path, db_path, state, true).await;
+}
+
 async fn reindex_handler(
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -5240,10 +5257,6 @@ async fn reindex_handler(
     // Ensure the guard is removed when we return early or the background task finishes.
     let guard_alias = alias_bg.clone();
     let guard_state = state.clone();
-
-    // `symbols=true` forces a symbol rebuild; without it the rebuild is
-    // gate-driven (missing/stale indexes are still healed).
-    let do_symbols = symbols;
 
     if force {
         // Force rebuild: stop FSW -> clear data in-place -> full reindex -> restart FSW.
@@ -5368,12 +5381,8 @@ async fn reindex_handler(
                 return;
             }
 
-            // 3. Restart FSW with fresh IndexManager.
-            g_state.restart_fsw(&g_alias, stores).await;
-
-            // 4. Symbol index rebuild — gate-driven for every installed
-            // language; `symbols=true` forces it (previous behaviour).
-            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, do_symbols).await;
+            // 3. Shared tail: fresh FSW + FORCED symbol pass.
+            finish_force_reindex(&g_state, &g_alias, &project_path, &db_path, stores).await;
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
@@ -5454,8 +5463,11 @@ async fn reindex_handler(
             }
 
             // Symbol index rebuild — gate-driven for every installed
-            // language; `symbols=true` forces it (previous behaviour).
-            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, do_symbols).await;
+            // language; the explicit `symbols=true` query param forces it
+            // (the no-force, symbol-only trigger). The FORCE branch above
+            // carries no flag at all: it ends in `finish_force_reindex`,
+            // which is always forced — there is no decision left to revert.
+            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, symbols).await;
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });

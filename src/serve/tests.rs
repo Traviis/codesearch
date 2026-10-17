@@ -5151,3 +5151,54 @@ async fn mcp_status_and_projects_answer_starting_pre_first_pass() {
         "projects pre-first-pass must carry the warming warning, got: {text}"
     );
 }
+
+#[tokio::test]
+async fn finish_force_reindex_starts_fsw_and_keeps_guard_contract() {
+    // Seam pin for the shared FORCE tail (HTTP force branch + TUI `n` both
+    // end here). The harness has no SCIP helpers, so the forced symbol
+    // pass is a per-language no-op here — the forced semantics are pinned
+    // by the maybe_rebuild_symbols(force=true) test and by the tail
+    // carrying NO flag a refactor could flip. What this test pins is the
+    // wiring: the tail (re)starts the FSW for the alias and leaves the
+    // reindex guard release to the callers (HTTP/TUI), in that order.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(&project).unwrap();
+    let db_path = project.join(DB_DIR_NAME);
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    let stores = match state
+        .try_open_stores("repo", &db_path, true, false, None)
+        .expect("a fresh repo must open in write mode")
+    {
+        OpenedStores::Write(s) => s,
+        OpenedStores::Readonly(_) => panic!("allow_create=true must open write mode"),
+    };
+    assert!(state.begin_indexing("repo", IndexingOwner::Reindex));
+    // restart_fsw skips aliases that are not registered — register first.
+    state
+        .config
+        .write()
+        .unwrap()
+        .repos
+        .insert("repo".to_string(), project.clone());
+
+    // Production order: the force path builds the index BEFORE the tail,
+    // and the tail's IndexManager init needs a real (empty) index to open.
+    let token = tokio_util::sync::CancellationToken::new();
+    IndexManager::force_reindex_with_stores(&project, &db_path, &stores, None, &token, None)
+        .await
+        .expect("force reindex of an empty repo must succeed");
+
+    super::finish_force_reindex(&state, "repo", &project, &db_path, stores).await;
+
+    assert!(
+        state.fsw_tasks.contains_key("repo"),
+        "the force tail must leave an FSW task registered for the alias"
+    );
+    assert!(
+        state.is_indexing("repo"),
+        "the tail must not release the reindex guard — callers own that"
+    );
+    state.end_indexing("repo", IndexingOwner::Reindex);
+}

@@ -241,6 +241,7 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **v1.5.33 (pending)** — force reindex (`n`, `index -f`) rebuilds the SCIP symbol indexes too — shared `finish_force_reindex` tail for HTTP + TUI; `?symbols=true` stays symbol-only, plain reindex stays gate-driven
 - **v1.5.33 (pending)** — Razor searchable: `.razor`/`.cshtml` via text chunking (Html variant); `obj/`, `.g.cs`, `.designer.cs` excluded as generated
 - **v1.5.33 (pending)** — /status + MCP status answer from a background snapshot (never measure inline): always responsive under rebuild waves, with `snapshot_age_secs` + a `load` summary for calling agents (`CODESEARCH_STATUS_REFRESH_SECS`, default 2s)
 - **v1.5.31 (pending)** — scip-csharp VS-MSBuild restore fallback: NETSDK1045-class CLI SDK gaps (hollow SDK dir, net10-only-in-VS) retry via vswhere + `MSBuild -t:restore`, and MSBuild registration picks a VS instance when no CLI SDK can target the repo
