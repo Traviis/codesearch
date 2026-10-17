@@ -116,6 +116,12 @@ pub(crate) fn compute_projects_snapshot(
 impl CodesearchService {
     /// Unified status tool — dispatches based on `kind`.
     #[tool(
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Unified status/info tool. Set `kind` to choose the action:\n\n- `index` (default): get the status of the local search index (model info, chunk count, readiness)\n- `projects`: list all registered projects/repositories, groups, and their index status"
     )]
     pub(crate) async fn status(

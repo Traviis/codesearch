@@ -95,6 +95,20 @@ fn test_tool_registration_exposes_exactly_the_six_tools() {
         names, expected,
         "tools/list must expose exactly the consolidated 6-tool surface"
     );
+    // Issue #339: every tool is a read-only index query — the declared
+    // readOnlyHint is what lets Claude Code plan mode auto-allow the call.
+    for tool in router.list_all() {
+        let read_only = tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint)
+            .unwrap_or(false);
+        assert!(
+            read_only,
+            "tool {} must declare annotations.read_only_hint = true",
+            tool.name
+        );
+    }
 }
 
 #[cfg(windows)]
