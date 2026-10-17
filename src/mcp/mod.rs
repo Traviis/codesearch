@@ -975,8 +975,8 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
         if let Some((kind, imported)) = parsed {
             items.push(ImportItem {
                 imported,
-                // `start_line` is the chunk's 0-based first line and `offset`
-                // is 0-based within it; the response emits 1-based lines.
+                // `start_line` is the chunk's 1-based first line and `offset`
+                // is 0-based within it; the sum is the match's editor line.
                 line: start_line + offset,
                 kind,
             });
