@@ -677,12 +677,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("keep.rs"), "fn a() {}").unwrap();
         std::fs::write(dir.path().join("drop.py"), "print(1)").unwrap();
-        std::fs::write(
-            dir.path().join(".codesearchinclude"),
-            "*.rs
-",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(".codesearchinclude"), "*.rs\n").unwrap();
 
         let watcher = watcher_with_isolated_home(dir.path().to_path_buf());
         assert!(
