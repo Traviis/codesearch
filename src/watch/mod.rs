@@ -12,8 +12,8 @@ use tokio::sync::Mutex;
 
 use crate::cache::normalize_path;
 use crate::constants::{
-    global_codesearchignore_path, global_codesearchinclude_path, ALWAYS_EXCLUDED,
-    ALWAYS_SKIP_EXTENSIONS, ALWAYS_SKIP_FILENAME_SUFFIXES,
+    global_codesearchignore_path, ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS,
+    ALWAYS_SKIP_FILENAME_SUFFIXES,
 };
 use crate::file::Language;
 
@@ -79,7 +79,7 @@ impl FileWatcher {
     /// Create a new file watcher for the given root directory
     pub fn new(root: PathBuf) -> Self {
         let gitignore = Self::build_gitignore(&root);
-        let include_matcher = Self::build_include_matcher(&root);
+        let include_matcher = crate::file::build_include_matcher(&root);
         Self {
             root,
             debouncer: None,
@@ -185,58 +185,15 @@ impl FileWatcher {
         }
     }
 
-    /// Build the whitelist matcher from `.codesearchinclude` (repo root) and
-    /// the global `~/.codesearch/.codesearchinclude`. `None` when neither
-    /// exists — the watcher then accepts everything the ignore rules allow.
-    /// Same loading order as `build_gitignore` (global lowest, local highest).
-    fn build_include_matcher(root: &Path) -> Option<Gitignore> {
-        let mut builder = GitignoreBuilder::new(root);
-        let mut added_any = false;
-
-        if let Some(global_path) = global_codesearchinclude_path() {
-            if global_path.exists() {
-                if let Some(e) = builder.add(&global_path) {
-                    tracing::debug!("Failed to add global codesearchinclude: {}", e);
-                } else {
-                    added_any = true;
-                }
-            }
-        }
-
-        let local_path = root.join(crate::constants::CODESEARCHINCLUDE_FILE);
-        if local_path.exists() {
-            if let Some(e) = builder.add(&local_path) {
-                tracing::debug!("Failed to add .codesearchinclude: {}", e);
-            } else {
-                added_any = true;
-            }
-        }
-
-        if !added_any {
-            return None;
-        }
-        builder.build().ok()
-    }
-
     /// Whitelist verdict for one path: included when the path itself or an
     /// ancestor matches an include rule (last match along the component
     /// chain wins, so a `!` rule inside the include file un-includes).
-    /// Mirrors `is_gitignored`'s ancestor walk, inverted.
+    /// Delegates to the shared walker helper so both gates cannot drift.
     fn is_included(&self, path: &Path) -> bool {
         let Some(ref inc) = self.include_matcher else {
             return true; // no include list = everything is included
         };
-        let relative = path.strip_prefix(&self.root).unwrap_or(path);
-        let mut current = PathBuf::new();
-        for component in relative.components() {
-            current.push(component);
-            match inc.matched(&current, true) {
-                m if m.is_ignore() => return true,
-                m if m.is_whitelist() => return false,
-                _ => {}
-            }
-        }
-        false
+        crate::file::is_included(inc, &self.root, path)
     }
 
     /// Start watching for file changes
