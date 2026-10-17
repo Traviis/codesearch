@@ -5151,6 +5151,29 @@ async fn reload_handler(
 /// - `symbols=true` — also rebuild the symbol index (C# SCIP) after text reindex.
 ///
 /// Returns 202 Accepted immediately; the reindex runs in the background.
+/// A force reindex promises "rebuild everything this repo has": text index
+/// AND symbol indexes. The `symbols` query param stays as the explicit
+/// no-force way to force only the symbol pass.
+fn force_implies_symbols(force: bool, symbols: bool) -> bool {
+    force || symbols
+}
+
+/// Shared tail of every FORCE reindex — the HTTP handler and the TUI `n`
+/// task both end here, so the two paths cannot drift on whether (or in
+/// which order) the symbol pass runs. The pass is FORCED: a force reindex
+/// that ships 19-hour-old references because no .cs changed defeats the
+/// "rebuild everything" promise (pre-SCIP semantics).
+pub(crate) async fn finish_force_reindex(
+    state: &Arc<ServeState>,
+    alias: &str,
+    project_path: &Path,
+    db_path: &Path,
+    stores: Arc<SharedStores>,
+) {
+    state.restart_fsw(alias, stores).await;
+    maybe_rebuild_symbols(alias, project_path, db_path, state, true).await;
+}
+
 async fn reindex_handler(
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -5242,8 +5265,12 @@ async fn reindex_handler(
     let guard_state = state.clone();
 
     // `symbols=true` forces a symbol rebuild; without it the rebuild is
-    // gate-driven (missing/stale indexes are still healed).
-    let do_symbols = symbols;
+    // gate-driven (missing/stale indexes are still healed). A FORCE reindex
+    // implies it: `n` / `index -f` promise "rebuild everything this repo
+    // has", and a repo carrying a SCIP index must not come out of a force
+    // reindex with 19-hour-old references just because no .cs file changed
+    // (pre-SCIP semantics — the flag predates the symbol indexes).
+    let do_symbols = force_implies_symbols(force, symbols);
 
     if force {
         // Force rebuild: stop FSW -> clear data in-place -> full reindex -> restart FSW.
@@ -5368,12 +5395,8 @@ async fn reindex_handler(
                 return;
             }
 
-            // 3. Restart FSW with fresh IndexManager.
-            g_state.restart_fsw(&g_alias, stores).await;
-
-            // 4. Symbol index rebuild — gate-driven for every installed
-            // language; `symbols=true` forces it (previous behaviour).
-            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, do_symbols).await;
+            // 3. Shared tail: fresh FSW + FORCED symbol pass.
+            finish_force_reindex(&g_state, &g_alias, &project_path, &db_path, stores).await;
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });

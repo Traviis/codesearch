@@ -1252,8 +1252,10 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
             return;
         }
 
-        // Restart FSW with fresh IndexManager.
-        state_bg.restart_fsw(&alias_bg, stores).await;
+        // Shared tail: fresh FSW + FORCED symbol pass (the TUI never ran a
+        // symbol pass at all before — `n` left find_impact on stale
+        // references while the text index was brand new).
+        super::finish_force_reindex(&state_bg, &alias_bg, &project_path, &db_path, stores).await;
 
         // Remove guard
         state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);

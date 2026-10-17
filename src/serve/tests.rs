@@ -5151,3 +5151,17 @@ async fn mcp_status_and_projects_answer_starting_pre_first_pass() {
         "projects pre-first-pass must carry the warming warning, got: {text}"
     );
 }
+
+#[test]
+fn force_reindex_implies_symbol_rebuild() {
+    // `n` / `index -f` promise "rebuild everything this repo has": force
+    // must imply the symbol pass even without ?symbols=true (pre-SCIP
+    // semantics left the SCIP index gate-driven and a fresh gate skipped
+    // it, so a force reindex shipped 19-hour-old references).
+    assert!(crate::serve::force_implies_symbols(true, false));
+    assert!(crate::serve::force_implies_symbols(true, true));
+    // Explicit symbols=true stays the no-force way to force only symbols.
+    assert!(crate::serve::force_implies_symbols(false, true));
+    // Plain reindex stays gate-driven.
+    assert!(!crate::serve::force_implies_symbols(false, false));
+}
