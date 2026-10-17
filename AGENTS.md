@@ -266,4 +266,4 @@ Older entries: see `CHANGELOG.md`.
 Force reindex moet de SCIP-index meenemen (gebruiker: "n of -f op een repo met scip index MOET die mee herbouwen" — ontwerp dateert van vóór SCIP). Fix: (1) reindex-handler do_symbols = force || symbols (was: alleen de losse ?symbols-vlag); (2) TUI n draaide NOOIT een symbol-pass — nu na restart_fsw maybe_rebuild_symbols(force=true), spiegelend aan het HTTP-pad. CLI index -f delegeert met force=true en erft zo de fix; lokale builds hadden nooit een symbol-pass (buiten scope, serve owns symbols).
 
 1. [x] Stage 1: handler + TUI + pin-test (defect-probe uitgevoerd)
-2. [ ] Stage 2: CHANGELOG + highlights + full validation
+2. [x] Stage 2: CHANGELOG + highlights + full validation
