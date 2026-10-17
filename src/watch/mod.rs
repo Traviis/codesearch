@@ -12,8 +12,8 @@ use tokio::sync::Mutex;
 
 use crate::cache::normalize_path;
 use crate::constants::{
-    global_codesearchignore_path, ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS,
-    ALWAYS_SKIP_FILENAME_SUFFIXES,
+    global_codesearchignore_path, global_codesearchinclude_path, ALWAYS_EXCLUDED,
+    ALWAYS_SKIP_EXTENSIONS, ALWAYS_SKIP_FILENAME_SUFFIXES,
 };
 use crate::file::Language;
 
@@ -71,17 +71,21 @@ pub struct FileWatcher {
     receiver: Option<Receiver<DebounceEventResult>>,
     /// Compiled .gitignore matcher for the repo root (None if no .gitignore found).
     gitignore: Option<Gitignore>,
+    /// Whitelist matcher (.codesearchinclude); None = no whitelist active.
+    include_matcher: Option<Gitignore>,
 }
 
 impl FileWatcher {
     /// Create a new file watcher for the given root directory
     pub fn new(root: PathBuf) -> Self {
         let gitignore = Self::build_gitignore(&root);
+        let include_matcher = Self::build_include_matcher(&root);
         Self {
             root,
             debouncer: None,
             receiver: None,
             gitignore,
+            include_matcher,
         }
     }
 
@@ -181,6 +185,60 @@ impl FileWatcher {
         }
     }
 
+    /// Build the whitelist matcher from `.codesearchinclude` (repo root) and
+    /// the global `~/.codesearch/.codesearchinclude`. `None` when neither
+    /// exists — the watcher then accepts everything the ignore rules allow.
+    /// Same loading order as `build_gitignore` (global lowest, local highest).
+    fn build_include_matcher(root: &Path) -> Option<Gitignore> {
+        let mut builder = GitignoreBuilder::new(root);
+        let mut added_any = false;
+
+        if let Some(global_path) = global_codesearchinclude_path() {
+            if global_path.exists() {
+                if let Some(e) = builder.add(&global_path) {
+                    tracing::debug!("Failed to add global codesearchinclude: {}", e);
+                } else {
+                    added_any = true;
+                }
+            }
+        }
+
+        let local_path = root.join(crate::constants::CODESEARCHINCLUDE_FILE);
+        if local_path.exists() {
+            if let Some(e) = builder.add(&local_path) {
+                tracing::debug!("Failed to add .codesearchinclude: {}", e);
+            } else {
+                added_any = true;
+            }
+        }
+
+        if !added_any {
+            return None;
+        }
+        builder.build().ok()
+    }
+
+    /// Whitelist verdict for one path: included when the path itself or an
+    /// ancestor matches an include rule (last match along the component
+    /// chain wins, so a `!` rule inside the include file un-includes).
+    /// Mirrors `is_gitignored`'s ancestor walk, inverted.
+    fn is_included(&self, path: &Path) -> bool {
+        let Some(ref inc) = self.include_matcher else {
+            return true; // no include list = everything is included
+        };
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        let mut current = PathBuf::new();
+        for component in relative.components() {
+            current.push(component);
+            match inc.matched(&current, true) {
+                m if m.is_ignore() => return true,
+                m if m.is_whitelist() => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Start watching for file changes
     pub fn start(&mut self, debounce_ms: u64) -> Result<()> {
         let (tx, rx) = channel();
@@ -269,6 +327,14 @@ impl FileWatcher {
 
         // Check .gitignore rules (relative to repo root)
         if self.is_gitignored(path) {
+            return false;
+        }
+
+        // Whitelist gate: with an active include list, a file no include
+        // rule covers is not watchable (never indexed incrementally). Runs
+        // AFTER the ignore machinery — an include can never resurrect an
+        // ignored file.
+        if !self.is_included(path) {
             return false;
         }
 
@@ -647,6 +713,38 @@ impl GitHeadWatcher {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn include_list_gates_the_watcher() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("drop.py"), "print(1)").unwrap();
+        std::fs::write(
+            dir.path().join(".codesearchinclude"),
+            "*.rs
+",
+        )
+        .unwrap();
+
+        let watcher = FileWatcher::new(dir.path().to_path_buf());
+        assert!(
+            watcher.is_watchable(&dir.path().join("keep.rs")),
+            "whitelisted file must be watchable"
+        );
+        assert!(
+            !watcher.is_watchable(&dir.path().join("drop.py")),
+            "file outside the include list must not be watchable"
+        );
+
+        // Absent include list: everything the ignore rules allow.
+        let dir2 = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir2.path().join("drop.py"), "print(1)").unwrap();
+        let watcher2 = FileWatcher::new(dir2.path().to_path_buf());
+        assert!(
+            watcher2.is_watchable(&dir2.path().join("drop.py")),
+            "no include list = historical behavior"
+        );
+    }
     use super::*;
     use crate::testing::EnvRestore;
     use serial_test::serial;
