@@ -148,6 +148,12 @@ pub fn get_global_cache_dir() -> PathBuf {
 /// Name of the global codesearchignore file in ~/.codesearch/
 pub const GLOBAL_CODESEARCHIGNORE_FILE: &str = ".codesearchignore";
 
+/// Name of the per-repo and global whitelist file. When it exists (repo
+/// root or ~/.codesearch/), ONLY files matching its gitignore-style rules
+/// are indexed — ignore rules still win first. Absent = index everything
+/// the ignore rules allow (the historical behavior).
+pub const CODESEARCHINCLUDE_FILE: &str = ".codesearchinclude";
+
 /// Get the path to the global .codesearchignore file
 /// (`<codesearch_home>/.codesearchignore`).
 ///
@@ -161,6 +167,13 @@ pub fn global_codesearchignore_path() -> Option<PathBuf> {
     codesearch_home()
         .ok()
         .map(|root| root.join(GLOBAL_CODESEARCHIGNORE_FILE))
+}
+
+/// The global whitelist file in ~/.codesearch/ (applies to every repo).
+pub fn global_codesearchinclude_path() -> Option<PathBuf> {
+    codesearch_home()
+        .ok()
+        .map(|root| root.join(CODESEARCHINCLUDE_FILE))
 }
 
 /// Name of the global extension→language map file in ~/.codesearch/

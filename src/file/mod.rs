@@ -1,12 +1,13 @@
 use anyhow::Result;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use crate::constants::{
-    global_codesearchignore_path, ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS,
-    ALWAYS_SKIP_FILENAME_SUFFIXES,
+    global_codesearchignore_path, global_codesearchinclude_path, ALWAYS_EXCLUDED,
+    ALWAYS_SKIP_EXTENSIONS, ALWAYS_SKIP_FILENAME_SUFFIXES,
 };
 
 mod binary;
@@ -25,7 +26,6 @@ pub struct FileInfo {
 
 /// Statistics about walked files
 #[derive(Debug, Default, Clone)]
-#[allow(dead_code)] // skipped_ignored reserved for future ignore stats
 pub struct WalkStats {
     pub total_files: usize,
     pub indexable_files: usize,
@@ -44,6 +44,10 @@ impl WalkStats {
         self.indexable_files += 1;
         self.total_size_bytes += file.size;
         *self.files_by_language.entry(file.language).or_insert(0) += 1;
+    }
+
+    pub fn add_skipped_ignored(&mut self) {
+        self.skipped_ignored += 1;
     }
 
     pub fn add_skipped_binary(&mut self) {
@@ -77,6 +81,60 @@ pub struct FileWalker {
     root: PathBuf,
     respect_gitignore: bool,
     include_hidden: bool,
+}
+
+/// Build the whitelist matcher from `.codesearchinclude` (repo root) and the
+/// global `~/.codesearch/.codesearchinclude` (lowest precedence). `None` when
+/// neither exists — the walker then indexes everything the ignore rules
+/// allow, exactly as before. When a matcher EXISTS, it is a whitelist: a
+/// file is indexed only when the include rules match it (the file itself or
+/// an ancestor — `src/` covers `src/a/b.rs`), and ignore rules still win
+/// first: an include can never resurrect an ignored file.
+fn build_include_matcher(root: &Path) -> Option<Gitignore> {
+    let mut builder = GitignoreBuilder::new(root);
+    let mut added_any = false;
+
+    if let Some(global_path) = global_codesearchinclude_path() {
+        if global_path.exists() {
+            if let Some(e) = builder.add(&global_path) {
+                debug!("Failed to add global codesearchinclude: {}", e);
+            } else {
+                added_any = true;
+            }
+        }
+    }
+
+    let local_path = root.join(".codesearchinclude");
+    if local_path.exists() {
+        if let Some(e) = builder.add(&local_path) {
+            debug!("Failed to add .codesearchinclude: {}", e);
+        } else {
+            added_any = true;
+        }
+    }
+
+    if !added_any {
+        return None;
+    }
+    builder.build().ok()
+}
+
+/// Whitelist verdict for one path against the include matcher: `true` when
+/// the file is included (the path itself or an ancestor matches an include
+/// rule; a `!`-whitelist rule inside the include file un-includes again —
+/// last match along the component chain wins, mirroring gitignore order).
+fn is_included(matcher: &Gitignore, root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let mut current = PathBuf::new();
+    for component in relative.components() {
+        current.push(component);
+        match matcher.matched(&current, true) {
+            m if m.is_ignore() => return true,
+            m if m.is_whitelist() => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 impl FileWalker {
@@ -117,6 +175,13 @@ impl FileWalker {
         debug!("Starting file walk in: {}", self.root.display());
 
         let mut builder = WalkBuilder::new(&self.root);
+        // Whitelist mode: when a .codesearchinclude exists (repo or global),
+        // ONLY files matching it are indexed. Absent = everything, as before.
+        let include_matcher = build_include_matcher(&self.root);
+        if include_matcher.is_some() {
+            debug!("Include list active: indexing only .codesearchinclude matches");
+        }
+
         builder
             .git_ignore(self.respect_gitignore)
             .git_global(self.respect_gitignore)
@@ -197,6 +262,18 @@ impl FileWalker {
                                 debug!("Skipping excluded extension .{}: {}", ext, path.display());
                                 continue;
                             }
+                        }
+                    }
+
+                    // Whitelist gate: with an active include list, a file
+                    // that no include rule covers is not indexed. Runs AFTER
+                    // the ignore machinery — an include can never resurrect
+                    // an ignored file.
+                    if let Some(inc) = &include_matcher {
+                        if !is_included(inc, &self.root, path) {
+                            stats.add_skipped_ignored();
+                            debug!("Skipping file not in include list: {}", path.display());
+                            continue;
                         }
                     }
 
@@ -406,5 +483,58 @@ mod tests {
         fs::write(ok_root.join("main.rs"), "fn main() {}").unwrap();
         let (files, _) = FileWalker::new(&ok_root).walk().unwrap();
         assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn include_list_whitelists_matching_files_only() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("keep.rs"), "fn a() {}").unwrap();
+        fs::write(dir.path().join("drop.py"), "print(1)").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src").join("nested.rs"), "fn b() {}").unwrap();
+        // Ancestor pattern `src/` must cover nested files.
+        fs::write(dir.path().join(".codesearchinclude"), "*.rs\nsrc/\n").unwrap();
+
+        let walker = FileWalker::new(dir.path());
+        let (files, stats) = walker.walk().unwrap();
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"keep.rs".to_string()));
+        assert!(names.contains(&"nested.rs".to_string()));
+        assert!(!names.contains(&"drop.py".to_string()));
+        assert_eq!(stats.indexable_files, 2);
+        assert_eq!(stats.skipped_ignored, 1);
+    }
+
+    #[test]
+    fn include_list_negation_unincludes_again() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("keep.rs"), "fn a() {}").unwrap();
+        fs::write(dir.path().join("gen.rs"), "generated").unwrap();
+        fs::write(dir.path().join(".codesearchinclude"), "*.rs\n!gen.rs\n").unwrap();
+
+        let walker = FileWalker::new(dir.path());
+        let (files, _) = walker.walk().unwrap();
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"keep.rs".to_string()));
+        assert!(!names.contains(&"gen.rs".to_string()));
+    }
+
+    #[test]
+    fn no_include_file_indexes_everything() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        fs::write(dir.path().join("b.py"), "print(1)").unwrap();
+
+        let walker = FileWalker::new(dir.path());
+        let (files, _) = walker.walk().unwrap();
+        assert_eq!(files.len(), 2, "absent include list = historical behavior");
     }
 }
