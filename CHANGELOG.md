@@ -26,6 +26,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **`GET /status` and the MCP `status` tool always answer, even under a heavy rebuild wave.** They used to measure inline in the request path: per registered repo several filesystem probes plus a SCIP LMDB env open and a sysinfo refresh, synchronous on async workers that a rebuild wave (dotnet restore + scip-csharp children) starves — with 28 repos one call took tens of seconds and polling clients (remote TUI, calling agents) piled up and timed out; the project list died the same death. Now a single background task measures (on the blocking pool, one pass at a time — under load the cadence stretches instead of piling measuring tasks onto a starved machine) and stores a snapshot whose readers answer in microseconds. Every answer carries `snapshot_age_secs` (staleness is visible, never a hang) and a `load` summary (`text_indexing` / `symbol_indexing` / `errored` / `refresh_interval_secs`) so calling agents can throttle themselves; before the first pass completes they answer `"starting"` immediately. Cadence: `CODESEARCH_STATUS_REFRESH_SECS`, default 2s.
 
+### Added
+
+- **A `.codesearchinclude` whitelist can now restrict indexing to matching files.** Next to the ignore machinery there was no way to say "index ONLY these". When a `.codesearchinclude` exists at the repo root (plus a global `~/.codesearch/.codesearchinclude`, lowest precedence), a file is indexed only when the file itself or an ancestor matches its gitignore-style rules (`src/` covers `src/a/b.rs`), and a `!`-rule un-includes again (last match along the component chain wins, mirroring gitignore order). Ignore rules still win first — an include can never resurrect an ignored file — and an absent or empty list keeps the historical behavior. Both gates share the semantics: the walker (the gate runs after the ignore machinery, before the binary probe, counted in the skipped-ignored stat) and the watcher's `is_watchable`, so incremental reindex follows the same whitelist.
+
 ## [1.5.31]
 
 ### Changed
