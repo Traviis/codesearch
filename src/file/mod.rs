@@ -85,12 +85,15 @@ pub struct FileWalker {
 
 /// Build the whitelist matcher from `.codesearchinclude` (repo root) and the
 /// global `~/.codesearch/.codesearchinclude` (lowest precedence). `None` when
-/// neither exists — the walker then indexes everything the ignore rules
+/// neither exists — or when both exist but carry no rules (empty or
+/// comments-only) — the caller then indexes everything the ignore rules
 /// allow, exactly as before. When a matcher EXISTS, it is a whitelist: a
 /// file is indexed only when the include rules match it (the file itself or
 /// an ancestor — `src/` covers `src/a/b.rs`), and ignore rules still win
 /// first: an include can never resurrect an ignored file.
-fn build_include_matcher(root: &Path) -> Option<Gitignore> {
+///
+/// Shared by the walker and the watcher so the two gates cannot drift.
+pub(crate) fn build_include_matcher(root: &Path) -> Option<Gitignore> {
     let mut builder = GitignoreBuilder::new(root);
     let mut added_any = false;
 
@@ -116,25 +119,34 @@ fn build_include_matcher(root: &Path) -> Option<Gitignore> {
     if !added_any {
         return None;
     }
-    builder.build().ok()
+    let matcher = builder.build().ok()?;
+    // A present-but-empty file (no rules — e.g. only `#` comments) is not a
+    // whitelist: `matched` would answer None for every path and index
+    // nothing, contradicting the "absent or empty = historical behavior"
+    // contract.
+    if matcher.num_ignores() == 0 && matcher.num_whitelists() == 0 {
+        return None;
+    }
+    Some(matcher)
 }
 
 /// Whitelist verdict for one path against the include matcher: `true` when
 /// the file is included (the path itself or an ancestor matches an include
 /// rule; a `!`-whitelist rule inside the include file un-includes again —
 /// last match along the component chain wins, mirroring gitignore order).
-fn is_included(matcher: &Gitignore, root: &Path, path: &Path) -> bool {
+pub(crate) fn is_included(matcher: &Gitignore, root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let mut current = PathBuf::new();
+    let mut included = false;
     for component in relative.components() {
         current.push(component);
         match matcher.matched(&current, true) {
-            m if m.is_ignore() => return true,
-            m if m.is_whitelist() => return false,
+            m if m.is_ignore() => included = true,
+            m if m.is_whitelist() => included = false,
             _ => {}
         }
     }
-    false
+    included
 }
 
 impl FileWalker {
@@ -536,5 +548,50 @@ mod tests {
         let walker = FileWalker::new(dir.path());
         let (files, _) = walker.walk().unwrap();
         assert_eq!(files.len(), 2, "absent include list = historical behavior");
+    }
+
+    #[test]
+    fn include_list_ancestor_negation_unincludes_again() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src").join("keep.rs"), "fn a() {}").unwrap();
+        fs::write(dir.path().join("src").join("gen.rs"), "generated").unwrap();
+        fs::write(dir.path().join("drop.py"), "print(1)").unwrap();
+        // The ancestor include decides first, the deeper `!` rule must win:
+        // last decisive match along the component chain.
+        fs::write(dir.path().join(".codesearchinclude"), "src/\n!src/gen.rs\n").unwrap();
+
+        let walker = FileWalker::new(dir.path());
+        let (files, stats) = walker.walk().unwrap();
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"keep.rs".to_string()));
+        assert!(
+            !names.contains(&"gen.rs".to_string()),
+            "the !-rule under an included ancestor must un-include"
+        );
+        assert!(!names.contains(&"drop.py".to_string()));
+        assert_eq!(stats.indexable_files, 1);
+        assert_eq!(stats.skipped_ignored, 2);
+    }
+
+    #[test]
+    fn include_list_present_but_empty_indexes_everything() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        fs::write(dir.path().join("b.py"), "print(1)").unwrap();
+        // Comments only: no rules, so this is not a whitelist.
+        fs::write(dir.path().join(".codesearchinclude"), "# nothing yet\n").unwrap();
+
+        let walker = FileWalker::new(dir.path());
+        let (files, _) = walker.walk().unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "a present-but-empty include list = historical behavior"
+        );
     }
 }
