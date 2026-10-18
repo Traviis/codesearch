@@ -250,6 +250,15 @@ fn hide_db_dir_on_windows(db_path: &Path) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    // The fts/ subdir is created lazily by the tantivy writer and does not
+    // inherit the parent's hidden attribute; hide it too so no indexer ever
+    // crawls fresh segment files. Best-effort, same as the parent.
+    let _ = std::process::Command::new("attrib")
+        .arg("+H")
+        .arg(db_path.join("fts"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(not(windows))]
@@ -1315,11 +1324,7 @@ impl IndexManager {
         cancel_token: &CancellationToken,
         embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
-        const FTS_TRANSIENT_BACKOFFS: [std::time::Duration; 2] = [
-            std::time::Duration::from_secs(5),
-            std::time::Duration::from_secs(20),
-        ];
-        Self::retry_on_transient_fts(&FTS_TRANSIENT_BACKOFFS, || async {
+        Self::retry_on_transient_fts(&Self::FTS_TRANSIENT_BACKOFFS, || async {
             Self::force_reindex_with_stores_once(
                 codebase_path,
                 db_path,
@@ -1362,6 +1367,14 @@ impl IndexManager {
         }
         attempt().await
     }
+
+    /// Backoffs for the transient Windows FTS commit race redrive: one extra
+    /// full pass per entry, then a final attempt. Shared by force reindex and
+    /// the per-file incremental paths so they cannot drift apart.
+    const FTS_TRANSIENT_BACKOFFS: [std::time::Duration; 2] = [
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(20),
+    ];
 
     async fn force_reindex_with_stores_once(
         codebase_path: &Path,
@@ -2558,8 +2571,12 @@ impl IndexManager {
         Self::ensure_indexing_active(cancel_token)?;
         for file_path in &files_to_index {
             debug!("📄 Indexing: {}", file_path.display());
-            if let Err(e) =
+            // Redrive the per-file attempt on the transient Windows FTS
+            // commit race — the same protection force reindex already has.
+            if let Err(e) = Self::retry_on_transient_fts(&Self::FTS_TRANSIENT_BACKOFFS, || async {
                 Self::index_single_file(codebase_path, file_path, stores, embedding_pool).await
+            })
+            .await
             {
                 warn!("⚠️  Failed to index {}: {}", file_path.display(), e);
             }
@@ -2810,8 +2827,14 @@ impl IndexManager {
             Self::ensure_indexing_active(cancel_token)?;
             let reindex_count = files_to_reindex.len();
             for file_path in &files_to_reindex {
+                // Redrive on the transient Windows FTS commit race — the
+                // same protection force reindex already has.
                 if let Err(e) =
-                    Self::index_single_file(codebase_path, file_path, stores, embedding_pool).await
+                    Self::retry_on_transient_fts(&Self::FTS_TRANSIENT_BACKOFFS, || async {
+                        Self::index_single_file(codebase_path, file_path, stores, embedding_pool)
+                            .await
+                    })
+                    .await
                 {
                     warn!("⚠️  Failed to re-index {}: {}", file_path.display(), e);
                 }
