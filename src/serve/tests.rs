@@ -5668,6 +5668,100 @@ async fn get_chunk_reports_the_real_chunker_editor_line_unchanged() {
     }
 }
 
+/// get_chunk warns when the source file on disk is newer than the last
+/// indexing write (file_meta.json's mtime): the indexed lines may not match
+/// disk — pending re-index, or the last pass failed (the HUSQ symptom).
+#[tokio::test]
+async fn get_chunk_notes_stale_source_newer_than_last_indexing_write() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("solo");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = "fn stale_fn() {}\n";
+    std::fs::write(root.join("lib.rs"), source).unwrap();
+
+    let mut chunker = crate::chunker::SemanticChunker::new(100, 4000, 2);
+    let chunks = chunker
+        .chunk_semantic(
+            crate::file::Language::Rust,
+            std::path::Path::new("lib.rs"),
+            source,
+        )
+        .expect("real chunker must parse the source");
+    let target = chunks.first().expect("at least one chunk").clone();
+
+    let db_path = root.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            target.clone(),
+            vec![0.5, 0.5],
+        )])
+        .expect("insert chunk");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(
+            0,
+            &target.content,
+            &target.path,
+            target.signature.as_deref(),
+            &format!("{:?}", target.kind),
+        )
+        .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+
+    // file_meta.json = the last indexing write; then edit the source so its
+    // mtime is strictly newer than the index.
+    let mut meta = crate::cache::FileMetaStore::new("minilm-l6-q".to_string(), 2);
+    meta.update_file(&root.join("lib.rs"), "lib.rs", vec![0])
+        .unwrap();
+    meta.save(&db_path).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::write(root.join("lib.rs"), "fn stale_fn() {}\n// edited\n").unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root.clone(), Some("solo".to_string()))
+        .unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 0,
+        chunk_ref: None,
+        context_lines: None,
+        project: None,
+        group: None,
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("get_chunk must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        parsed["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("modified after the last indexing pass")),
+        "a source file newer than file_meta.json must carry the stale note, got: {text}"
+    );
+}
+
 /// The no-download model gate: with an empty model cache, a semantic search
 /// must answer the explicit refusal (naming `codesearch setup`) instead of
 /// turning the query into an unbounded network fetch — the whole-night serve

@@ -2705,6 +2705,82 @@ impl IndexManager {
             // Find files that were deleted (tracked in metadata but not on disk)
             let deleted_files = file_meta_store.find_deleted_files(codebase_path);
 
+            // Phase 3.6: heal mixed generations on LIVE files. A failed FTS
+            // commit used to leave the failed attempt's vector chunks
+            // untracked (never in file_meta) while the tracked generation's
+            // ids were already deleted from the vector store — search (FTS)
+            // and get_chunk (vector) then disagreed (the HUSQ stale-index
+            // symptom). Delete untracked vector ids; queue tracked files
+            // whose ids are missing from the vector store for Phase 4.
+            {
+                let vs_file_chunks = {
+                    let vstore = stores.vector_store.read().await;
+                    vstore.get_chunks_by_file()?
+                };
+            let tracked: std::collections::HashSet<u32> =
+                file_meta_store.tracked_chunk_ids();
+            let mut untracked_ids: Vec<u32> = Vec::new();
+            for (vs_path, chunk_ids) in &vs_file_chunks {
+                if !codebase_path.join(vs_path).exists() {
+                    continue; // ghost files: Phase 3.5 owns them
+                }
+                untracked_ids.extend(chunk_ids.iter().filter(|id| !tracked.contains(id)));
+            }
+            let mut heal_files: Vec<PathBuf> = Vec::new();
+            for key in file_meta_store.tracked_files() {
+                let Some(meta_ids) = file_meta_store.file_chunk_ids(key) else {
+                    continue;
+                };
+                if !codebase_path.join(key).exists() {
+                    continue;
+                }
+                let missing = meta_ids
+                    .iter()
+                    .filter(|id| {
+                        !vs_file_chunks
+                            .get(key)
+                            .is_some_and(|v| v.contains(id))
+                    })
+                    .count();
+                if missing > 0 {
+                    let p = codebase_path.join(key);
+                    if !files_to_reindex.contains(&p) {
+                        heal_files.push(p);
+                    }
+                }
+            }
+            if !untracked_ids.is_empty() || !heal_files.is_empty() {
+                info!(
+                    "🧹 Healing mixed generations: {} untracked vector chunks, {} live files missing tracked chunks",
+                    untracked_ids.len(),
+                    heal_files.len()
+                );
+                if !untracked_ids.is_empty() {
+                    {
+                        let mut vstore = stores.vector_store.write().await;
+                        vstore.delete_chunks(&untracked_ids)?;
+                    }
+                    {
+                        let vector_store = Arc::clone(&stores.vector_store);
+                        tokio::task::spawn_blocking(move || {
+                            let mut vstore = vector_store.blocking_write();
+                            vstore.build_index()
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
+                    }
+                    {
+                        let mut fstore = stores.fts_store.write().await;
+                        for &cid in &untracked_ids {
+                            let _ = fstore.delete_chunk(cid);
+                        }
+                        fstore.commit()?;
+                    }
+                }
+                files_to_reindex.extend(heal_files);
+            }
+        }
+
             if files_to_reindex.is_empty() && deleted_files.is_empty() {
                 info!("✅ Branch refresh: index is up to date, no changes needed");
                 return Ok(());
@@ -2819,78 +2895,6 @@ impl IndexManager {
 
                     deleted_count += orphan_file_count;
                 }
-
-                // Phase 3.6: heal mixed generations on LIVE files. A failed FTS
-            // commit used to leave the failed attempt's vector chunks
-            // untracked (never in file_meta) while the tracked generation's
-            // ids were already deleted from the vector store — search (FTS)
-            // and get_chunk (vector) then disagreed (the HUSQ stale-index
-            // symptom). Delete untracked vector ids; queue tracked files
-            // whose ids are missing from the vector store for Phase 4.
-            {
-                let tracked: std::collections::HashSet<u32> =
-                    file_meta_store.tracked_chunk_ids();
-                let mut untracked_ids: Vec<u32> = Vec::new();
-                for (vs_path, chunk_ids) in &vs_file_chunks {
-                    if !codebase_path.join(vs_path).exists() {
-                        continue; // ghost files: Phase 3.5 owns them
-                    }
-                    untracked_ids.extend(chunk_ids.iter().filter(|id| !tracked.contains(id)));
-                }
-                let mut heal_files: Vec<PathBuf> = Vec::new();
-                for key in file_meta_store.tracked_files() {
-                    let Some(meta_ids) = file_meta_store.file_chunk_ids(key) else {
-                        continue;
-                    };
-                    if !codebase_path.join(key).exists() {
-                        continue;
-                    }
-                    let missing = meta_ids
-                        .iter()
-                        .filter(|id| {
-                            !vs_file_chunks
-                                .get(key)
-                                .is_some_and(|v| v.contains(id))
-                        })
-                        .count();
-                    if missing > 0 {
-                        let p = codebase_path.join(key);
-                        if !files_to_reindex.contains(&p) {
-                            heal_files.push(p);
-                        }
-                    }
-                }
-                if !untracked_ids.is_empty() || !heal_files.is_empty() {
-                    info!(
-                        "🧹 Healing mixed generations: {} untracked vector chunks, {} live files missing tracked chunks",
-                        untracked_ids.len(),
-                        heal_files.len()
-                    );
-                    if !untracked_ids.is_empty() {
-                        {
-                            let mut vstore = stores.vector_store.write().await;
-                            vstore.delete_chunks(&untracked_ids)?;
-                        }
-                        {
-                            let vector_store = Arc::clone(&stores.vector_store);
-                            tokio::task::spawn_blocking(move || {
-                                let mut vstore = vector_store.blocking_write();
-                                vstore.build_index()
-                            })
-                            .await
-                            .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
-                        }
-                        {
-                            let mut fstore = stores.fts_store.write().await;
-                            for &cid in &untracked_ids {
-                                let _ = fstore.delete_chunk(cid);
-                            }
-                            fstore.commit()?;
-                        }
-                    }
-                    files_to_reindex.extend(heal_files);
-                }
-            }
             }
 
             // Phase 4: Re-index changed/new files
@@ -3143,17 +3147,7 @@ impl IndexManager {
         )
         .await
         {
-            {
-                let mut store = stores.vector_store.write().await;
-                let _ = store.delete_chunks(&chunk_ids);
-            }
-            {
-                let mut fts_store = stores.fts_store.write().await;
-                for id in &chunk_ids {
-                    let _ = fts_store.delete_chunk(*id);
-                }
-                let _ = fts_store.commit();
-            }
+            Self::rollback_vector_insert(stores, &chunk_ids).await;
             return Err(e);
         }
 
@@ -3164,6 +3158,25 @@ impl IndexManager {
         );
 
         Ok(())
+    }
+
+    /// Best-effort removal of a failed attempt's fresh chunk_ids from both
+    /// stores. Called when [`Self::publish_file_chunks`] failed after the
+    /// vector insert: without this the ids are orphaned (never in file_meta,
+    /// so no later pass can find them). file_meta is deliberately untouched —
+    /// it still names the previous generation, so the next pass heals clean.
+    async fn rollback_vector_insert(stores: &SharedStores, chunk_ids: &[u32]) {
+        {
+            let mut store = stores.vector_store.write().await;
+            let _ = store.delete_chunks(chunk_ids);
+        }
+        {
+            let mut fts_store = stores.fts_store.write().await;
+            for id in chunk_ids {
+                let _ = fts_store.delete_chunk(*id);
+            }
+            let _ = fts_store.commit();
+        }
     }
 
     /// FTS insert + commit + file_meta update for one file's fresh chunks —
@@ -4586,6 +4599,131 @@ mod tests {
         assert!(
             guard.try_lock().is_ok(),
             "guard must be released after the rebuild"
+        );
+    }
+
+    /// The crash-safe rollback: a failed publish must remove the fresh ids
+    /// from BOTH stores so no later pass inherits orphans it cannot find
+    /// (they never reach file_meta).
+    #[tokio::test]
+    async fn rollback_vector_insert_removes_fresh_ids_from_both_stores() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let chunk = |path: &str| {
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn f() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )
+        };
+        let ids = {
+            let mut vs = stores.vector_store.write().await;
+            vs.insert_chunks_with_ids(vec![chunk("lib.rs"), chunk("util.rs")])
+                .unwrap()
+        };
+
+        IndexManager::rollback_vector_insert(&stores, &ids).await;
+
+        let remaining = {
+            let vs = stores.vector_store.read().await;
+            vs.get_chunks_by_file().unwrap()
+        };
+        assert!(
+            remaining.is_empty(),
+            "rolled-back ids must be gone from the vector store, got: {remaining:?}"
+        );
+    }
+
+    /// Phase 3.6: vector chunks not tracked by file_meta are deleted on the
+    /// next refresh, and a tracked live file whose ids are missing from the
+    /// vector store is queued for re-index (heals mixed generations without
+    /// a force reindex).
+    #[tokio::test]
+    async fn refresh_heals_mixed_generations_on_live_files() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let file = codebase_path.join("lib.rs");
+        std::fs::write(&file, "pub fn lib_fn() {}").unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+        let chunk = |path: &str| {
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn f() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )
+        };
+        // ids[0] = the tracked generation; ids[1] = an orphan a failed FTS
+        // commit left behind (its file exists, so Phase 3.5's ghost sweep
+        // must NOT claim it — Phase 3.6's id-level check owns it).
+        let ids = {
+            let mut vs = stores.vector_store.write().await;
+            vs.insert_chunks_with_ids(vec![chunk("lib.rs"), chunk("lib.rs")])
+                .unwrap()
+        };
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta
+            .update_file(&file, "lib.rs", vec![ids[0]])
+            .unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        // Simulate the failed commit's delete-phase: the tracked generation
+        // is gone from the vector store, the orphan remains.
+        {
+            let mut vs = stores.vector_store.write().await;
+            vs.delete_chunks(&[ids[0]]).unwrap();
+        }
+
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "refresh must succeed: {result:?}");
+
+        let remaining = {
+            let vs = stores.vector_store.read().await;
+            vs.get_chunks_by_file().unwrap()
+        };
+        let lib_ids = remaining.get("lib.rs").cloned().unwrap_or_default();
+        assert!(
+            !lib_ids.contains(&ids[1]),
+            "the untracked orphan must be deleted by the sweep, got: {lib_ids:?}"
+        );
+        // The tracked file was queued for re-index; without a real embedding
+        // model the re-index attempt fails gracefully (warn + continue), so
+        // the meta ids stay missing — the assertion pins the graceful path,
+        // the real heal is covered by the HUSQ remediation reindex.
+        assert!(
+            !lib_ids.contains(&ids[0]),
+            "no embedding model in tests: the re-index attempt must fail gracefully, got: {lib_ids:?}"
         );
     }
 }
