@@ -275,20 +275,20 @@ inserts into VECTOR before the FTS commit with no rollback -> orphaned
 vector chunks + lingering old FTS chunks + stale meta = mixed generations
 (HUSQ.Aprimo-209169-import-progress-table symptom).
 
-- [ ] Stage 1: per-file transient-FTS redrive — wrap the incremental
+- [x] Stage 1: per-file transient-FTS redrive — wrap the incremental
       per-file/batch paths with retry_on_transient_fts (same backoffs as
       force_reindex); fts/ subdir also marked hidden on Windows (belt and
       suspenders vs Search indexer).
-- [ ] Stage 2: crash-safe per-file indexing — on ANY error after the vector
+- [x] Stage 2: crash-safe per-file indexing — on ANY error after the vector
       insert, best-effort delete the just-inserted chunk_ids from BOTH
       stores before returning Err; file_meta stays old so the next pass
       heals clean (no orphans).
-- [ ] Stage 3: orphan sweep in refresh_index_with_stores — compare vector
+- [x] Stage 3: orphan sweep in refresh_index_with_stores — compare vector
       chunk ids vs file_meta chunk-id sum, delete orphans; heals existing
       corrupted indexes without force reindex.
-- [ ] Stage 4: stale warning on get_chunk — stat the file vs per-repo
+- [x] Stage 4: stale warning on get_chunk — stat the file vs per-repo
       last_indexed_unix in ServeState (set via indexing callback).
-- [ ] Stage 5: tests (FTS-failure simulation: no orphans, meta unchanged,
+- [x] Stage 5: tests (FTS-failure simulation: no orphans, meta unchanged,
       next pass heals; orphan sweep; stale warning) + CHANGELOG + highlights
       + full validation (fmt, clippy, cargo test --lib --bins AND
       cargo test --test '*') + PR + merge + force reindex the HUSQ worktree.
