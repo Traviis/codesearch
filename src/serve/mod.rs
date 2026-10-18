@@ -5664,12 +5664,28 @@ fn resolve_add_repo_model(
     })
 }
 
+/// Whether `POST /repos` may keep an index already on disk instead of
+/// force-rebuilding it.
+///
+/// Adopt when the index recorded a model and no model change was requested;
+/// `None` from `from_index_metadata` means there is no usable index (or a
+/// pre-model legacy index), which the destructive force path rebuilds. An
+/// explicit/override model that differs from the recorded one invalidates every
+/// stored vector (dimensions and vector space change), so it must rebuild.
+fn should_adopt_existing_index(
+    recorded: Option<crate::embed::ModelType>,
+    model_override: Option<crate::embed::ModelType>,
+) -> bool {
+    recorded.is_some() && model_override.is_none_or(|requested| recorded == Some(requested))
+}
+
 /// Add-repo handler: POST /repos
 ///
 /// Registers a new repo in repos.json, opens the LMDB/Tantivy stores inline
 /// (fast — prevents the double-open race from the old `index_quiet` path),
-/// then spawns a full reindex + vector index build + FSW start in the
-/// background. Returns 202 Accepted immediately.
+/// then spawns the indexing work in the background: an incremental refresh when
+/// an index already exists (adopted), a full reindex otherwise. Returns 202
+/// Accepted immediately.
 async fn add_repo_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
     axum::extract::Json(body): axum::extract::Json<AddRepoRequest>,
@@ -5735,11 +5751,19 @@ async fn add_repo_handler(
     // creating a brand-new index: an existing index keeps the model recorded in
     // its `metadata.json`, exactly as if the flag had not been set. An explicit
     // `model` still wins and rebuilds at that model's dimension.
-    let model_override = resolve_add_repo_model(
-        explicit_model,
-        crate::embed::ModelType::from_index_metadata(&db_path),
-        state.default_model(),
-    );
+    let recorded_model = crate::embed::ModelType::from_index_metadata(&db_path);
+    let model_override =
+        resolve_add_repo_model(explicit_model, recorded_model, state.default_model());
+
+    // A usable index already on disk is adopted (incremental refresh), never
+    // thrown away: `POST /repos` is also the registration path behind
+    // `codesearch index add`, whose local path explicitly reuses an existing
+    // index. Force-rebuilding every registration meant adding N already-indexed
+    // repos cleared all N indexes and re-embedded them, serialized behind the
+    // heavy-job gate — minutes-to-hours of no visible progress for work that was
+    // already on disk. Build fresh only when there is no index yet or the caller
+    // asked for a different embedding model (the dimensions change).
+    let adopt_existing = should_adopt_existing_index(recorded_model, model_override);
 
     // Register in repos.json
     let alias = {
@@ -5890,26 +5914,55 @@ async fn add_repo_handler(
     let task_db_path = db_path.clone();
 
     let index_handle = tokio::spawn(async move {
-        tracing::info!(
-            "Indexing newly added repo '{}' ({}) in background",
-            alias_bg,
-            project_path.display()
-        );
+        if adopt_existing {
+            tracing::info!(
+                "Refreshing existing index for newly added repo '{}' ({}) in background",
+                alias_bg,
+                project_path.display()
+            );
+        } else {
+            tracing::info!(
+                "Indexing newly added repo '{}' ({}) in background",
+                alias_bg,
+                project_path.display()
+            );
+        }
 
         let pool = state_bg.embedding_pool();
-        match IndexManager::force_reindex_with_stores(
-            &project_path,
-            &db_path,
-            &stores,
-            model_override,
-            &token_for_task,
-            Some(&pool),
-        )
-        .await
-        {
+        let indexed = if adopt_existing {
+            // Incremental refresh: unchanged files stay in the index, only real
+            // changes are re-chunked/re-embedded. Same heavy-job gate and
+            // cancellation semantics as the force path (the public wrapper
+            // acquires the permit).
+            IndexManager::perform_incremental_refresh_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                &token_for_task,
+                Some(&pool),
+                None,
+            )
+            .await
+        } else {
+            IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                model_override,
+                &token_for_task,
+                Some(&pool),
+            )
+            .await
+        };
+        match indexed {
             Ok(()) => {
                 tracing::info!(
-                    "Index created for '{}' ({})",
+                    "{} for '{}' ({})",
+                    if adopt_existing {
+                        "Existing index refreshed"
+                    } else {
+                        "Index created"
+                    },
                     alias_bg,
                     project_path.display()
                 );

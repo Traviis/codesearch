@@ -1227,6 +1227,127 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
     );
 }
 
+/// `POST /repos` for a path whose `.codesearch.db` already holds a usable index
+/// must adopt it (incremental refresh), not clear and re-embed it. The old
+/// force path re-indexed every re-registration, so registering a batch of
+/// already-indexed repos threw away all their work and re-ran it serialized
+/// behind the heavy-job gate.
+///
+/// Fixture: one unchanged whitespace `lib.rs` tracked by an index holding one
+/// chunk. Adoption sees "up to date" and keeps the chunk (no embedding model is
+/// loaded). The force path clears the store first; re-indexing the file yields
+/// zero chunks, so the chunk count drops to zero.
+#[tokio::test]
+#[serial]
+async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("adopted");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    // Non-empty (the walker skips empty files) but yields no chunks, so the
+    // force path cannot re-embed and needs no ONNX session.
+    let file_path = repo_path.join("lib.rs");
+    std::fs::write(&file_path, "\n\n").unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":384,"model_short_name":"minilm-l6-q","indexed_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let chunk_id = {
+        let stores = crate::index::SharedStores::new(&db_path, 384).expect("fixture stores");
+        let chunk = crate::chunker::Chunk::new(
+            "\n\n".to_string(),
+            1,
+            2,
+            crate::chunker::ChunkKind::Function,
+            "lib.rs".to_string(),
+        );
+        let ids = {
+            let mut vs = stores.vector_store.write().await;
+            let ids = vs
+                .insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
+                    chunk,
+                    vec![0.5f32; 384],
+                )])
+                .expect("seed vector chunk");
+            vs.build_index().expect("build fixture index");
+            ids
+        };
+        {
+            let mut fts = stores.fts_store.write().await;
+            fts.add_chunk(ids[0], "\n\n", "lib.rs", Some("adopted"), "Function")
+                .expect("seed fts doc");
+            fts.commit().expect("commit fts");
+        }
+        {
+            let mut fm = crate::cache::FileMetaStore::load_or_create(&db_path, "minilm-l6-q", 384)
+                .expect("seed file meta");
+            let key = crate::cache::storage_key(&file_path, &repo_path);
+            fm.update_file(&file_path, &key, ids.clone())
+                .expect("track the unchanged file");
+            fm.save(&db_path).expect("save file meta");
+        }
+        // Release the writer lock so the handler can open the stores itself.
+        ids[0]
+    };
+
+    let state = Arc::new(state_with_config(ReposConfig::default()));
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("adopted".to_string()),
+            model: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+
+    // The indexing task runs in the background; wait for it to release the
+    // alias marker (bounded so a hang fails the test instead of stalling it).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while state.is_indexing("adopted") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "adopted-index refresh did not finish within 30s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let stores = state
+        .get_opened_stores("adopted")
+        .expect("store must still be open after the add");
+    let stats = stores.vector_store.try_read().unwrap().stats().unwrap();
+    assert_eq!(
+        stats.total_chunks, 1,
+        "an existing index must be adopted, not cleared and rebuilt"
+    );
+    assert_eq!(
+        stats.total_files, 1,
+        "the tracked unchanged file must survive the adoption refresh"
+    );
+    assert!(
+        stores
+            .vector_store
+            .try_read()
+            .unwrap()
+            .get_chunk(chunk_id)
+            .expect("read back adopted chunk")
+            .is_some(),
+        "the previously indexed chunk must still be present (id {chunk_id})"
+    );
+}
+
 /// Precedence contract for the model a `POST /repos` add indexes with.
 #[test]
 fn resolve_add_repo_model_precedence() {
@@ -1247,6 +1368,28 @@ fn resolve_add_repo_model_precedence() {
     assert_eq!(resolve_add_repo_model(None, None, None), None);
     // Explicit model still wins when nothing else is set.
     assert_eq!(resolve_add_repo_model(Some(mini), None, None), Some(mini));
+}
+
+/// Adoption contract for `POST /repos`: an index already on disk is kept unless
+/// the add changes its embedding model. Rebuilding a registered-but-already-
+/// indexed repo used to clear and re-embed everything.
+#[test]
+fn should_adopt_existing_index_precedence() {
+    use crate::embed::ModelType;
+    let gemma = ModelType::EmbeddingGemma300MQ4;
+    let mini = ModelType::AllMiniLML6V2Q;
+
+    // No index on disk → nothing to adopt, force-build.
+    assert!(!should_adopt_existing_index(None, None));
+    assert!(!should_adopt_existing_index(None, Some(gemma)));
+
+    // Existing index, no model change → adopt and refresh incrementally.
+    assert!(should_adopt_existing_index(Some(mini), None));
+    // An explicit model that matches the recorded one is not a change.
+    assert!(should_adopt_existing_index(Some(mini), Some(mini)));
+
+    // A model change invalidates the vectors → force rebuild.
+    assert!(!should_adopt_existing_index(Some(mini), Some(gemma)));
 }
 
 /// The serve-wide default is the scope-free fallback model in serve mode (the
