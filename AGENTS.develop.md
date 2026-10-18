@@ -241,6 +241,7 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **v1.5.33 (pending)** — status CPU = whole serve process tree (incl. scip/dotnet children) instead of the serve process alone
 - **v1.5.33 (pending)** — Razor refs mapped to source: helper emits `GetMappedLineSpan()` paths/lines (#line → .razor/.cshtml), SCIP stamp split (`SCIP_INDEX_BUILDER_VERSION`) so symbol rebuilds skip the text re-embed wave
 - **v1.5.33 (pending)** — FTS commit-failure hardening: per-file transient redrive, crash-safe vector rollback, mixed-generation sweep in refresh, stale note on get_chunk
 - **v1.5.33 (pending)** — `.codesearchinclude` whitelist: when present (repo root or `~/.codesearch/`), only matching files are indexed; ignore rules still win, absent list = historical behavior
