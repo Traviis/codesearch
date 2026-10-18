@@ -326,23 +326,32 @@ impl CodesearchService {
         let mut context_after = None;
         let mut note = None;
 
+        // Resolve the on-disk source path up front: the context read and the
+        // staleness check below both need it, independent of context_lines.
+        let source_path = if Path::new(&chunk.path).is_absolute() {
+            PathBuf::from(&chunk.path)
+        } else if let Some(root) = owner_alias
+            .as_deref()
+            .and_then(|alias| ctx.alias_roots.get(alias))
+            .filter(|root| !root.is_empty())
+        {
+            Path::new(root).join(stored_path.trim_start_matches('/'))
+        } else {
+            self.project_path.join(&chunk.path)
+        };
+        let repo_root = owner_alias
+            .as_deref()
+            .and_then(|alias| ctx.alias_roots.get(alias))
+            .filter(|root| !root.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.project_path.clone());
+
         if context_lines > 0 {
             // Resolve relative chunk paths against the OWNING repo's root —
             // chunk paths are project-relative, and in serve mode the service's
             // own project_path is not that repo's root, so the old join never
             // found the file. Stdio single-repo mode has no alias roots and
             // keeps the historical project_path join.
-            let source_path = if Path::new(&chunk.path).is_absolute() {
-                PathBuf::from(&chunk.path)
-            } else if let Some(root) = owner_alias
-                .as_deref()
-                .and_then(|alias| ctx.alias_roots.get(alias))
-                .filter(|root| !root.is_empty())
-            {
-                Path::new(root).join(stored_path.trim_start_matches('/'))
-            } else {
-                self.project_path.join(&chunk.path)
-            };
             match tokio::fs::read_to_string(&source_path).await {
                 Ok(src) => {
                     let lines: Vec<&str> = src.lines().collect();
@@ -366,6 +375,32 @@ impl CodesearchService {
                 Err(_) => {
                     note = Some(
                         "source file not readable, returning indexed content only".to_string(),
+                    );
+                }
+            }
+        }
+
+        // Staleness check: file_meta.json's mtime is the timestamp of the last
+        // successful indexing write (per-file saves). A source file modified
+        // after it is pending re-index — or its last indexing pass failed —
+        // so the indexed lines may not match disk.
+        if note.is_none() {
+            let meta_mtime = std::fs::metadata(
+                repo_root
+                    .join(crate::constants::DB_DIR_NAME)
+                    .join("file_meta.json"),
+            )
+            .and_then(|m| m.modified())
+            .ok();
+            let file_mtime = std::fs::metadata(&source_path)
+                .and_then(|m| m.modified())
+                .ok();
+            if let (Some(indexed_at), Some(modified_at)) = (meta_mtime, file_mtime) {
+                if modified_at > indexed_at {
+                    note = Some(
+                        "source file was modified after the last indexing pass; indexed \
+                         lines may not match disk (re-index pending)"
+                            .to_string(),
                     );
                 }
             }
