@@ -3940,15 +3940,44 @@ impl ServeState {
         let repos = self.repo_statuses_lightweight();
         let active_sessions = self.active_session_count();
 
-        // CPU usage — reuse shared System instance so cpu_usage() can compute delta
+        // CPU usage — serve process PLUS all its descendants. The SCIP
+        // helpers and their dotnet children do the heavy lifting during a
+        // rebuild wave; measuring the serve process alone reads near-zero
+        // exactly when the machine is busy. Refresh ALL processes once so
+        // parent links are populated, then walk the tree from our pid and
+        // sum the per-process usage (cpu_usage() computes its delta against
+        // the previous pass on the shared System instance).
         let cpu = (|| -> Option<String> {
             use sysinfo::ProcessesToUpdate;
             let pid = sysinfo::get_current_pid().ok()?;
             let mut sys = self.sysinfo_system.lock().ok()?;
-            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-            let proc = sys.process(pid)?;
+            sys.refresh_processes(ProcessesToUpdate::All, true);
+
+            let mut tree: Vec<sysinfo::Pid> = vec![pid];
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(pid);
+            let mut grew = true;
+            while grew {
+                grew = false;
+                for (p, proc_) in sys.processes() {
+                    if seen.contains(p) {
+                        continue;
+                    }
+                    if proc_.parent().is_some_and(|parent| seen.contains(&parent)) {
+                        seen.insert(*p);
+                        tree.push(*p);
+                        grew = true;
+                    }
+                }
+            }
+
+            let total: f32 = tree
+                .iter()
+                .filter_map(|p| sys.process(*p))
+                .map(|p| p.cpu_usage())
+                .sum();
             let num_cpus = sys.cpus().len().max(1) as f32;
-            Some(format!("{:.0}%", proc.cpu_usage() / num_cpus))
+            Some(format!("{:.0}%", total / num_cpus))
         })()
         .unwrap_or_else(|| "—".to_string());
 
