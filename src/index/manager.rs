@@ -3052,6 +3052,62 @@ impl IndexManager {
             chunk_ids
         };
 
+        // FTS insert + commit + file_meta update. On ANY failure here the
+        // vector insert above must be rolled back: the failed attempt's ids
+        // would otherwise never reach file_meta, so no later pass could find
+        // and clean them — orphaned vector chunks next to lingering old FTS
+        // chunks = mixed generations (the HUSQ stale-index symptom).
+        // file_meta is deliberately left untouched: it still names the old
+        // generation, so the next pass (redrive or refresh) heals cleanly.
+        if let Err(e) = Self::publish_file_chunks(
+            &db_path,
+            file_path,
+            stores,
+            &rel_key,
+            &embedded_chunks,
+            &chunk_ids,
+            model_name,
+            dimensions,
+        )
+        .await
+        {
+            {
+                let mut store = stores.vector_store.write().await;
+                let _ = store.delete_chunks(&chunk_ids);
+            }
+            {
+                let mut fts_store = stores.fts_store.write().await;
+                for id in &chunk_ids {
+                    let _ = fts_store.delete_chunk(*id);
+                }
+                let _ = fts_store.commit();
+            }
+            return Err(e);
+        }
+
+        info!(
+            "✅ Indexed {} ({} chunks)",
+            file_path.display(),
+            embedded_chunks.len()
+        );
+
+        Ok(())
+    }
+
+    /// FTS insert + commit + file_meta update for one file's fresh chunks —
+    /// split from [`Self::index_single_file`] so the caller can roll the
+    /// vector insert back when any of these steps fails.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_file_chunks(
+        db_path: &Path,
+        file_path: &Path,
+        stores: &SharedStores,
+        rel_key: &str,
+        embedded_chunks: &[crate::embed::EmbeddedChunk],
+        chunk_ids: &[u32],
+        model_name: &str,
+        dimensions: usize,
+    ) -> Result<()> {
         // Add to FTS with write lock
         {
             let mut fts_store = stores.fts_store.write().await;
@@ -3071,15 +3127,10 @@ impl IndexManager {
         }
 
         // Update file metadata (separate store, not shared)
-        let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
-        file_meta_store.update_file(file_path, &rel_key, chunk_ids)?;
-        file_meta_store.save(&db_path)?;
-
-        info!(
-            "✅ Indexed {} ({} chunks)",
-            file_path.display(),
-            embedded_chunks.len()
-        );
+        let mut file_meta_store =
+            crate::cache::FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
+        file_meta_store.update_file(file_path, rel_key, chunk_ids.to_vec())?;
+        file_meta_store.save(db_path)?;
 
         Ok(())
     }
