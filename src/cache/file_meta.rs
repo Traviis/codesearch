@@ -580,6 +580,14 @@ impl FileMetaStore {
         self.files.remove(&path_str)
     }
 
+    /// Non-destructive per-file chunk-id lookup — unlike [`Self::remove_file`],
+    /// which clears the entry as a side effect. Same key normalization.
+    pub fn file_chunk_ids(&self, key: &str) -> Option<Vec<u32>> {
+        self.files
+            .get(&normalize_path_str(key))
+            .map(|m| m.chunk_ids.clone())
+    }
+
     /// Re-key entries still filed under an absolute path inside `project_root`
     /// (the pre-relative-key format) to their project-relative storage key.
     ///
