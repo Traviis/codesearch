@@ -241,6 +241,7 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **v1.5.33 (pending)** — FTS commit-failure hardening: per-file transient redrive, crash-safe vector rollback, mixed-generation sweep in refresh, stale note on get_chunk
 - **v1.5.33 (pending)** — `.codesearchinclude` whitelist: when present (repo root or `~/.codesearch/`), only matching files are indexed; ignore rules still win, absent list = historical behavior
 - **v1.5.33 (pending)** — MCP tools declare `readOnlyHint` annotations: Claude Code plan mode auto-allows all six tools instead of prompting every call
 - **v1.5.33 (pending)** — force reindex (`n`, `index -f`) rebuilds the SCIP symbol indexes too — shared `finish_force_reindex` tail for HTTP + TUI; `?symbols=true` stays symbol-only, plain reindex stays gate-driven
