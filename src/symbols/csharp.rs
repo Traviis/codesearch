@@ -763,11 +763,12 @@ impl CSharpSymbolIndexer {
         }
         // Stamp the producing build: the rebuild gate treats an index from
         // another (or an unknown) build as stale, so a deployed binary
-        // rebuilds the indexes it inherited itself at startup.
+        // rebuilds the indexes it inherited itself at startup. SCIP-only
+        // stamp — the text index compares INDEX_BUILDER_VERSION instead.
         meta_db.put(
             wtxn,
             META_BUILDER_VERSION,
-            crate::constants::INDEX_BUILDER_VERSION,
+            crate::constants::SCIP_INDEX_BUILDER_VERSION,
         )?;
         Ok(())
     }
@@ -2503,7 +2504,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
     /// Which codesearch build produced this index — `None` when the stamp is
     /// absent (pre-stamp index) or the meta is unreadable. The rebuild gate
-    /// compares against [`crate::constants::INDEX_BUILDER_VERSION`] and
+    /// compares against [`crate::constants::SCIP_INDEX_BUILDER_VERSION`] and
     /// rebuilds on mismatch: this binary never produced that index.
     fn index_builder_version(&self, db_path: &Path) -> Option<String> {
         let env = match self.open_scip_env(db_path) {
@@ -2532,7 +2533,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     /// precomputed references, and only a rebuild produces them.
     fn index_matches_builder(&self, db_path: &Path) -> bool {
         self.index_builder_version(db_path).as_deref()
-            == Some(crate::constants::INDEX_BUILDER_VERSION)
+            == Some(crate::constants::SCIP_INDEX_BUILDER_VERSION)
             && matches!(
                 self.refs_coverage(db_path).as_deref(),
                 Some(
