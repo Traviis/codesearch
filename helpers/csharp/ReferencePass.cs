@@ -30,7 +30,7 @@ internal sealed class ReferencePass
 
     private readonly record struct Site(int Key, int File, int StartLine, int StartColumn, int EndLine);
 
-    private readonly record struct RawSite(string Key, int StartLine, int StartColumn, int EndLine);
+    private readonly record struct RawSite(string Key, string MappedPath, int StartLine, int StartColumn, int EndLine);
 
     internal ReferencePass(string? projectRoot, IEnumerable<string?> sourceAssemblyNames)
     {
@@ -101,17 +101,24 @@ internal sealed class ReferencePass
         return document.Sites;
     }
 
-    private void Merge(string file, List<RawSite> sites)
+    private void Merge(string fallbackFile, List<RawSite> sites)
     {
         if (sites.Count == 0)
             return;
         lock (_gate)
         {
-            var fileId = Intern(_fileIds, _files, file);
-            foreach (var site in sites)
+            // Group by the MAPPED path: a Razor-generated tree's sites map to
+            // their .razor/.cshtml source file, not the tree's virtual path.
+            foreach (var group in sites.GroupBy(
+                         s => string.IsNullOrEmpty(s.MappedPath) ? fallbackFile : s.MappedPath))
             {
-                _sites.Add(new Site(
-                    Intern(_keyIds, _keys, site.Key), fileId, site.StartLine, site.StartColumn, site.EndLine));
+                var file = SymbolIndexer.MakeRelative(group.Key, _projectRoot) ?? group.Key;
+                var fileId = Intern(_fileIds, _files, file);
+                foreach (var site in group)
+                {
+                    _sites.Add(new Site(
+                        Intern(_keyIds, _keys, site.Key), fileId, site.StartLine, site.StartColumn, site.EndLine));
+                }
             }
         }
     }
@@ -458,9 +465,16 @@ internal sealed class ReferencePass
             }
             if (key is null)
                 return;
-            var span = location.GetLineSpan();
+            // Mapped span: #line directives (Razor source generators) resolve
+            // to the .razor/.cshtml source path and line. Hidden regions keep
+            // the last #line mapping (Roslyn semantics); a tree with no
+            // directives maps to nothing — empty path, the site is dropped.
+            var span = location.GetMappedLineSpan();
+            if (string.IsNullOrEmpty(span.Path))
+                return;
             Sites.Add(new RawSite(
                 key,
+                span.Path,
                 span.StartLinePosition.Line + 1,
                 span.StartLinePosition.Character,
                 span.EndLinePosition.Line + 1));

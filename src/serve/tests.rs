@@ -4368,7 +4368,7 @@ fn note_add_index_failure_keeps_the_repo_registered() {
 #[serial]
 fn symbol_index_status_reflects_the_on_disk_meta() {
     use crate::constants::{
-        INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_REFS_COVERAGE_KEY,
+        SCIP_INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_REFS_COVERAGE_KEY,
         SCIP_REFS_COVERAGE_LAZY,
     };
 
@@ -4398,7 +4398,7 @@ fn symbol_index_status_reflects_the_on_disk_meta() {
     // Current builder stamp without a refs_coverage stamp: still stale.
     seed_scip_meta(
         &db,
-        &[(SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION)],
+        &[(SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION)],
     );
     let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
         .into_iter()
@@ -4410,7 +4410,7 @@ fn symbol_index_status_reflects_the_on_disk_meta() {
     seed_scip_meta(
         &db,
         &[
-            (SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION),
+            (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
             (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_LAZY),
         ],
     );
@@ -4425,7 +4425,7 @@ fn symbol_index_status_reflects_the_on_disk_meta() {
     seed_scip_meta(
         &db,
         &[
-            (SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION),
+            (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
             (
                 crate::constants::SCIP_INDEX_WARNINGS_KEY,
                 r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
@@ -4859,7 +4859,7 @@ fn evaluate_rebuilds_an_index_from_an_older_binary() {
 const CURRENT_BUILD_META: &[(&str, &str)] = &[
     (
         crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
-        crate::constants::INDEX_BUILDER_VERSION,
+        crate::constants::SCIP_INDEX_BUILDER_VERSION,
     ),
     (
         crate::constants::SCIP_REFS_COVERAGE_KEY,
@@ -4876,7 +4876,7 @@ fn evaluate_rebuilds_an_index_without_a_coverage_stamp() {
         "nocoverage",
         &[(
             crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
-            crate::constants::INDEX_BUILDER_VERSION,
+            crate::constants::SCIP_INDEX_BUILDER_VERSION,
         )],
     );
 

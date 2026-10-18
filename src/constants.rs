@@ -803,6 +803,13 @@ pub const SCIP_INDEX_BUILDER_VERSION_KEY: &str = "index_builder_version";
 /// not alter what gets written.
 pub const INDEX_BUILDER_VERSION: &str = "2026-10.1";
 
+/// Stamp for the SCIP symbol indexes specifically. Split from
+/// [`INDEX_BUILDER_VERSION`] so a SCIP-only convention change (the helper
+/// now emits #line-mapped .razor/.cshtml paths) forces a symbol rebuild
+/// WITHOUT a text re-embed wave: file_meta keeps comparing
+/// [`INDEX_BUILDER_VERSION`].
+pub const SCIP_INDEX_BUILDER_VERSION: &str = "2026-10.2";
+
 /// Current value written for [`SCIP_KEY_FORMAT_KEY`]. Bump whenever the
 /// canonical SCIP symbol key format produced by a language helper changes
 /// shape (B4: C# generic arity / containing-type path / fully qualified

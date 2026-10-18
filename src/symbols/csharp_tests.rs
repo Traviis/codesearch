@@ -384,7 +384,7 @@ fn index_matches_builder_mirrors_the_rebuild_gate() {
 
 #[test]
 fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
-    use crate::constants::{INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};
+    use crate::constants::{SCIP_INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};
 
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("db");
@@ -427,7 +427,7 @@ fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
     use crate::symbols::SymbolIndexer as _;
     assert_eq!(
         indexer.index_builder_version(&db).as_deref(),
-        Some(INDEX_BUILDER_VERSION),
+        Some(SCIP_INDEX_BUILDER_VERSION),
         "the rebuild meta write must stamp the producing build"
     );
     assert!(
@@ -564,7 +564,7 @@ fn restore_pending_flag_round_trips_through_the_trait_method() {
 fn symbol_index_status_reports_restore_pending_over_a_ready_index() {
     use super::SymbolIndexer as _;
     use crate::constants::{
-        INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_KEY_FORMAT,
+        SCIP_INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_KEY_FORMAT,
         SCIP_KEY_FORMAT_KEY, SCIP_META_DB_NAME, SCIP_REBUILD_TIMESTAMP_KEY,
         SCIP_REFS_COVERAGE_COMPLETE, SCIP_REFS_COVERAGE_KEY,
     };
@@ -589,7 +589,7 @@ fn symbol_index_status_reports_restore_pending_over_a_ready_index() {
         for (key, value) in [
             (SCIP_REBUILD_TIMESTAMP_KEY, "0"),
             (SCIP_KEY_FORMAT_KEY, SCIP_KEY_FORMAT),
-            (SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION),
+            (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
             (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_COMPLETE),
         ] {
             meta.put(&mut wtxn, key, value).unwrap();

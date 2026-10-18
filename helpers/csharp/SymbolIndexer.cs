@@ -132,7 +132,15 @@ public sealed class SymbolIndexer
             {
                 if (loc.IsInSource)
                 {
-                    var relPath = MakeRelative(loc.SourceTree?.FilePath, projectRoot);
+                    // Document key from the MAPPED path: a source-generated
+                    // tree (Razor) maps to its .razor/.cshtml source file, so
+                    // definitions land on the source the user edits. Hidden
+                    // regions keep the last #line mapping (Roslyn semantics);
+                    // a tree with no directives at all maps to nothing —
+                    // empty path, skip.
+                    var mapped = loc.GetMappedLineSpan();
+                    if (string.IsNullOrEmpty(mapped.Path)) continue;
+                    var relPath = MakeRelative(mapped.Path, projectRoot);
                     if (relPath is null) continue;
 
                     var occ = new ScipOccurrence
@@ -405,7 +413,10 @@ public sealed class SymbolIndexer
 
     internal static List<int> LocationToRange(Location loc)
     {
-        var lineSpan = loc.GetLineSpan();
+        // Mapped: #line directives (Razor source generators) resolve to the
+        // .razor/.cshtml source path and line — the same mechanism VS's
+        // ctrl-click uses. Identity for ordinary files.
+        var lineSpan = loc.GetMappedLineSpan();
         return
         [
             lineSpan.StartLinePosition.Line + 1,  // 1-based line
