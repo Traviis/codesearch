@@ -55,4 +55,27 @@ public class PathGuardTests
         var candidate = Path.Combine(baseDir, "sub", "..", "file.json");
         Assert.ThrowsAny<ArgumentException>(() => PathGuard.Inside(baseDir, candidate));
     }
+
+    [Fact]
+    public void TryInside_ReturnsPath_ForCleanInput()
+    {
+        var baseDir = Path.GetTempPath();
+        var candidate = Path.Combine(baseDir, "sub", "file.json");
+        var result = PathGuard.TryInside(baseDir, candidate, out var error);
+        Assert.True(string.IsNullOrEmpty(error), $"expected no error, got: {error}");
+        Assert.Equal(Path.GetFullPath(candidate), result);
+    }
+
+    [Fact]
+    public void TryInside_DegradesInsteadOfThrowing_OnDotDotSegment()
+    {
+        var baseDir = Path.GetFullPath(Path.GetTempPath());
+        // Normalizes inside baseDir but carries '..': the segment arm fires,
+        // deterministically on every platform — the per-entry loop must see
+        // null + reason, never an exception.
+        var candidate = Path.Combine(baseDir, "sub", "..", "file.json");
+        var result = PathGuard.TryInside(baseDir, candidate, out var error);
+        Assert.Null(result);
+        Assert.Contains("'..'", error);
+    }
 }

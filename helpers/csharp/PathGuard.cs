@@ -51,4 +51,24 @@ internal static class PathGuard
         }
         return full;
     }
+
+    /// <summary>
+    /// Non-throwing variant of <see cref="Inside"/> for per-entry loops:
+    /// returns null plus the rejection reason instead of aborting the run —
+    /// degrade the one entry, never the whole pass (see the Program.cs
+    /// sln-projection call site).
+    /// </summary>
+    public static string? TryInside(string baseDir, string candidate, out string error)
+    {
+        try
+        {
+            error = string.Empty;
+            return Inside(baseDir, candidate);
+        }
+        catch (ArgumentException ex)
+        {
+            error = ex.Message;
+            return null;
+        }
+    }
 }

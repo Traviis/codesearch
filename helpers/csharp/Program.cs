@@ -857,13 +857,9 @@ public static class Program
         var eolSkipped = new List<(int LineIndex, string RelativePath, string Tfm)>();
         foreach (var entry in supported)
         {
-            string projectPath;
-            try
-            {
-                projectPath = PathGuard.Inside(
-                    solutionDir, Path.GetFullPath(Path.Combine(solutionDir, entry.RelativePath)));
-            }
-            catch (ArgumentException ex)
+            var projectPath = PathGuard.TryInside(
+                solutionDir, Path.GetFullPath(Path.Combine(solutionDir, entry.RelativePath)), out var guardError);
+            if (projectPath is null)
             {
                 // Second line of defence behind the parse-time containment
                 // rejection: degrade this project, never the whole run. The
@@ -872,7 +868,7 @@ public static class Program
                 // here — skip with the same outcome.
                 Console.Error.WriteLine(
                     $"[WARN] Skipping project whose path escapes the solution dir: " +
-                    $"{entry.RelativePath} ({ex.Message})");
+                    $"{entry.RelativePath} ({guardError})");
                 continue;
             }
             string? tfm = null;
