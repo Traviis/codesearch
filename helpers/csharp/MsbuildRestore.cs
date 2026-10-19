@@ -196,6 +196,7 @@ internal static class MsbuildRestore
         string[] lines;
         try
         {
+            solutionPath = PathGuard.Validate(solutionPath);
             lines = File.ReadAllLines(solutionPath);
         }
         catch
@@ -233,6 +234,7 @@ internal static class MsbuildRestore
     {
         try
         {
+            path = PathGuard.Validate(path);
             return File.Exists(path) ? File.ReadAllText(path) : null;
         }
         catch

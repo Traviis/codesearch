@@ -857,7 +857,24 @@ public static class Program
         var eolSkipped = new List<(int LineIndex, string RelativePath, string Tfm)>();
         foreach (var entry in supported)
         {
-            var projectPath = Path.GetFullPath(Path.Combine(solutionDir, entry.RelativePath));
+            string projectPath;
+            try
+            {
+                projectPath = PathGuard.Inside(
+                    solutionDir, Path.GetFullPath(Path.Combine(solutionDir, entry.RelativePath)));
+            }
+            catch (ArgumentException ex)
+            {
+                // Second line of defence behind the parse-time containment
+                // rejection: degrade this project, never the whole run. The
+                // guard compares Ordinal off-Windows, so a case-variant
+                // reference the parse gate (IgnoreCase) accepted can land
+                // here — skip with the same outcome.
+                Console.Error.WriteLine(
+                    $"[WARN] Skipping project whose path escapes the solution dir: " +
+                    $"{entry.RelativePath} ({ex.Message})");
+                continue;
+            }
             string? tfm = null;
             try
             {
