@@ -22,6 +22,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Adopting an index on `POST /repos` no longer rebuilds the HNSW graph a second time.** The adoption path's incremental refresh already rebuilds the index once under the job gate; the add-repo task still re-ran a full graph build afterwards, doubling the work (serialized behind the job gate) for an identical result. The extra build now runs only on the force-rebuild path, which builds no index internally.
 
+- **The C# helper now evaluates with the SDK pinned by `global.json`, not the machine's default.** `dotnet build` resolves the pinned SDK from the muxer, but the helper registered MSBuild from the default SDK — on machines whose default is newer than the repo's pin (Visual Studio 2026 RC ships the .NET 11 RC), every project evaluated under the wrong SDK and the symbol index degraded with evaluation failures no actual build shows (duplicate `Compile` items, unresolvable project references). The helper now picks the installed SDK the same way the muxer would (exact pin → same minor → same major) and falls back to discovery only when nothing matches.
+
 ## [1.6.0] - 2026-10-18
 
 ### Fixed
