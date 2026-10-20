@@ -1162,6 +1162,51 @@ public static class Program
     // ── MSBuild registration ─────────────────────────────────────────
 
     /// <summary>
+    /// Register the MSBuild from the global.json-pinned SDK: pick the
+    /// installed SDK the muxer would resolve for the pin, verify it actually
+    /// carries an MSBuild, and register it. False (nothing registered) keeps
+    /// the discovery path — the pin is an improvement, never a requirement.
+    /// </summary>
+    private static bool TryRegisterPinnedSdk(string pinned)
+    {
+        try
+        {
+            var sdksOutput = MsbuildRestore.ListInstalledSdks();
+            if (sdksOutput is null)
+            {
+                return false;
+            }
+            var pick = MsbuildRestore.ChoosePinnedSdk(MsbuildRestore.ParseListSdks(sdksOutput), pinned);
+            if (pick is null)
+            {
+                return false;
+            }
+            var msbuildBin = Path.Combine(pick.Value.Root, "MSBuild", "Current", "Bin");
+            if (!File.Exists(Path.Combine(msbuildBin, "MSBuild.dll")))
+            {
+                return false;
+            }
+            Console.Error.WriteLine(
+                $"MSBuild: registering global.json-pinned SDK {pick.Value.Version} at {msbuildBin} " +
+                "(matches what `dotnet build` resolves).");
+            MSBuildLocator.RegisterMSBuildPath(msbuildBin);
+            var msbuildExe = Path.Combine(msbuildBin, "MSBuild.exe");
+            if (File.Exists(msbuildExe))
+            {
+                Environment.SetEnvironmentVariable("MSBUILD_EXE_PATH", msbuildExe);
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[INFO] pinned-SDK registration failed ({ex.GetType().Name}: {ex.Message}) — " +
+                "falling back to discovery.");
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Register the MSBuild instance the workspace will evaluate through.
     /// Capability-aware since the 2026-10-15 net10 incident: when every
     /// CLI-visible .NET SDK is older than the repo's target frameworks
@@ -1182,6 +1227,30 @@ public static class Program
         {
             errorMessage = null;
             return true;
+        }
+
+        // global.json pin first. `dotnet build` resolves the pinned SDK from
+        // the muxer; MSBuildLocator only reports the muxer's DEFAULT SDK —
+        // on a machine whose default is newer than the pin (VS2026 RC ships
+        // the .NET 11 RC), evaluating with it diverges from every plain
+        // build and surfaces as evaluation failures no build shows. Register
+        // the pinned SDK's own MSBuild when one matches; discovery stays the
+        // fallback.
+        if (solutionPath is not null && File.Exists(solutionPath))
+        {
+            var pinDir = Path.GetDirectoryName(Path.GetFullPath(solutionPath)) ?? ".";
+            var pinned = MsbuildRestore.GlobalJsonSdkVersion(pinDir);
+            if (pinned is not null)
+            {
+                if (TryRegisterPinnedSdk(pinned))
+                {
+                    errorMessage = null;
+                    return true;
+                }
+                Console.Error.WriteLine(
+                    $"[INFO] global.json pins SDK {pinned} but no matching installed SDK was found — " +
+                    "falling back to MSBuild discovery.");
+            }
         }
 
         try
