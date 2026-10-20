@@ -20,6 +20,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **`POST /repos` adopts an index that is already on disk instead of clearing and re-embedding it.** Registering a repo (`codesearch index add`, the git-hook path, or a script adding many repos at once) unconditionally ran the destructive force reindex, so a repo that already had a valid `.codesearch.db` — for example one indexed directly before being registered — lost its index and had to re-embed every file, serialized behind the process-wide job gate. The local `codesearch index add` path already reused an existing index; the serve path now matches it. A new index (no `metadata.json`) and an explicit model change still take the force-rebuild path, because changing the embedding model invalidates every stored vector.
 
+- **Adopting an index on `POST /repos` no longer rebuilds the HNSW graph a second time.** The adoption path's incremental refresh already rebuilds the index once under the job gate; the add-repo task still re-ran a full graph build afterwards, doubling the work (serialized behind the job gate) for an identical result. The extra build now runs only on the force-rebuild path, which builds no index internally.
+
 ## [1.6.0] - 2026-10-18
 
 ### Fixed
