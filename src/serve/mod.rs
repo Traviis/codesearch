@@ -6002,38 +6002,47 @@ async fn add_repo_handler(
             return;
         }
 
-        // Build vector index from freshly indexed data.
+        // Build vector index from freshly indexed data — force path only.
+        // On the adopt path `perform_incremental_refresh_with_stores` already
+        // rebuilt the HNSW once after its last batch (or left the existing
+        // valid graph untouched when nothing changed), so a second build here
+        // would redo the whole graph per adopted registration for an
+        // identical result.
         // build_index() is CPU-heavy — offload to the blocking pool, under the
         // same process-wide job permit as every other heavy pass. The wait is
         // cancellation-aware: a repo removed while queued behind another build
         // must not keep its stores (and a queue position) parked.
-        let _job_permit = match stores.acquire_job_permit_or_cancel(&token_for_task).await {
-            JobAcquire::Ready(permit) => permit,
-            JobAcquire::Cancelled => {
+        if !adopt_existing {
+            let _job_permit = match stores.acquire_job_permit_or_cancel(&token_for_task).await {
+                JobAcquire::Ready(permit) => permit,
+                JobAcquire::Cancelled => {
+                    state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
+                    return;
+                }
+            };
+            // Re-check liveness after the wait: a removal that landed while the
+            // task was parked must not resurrect the alias's vector index.
+            if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
                 state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
                 return;
             }
-        };
-        // Re-check liveness after the wait: a removal that landed while the
-        // task was parked must not resurrect the alias's vector index.
-        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
-            state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
-            return;
-        }
-        {
-            let vector_store = Arc::clone(&stores.vector_store);
-            let alias_bi = alias_bg.clone();
-            match tokio::task::spawn_blocking(move || {
-                let mut vstore = vector_store.blocking_write();
-                vstore.build_index()
-            })
-            .await
             {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to build vector index for '{}': {}", alias_bi, e)
+                let vector_store = Arc::clone(&stores.vector_store);
+                let alias_bi = alias_bg.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mut vstore = vector_store.blocking_write();
+                    vstore.build_index()
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to build vector index for '{}': {}", alias_bi, e)
+                    }
+                    Err(e) => {
+                        tracing::warn!("build_index task panicked for '{}': {:?}", alias_bi, e)
+                    }
                 }
-                Err(e) => tracing::warn!("build_index task panicked for '{}': {:?}", alias_bi, e),
             }
         }
 
