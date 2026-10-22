@@ -178,9 +178,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "arroy"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f88e18ede2cb2f69e1a68ea804c8fc2f19f748da5f28c795271f279f4068afb"
+checksum = "36d4f3fe47cf9258aa7a3bcfe3946549cebc03e8461d20559ce7ff4b1052833a"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -2030,9 +2030,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heed"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad82d6598ccf1dac15c8b758a1bd282b755b6776be600429176757190a1b0202"
+checksum = "19596d4caf0a0800d6f03dd1290bdcf6e74bea8ea0bca52cc399a725a02e78c6"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",

@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::lmdb_registry::TrackedEnv;
+use crate::lmdb_registry::{create_named_db, open_named_db, TrackedEnv};
 use anyhow::{bail, Context, Result};
 use heed::types::{Bytes, Str};
 use heed::Database;
@@ -525,18 +525,18 @@ fn put_ctx(db_name: &str, key: &str, value_len: usize) -> String {
 /// instead of reporting it forever. (Wire format = the key-list format:
 /// version byte + bincode Vec<String>.)
 fn store_ref_warnings(
-    env: &TrackedEnv,
+    warnings_db: &Database<'static, Str, Bytes>,
     wtxn: &mut heed::RwTxn<'_>,
     canonical: &str,
     warnings: &[String],
 ) -> Result<()> {
-    let db: Database<Str, Bytes> = env.create_database(wtxn, Some(SCIP_REF_WARNINGS_DB_NAME))?;
     if warnings.is_empty() {
-        db.delete(wtxn, canonical)?;
+        warnings_db.delete(wtxn, canonical)?;
     } else {
         let bytes = serialize_keys_v1(warnings)
             .with_context(|| format!("Failed to serialize warnings for {canonical}"))?;
-        db.put(wtxn, canonical, &bytes)
+        warnings_db
+            .put(wtxn, canonical, &bytes)
             .with_context(|| put_ctx(SCIP_REF_WARNINGS_DB_NAME, canonical, bytes.len()))?;
     }
     Ok(())
@@ -546,7 +546,7 @@ fn store_ref_warnings(
 /// undecodable value — read as empty (complete): a warning that cannot be
 /// read must not fail a lookup that has valid references.
 fn read_ref_warnings(env: &TrackedEnv, rtxn: &heed::RoTxn<'_>, canonical: &str) -> Vec<String> {
-    match env.open_database::<Str, Bytes>(rtxn, Some(SCIP_REF_WARNINGS_DB_NAME)) {
+    match open_named_db::<Str, Bytes>(env, SCIP_REF_WARNINGS_DB_NAME) {
         Ok(Some(db)) => match db.get(rtxn, canonical) {
             Ok(Some(bytes)) => deserialize_keys_v1(bytes).unwrap_or_default(),
             _ => Vec::new(),
@@ -751,7 +751,7 @@ impl CSharpSymbolIndexer {
     /// `pub(crate)` so the producer test drives the exact write the pipeline
     /// runs.
     pub(crate) fn write_rebuild_meta(
-        meta_db: &Database<Str, Str>,
+        meta_db: &Database<'static, Str, Str>,
         wtxn: &mut heed::RwTxn,
         index_warnings: &[String],
         refs_coverage: &str,
@@ -1182,10 +1182,11 @@ impl CSharpSymbolIndexer {
     fn resolve_name_key(&self, env: &TrackedEnv, symbol: &str) -> Result<KeyMatch> {
         let rtxn = env.read_txn()?;
 
-        let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
-            Some(db) => db,
-            None => return Ok(KeyMatch::NotFound),
-        };
+        let symbols_db: Database<'static, Str, Bytes> =
+            match open_named_db::<Str, Bytes>(env, SCIP_DB_NAME)? {
+                Some(db) => db,
+                None => return Ok(KeyMatch::NotFound),
+            };
 
         // Exact match first
         if symbols_db.get(&rtxn, symbol)?.is_some() {
@@ -1193,8 +1194,8 @@ impl CSharpSymbolIndexer {
         }
 
         // Fuzzy via simple-name index
-        let simple_names_db: Database<Str, Bytes> =
-            match env.open_database(&rtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))? {
+        let simple_names_db: Database<'static, Str, Bytes> =
+            match open_named_db::<Str, Bytes>(env, SCIP_SIMPLE_NAMES_DB_NAME)? {
                 Some(db) => db,
                 None => return Ok(KeyMatch::NotFound),
             };
@@ -1246,7 +1247,7 @@ impl CSharpSymbolIndexer {
             let rtxn = env.read_txn()?;
 
             // 1. Load definitions from scip_symbols
-            if let Some(symbols_db) = env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))? {
+            if let Some(symbols_db) = open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)? {
                 if let Some(bytes) = symbols_db.get(&rtxn, canonical)? {
                     match deserialize_refs(bytes) {
                         Ok(defs) => all_stored.extend(defs),
@@ -1261,7 +1262,7 @@ impl CSharpSymbolIndexer {
 
             // 2. Check reference cache
             cache_hit = if let Some(ref_cache_db) =
-                env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_REF_CACHE_DB_NAME))?
+                open_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?
             {
                 match ref_cache_db.get(&rtxn, canonical)? {
                     Some(cached_bytes) => match deserialize_refs(cached_bytes) {
@@ -1312,9 +1313,8 @@ impl CSharpSymbolIndexer {
         // fall back to db_path.parent() for backward compat with old indexes.
         let repo_path = {
             let rtxn = env.read_txn()?;
-            let meta_db: Database<Str, Str> = env
-                .open_database(&rtxn, Some(SCIP_META_DB_NAME))?
-                .unwrap_or_else(|| {
+            let meta_db: Database<'static, Str, Str> =
+                open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)?.unwrap_or_else(|| {
                     panic!("scip_meta DB should exist (created during open_scip_env)")
                 });
             match meta_db.get(&rtxn, META_REPO_PATH)? {
@@ -1386,9 +1386,14 @@ impl CSharpSymbolIndexer {
                             // the cache, resolves properly and replaces the
                             // warning (issue #225).
                             {
+                                let warnings_db =
+                                    open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)?
+                                        .ok_or_else(|| {
+                                        anyhow::anyhow!("scip_ref_warnings database not found")
+                                    })?;
                                 let mut wtxn = env.write_txn()?;
                                 store_ref_warnings(
-                                    &env,
+                                    &warnings_db,
                                     &mut wtxn,
                                     canonical,
                                     &[RESTORE_PENDING_REF_WARNING.to_string()],
@@ -1410,9 +1415,10 @@ impl CSharpSymbolIndexer {
         // Over the LMDB key limit: answer from the live resolution and skip the
         // cache write, rather than failing a lookup that already succeeded.
         if canonical.len() <= env.max_key_size() {
+            let ref_cache_db = create_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?;
+            let warnings_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)?
+                .ok_or_else(|| anyhow::anyhow!("scip_ref_warnings database not found"))?;
             let mut wtxn = env.write_txn()?;
-            let ref_cache_db: Database<Str, Bytes> =
-                env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
             let cached_bytes = serialize_refs(&lazy_refs)
                 .with_context(|| format!("Failed to serialize refs for cache: {}", canonical))?;
             ref_cache_db
@@ -1420,7 +1426,7 @@ impl CSharpSymbolIndexer {
                 .with_context(|| put_ctx(SCIP_REF_CACHE_DB_NAME, canonical, cached_bytes.len()))?;
             // Same txn as the refs: cached-partial and its warnings are one
             // atomic fact. Empty warnings remove any stale entry.
-            store_ref_warnings(&env, &mut wtxn, canonical, &lazy_warnings)?;
+            store_ref_warnings(&warnings_db, &mut wtxn, canonical, &lazy_warnings)?;
             wtxn.commit()?;
         }
 
@@ -1433,10 +1439,10 @@ impl CSharpSymbolIndexer {
     pub fn refs_coverage(&self, db_path: &Path) -> Option<String> {
         let env = self.open_scip_env(db_path).ok()?;
         let rtxn = env.read_txn().ok()?;
-        let meta_db: Database<Str, Str> = env
-            .open_database(&rtxn, Some(SCIP_META_DB_NAME))
-            .ok()
-            .flatten()?;
+        let meta_db: Database<'static, Str, Str> =
+            open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
+                .ok()
+                .flatten()?;
         meta_db
             .get(&rtxn, META_REFS_COVERAGE)
             .ok()
@@ -1451,12 +1457,12 @@ impl CSharpSymbolIndexer {
         let env = self.open_scip_env(db_path)?;
         let rtxn = env.read_txn()?;
 
-        let symbols_db: Database<Str, Bytes> = env
-            .open_database(&rtxn, Some(SCIP_DB_NAME))?
-            .ok_or_else(|| anyhow::anyhow!("scip_symbols database not found"))?;
+        let symbols_db: Database<'static, Str, Bytes> =
+            open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)?
+                .ok_or_else(|| anyhow::anyhow!("scip_symbols database not found"))?;
 
-        let ref_cache_db: Option<Database<Str, Bytes>> =
-            env.open_database(&rtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
+        let ref_cache_db: Option<Database<'static, Str, Bytes>> =
+            open_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?;
 
         let mut uncached = Vec::new();
         let iter = symbols_db.iter(&rtxn)?;
@@ -1756,9 +1762,10 @@ impl CSharpSymbolIndexer {
         }
 
         let env = self.open_scip_env(db_path)?;
+        let ref_cache_db = create_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?;
+        let warnings_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)?
+            .ok_or_else(|| anyhow::anyhow!("scip_ref_warnings database not found"))?;
         let mut wtxn = env.write_txn()?;
-        let ref_cache_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
 
         let mut cached_count = 0usize;
         for result in &batch.results {
@@ -1789,7 +1796,7 @@ impl CSharpSymbolIndexer {
                 .with_context(|| put_ctx(SCIP_REF_CACHE_DB_NAME, &result.symbol, bytes.len()))?;
             // Same txn as the refs: cached-partial and its warnings are one
             // atomic fact. Empty warnings remove any stale entry.
-            store_ref_warnings(&env, &mut wtxn, &result.symbol, &result.warnings)?;
+            store_ref_warnings(&warnings_db, &mut wtxn, &result.symbol, &result.warnings)?;
             cached_count += 1;
         }
 
@@ -1961,20 +1968,16 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         // Open LMDB (all named DBs pre-created by open_scip_env)
         let env = self.open_scip_env(db_path)?;
-        let mut wtxn = env.write_txn()?;
 
-        let symbols_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_DB_NAME))?;
-        let meta_db: Database<Str, Str> =
-            env.create_database(&mut wtxn, Some(SCIP_META_DB_NAME))?;
-        let positions_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_POSITION_DB_NAME))?;
-        let simple_names_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))?;
-        let ref_cache_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
-        let ref_warnings_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_REF_WARNINGS_DB_NAME))?;
+        // heed 0.23: creation commits its own transaction — one per database,
+        // before the single data-write transaction below.
+        let symbols_db = create_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)?;
+        let meta_db = create_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)?;
+        let positions_db = create_named_db::<Str, Bytes>(&env, SCIP_POSITION_DB_NAME)?;
+        let simple_names_db = create_named_db::<Str, Bytes>(&env, SCIP_SIMPLE_NAMES_DB_NAME)?;
+        let ref_cache_db = create_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?;
+        let ref_warnings_db = create_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)?;
+        let mut wtxn = env.write_txn()?;
 
         // Collect affected files (non-empty only for incremental/Files scope).
         // Declared outside the if/else so the write loop below can also reference it.
@@ -2365,7 +2368,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 // guess at a near-miss symbol.
                 let env = self.open_scip_env(db_path)?;
                 let rtxn = env.read_txn()?;
-                let present = match env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))? {
+                let present = match open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)? {
                     Some(db) => db.get(&rtxn, key as &str)?.is_some(),
                     None => false,
                 };
@@ -2383,9 +2386,8 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 let env = self.open_scip_env(db_path)?;
                 let rtxn = env.read_txn()?;
 
-                let positions_db: Database<Str, Bytes> = env
-                    .open_database(&rtxn, Some(SCIP_POSITION_DB_NAME))?
-                    .ok_or_else(|| {
+                let positions_db: Database<'static, Str, Bytes> =
+                    open_named_db::<Str, Bytes>(&env, SCIP_POSITION_DB_NAME)?.ok_or_else(|| {
                         anyhow::anyhow!("Position index not found. Run a rebuild first.")
                     })?;
 
@@ -2449,10 +2451,11 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Err(_) => return u64::MAX,
         };
 
-        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
-            Ok(Some(db)) => db,
-            _ => return u64::MAX,
-        };
+        let meta_db: Database<'static, Str, Str> =
+            match open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME) {
+                Ok(Some(db)) => db,
+                _ => return u64::MAX,
+            };
 
         let ts_str: &str = match meta_db.get(&rtxn, META_REBUILD_TS) {
             Ok(Some(s)) => s,
@@ -2475,10 +2478,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     fn index_head_sha(&self, db_path: &Path) -> Option<String> {
         let env = self.open_scip_env(db_path).ok()?;
         let rtxn = env.read_txn().ok()?;
-        let meta_db: Database<Str, Str> = env
-            .open_database(&rtxn, Some(SCIP_META_DB_NAME))
-            .ok()
-            .flatten()?;
+        let meta_db: Database<'static, Str, Str> =
+            open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
+                .ok()
+                .flatten()?;
         let sha = meta_db.get(&rtxn, META_HEAD_SHA).ok().flatten()?;
         let sha = sha.trim().to_string();
         (!sha.is_empty()).then_some(sha)
@@ -2500,10 +2503,11 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
-        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
-            Ok(Some(db)) => db,
-            _ => return Vec::new(),
-        };
+        let meta_db: Database<'static, Str, Str> =
+            match open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME) {
+                Ok(Some(db)) => db,
+                _ => return Vec::new(),
+            };
         let json = match meta_db.get(&rtxn, META_INDEX_WARNINGS) {
             Ok(Some(s)) => s,
             _ => return Vec::new(),
@@ -2524,10 +2528,11 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Ok(t) => t,
             Err(_) => return None,
         };
-        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
-            Ok(Some(db)) => db,
-            _ => return None,
-        };
+        let meta_db: Database<'static, Str, Str> =
+            match open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME) {
+                Ok(Some(db)) => db,
+                _ => return None,
+            };
         meta_db
             .get(&rtxn, META_BUILDER_VERSION)
             .ok()
@@ -2575,10 +2580,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Ok(t) => t,
             Err(_) => return false,
         };
-        let meta_db: Option<Database<Str, Str>> = env
-            .open_database(&rtxn, Some(SCIP_META_DB_NAME))
-            .ok()
-            .flatten();
+        let meta_db: Option<Database<'static, Str, Str>> =
+            open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
+                .ok()
+                .flatten();
         let stored = meta_db
             .and_then(|db| db.get(&rtxn, META_KEY_FORMAT).ok().flatten())
             .map(|s| s.trim().to_string());
@@ -2725,11 +2730,10 @@ mod tests {
         );
 
         let long_key = "a".repeat(1000);
-        let mut wtxn = env.write_txn().unwrap();
-        let db: Database<Str, Bytes> = env
-            .open_database(&wtxn, Some(SCIP_DB_NAME))
+        let db = open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)
             .unwrap()
             .unwrap();
+        let mut wtxn = env.write_txn().unwrap();
         db.put(&mut wtxn, long_key.as_str(), b"v".as_slice())
             .expect("a 1000-byte key must be writable");
         wtxn.commit().unwrap();
@@ -2748,11 +2752,10 @@ mod tests {
 
         let put_meta = |key: &str, value: &str| {
             let env = crate::symbols::get_shared_scip_env(&db).unwrap();
-            let mut wtxn = env.write_txn().unwrap();
-            let meta: Database<Str, Str> = env
-                .open_database(&wtxn, Some(SCIP_META_DB_NAME))
+            let meta = open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
                 .unwrap()
                 .unwrap();
+            let mut wtxn = env.write_txn().unwrap();
             meta.put(&mut wtxn, META_REBUILD_TS, "0").unwrap();
             if !key.is_empty() {
                 meta.put(&mut wtxn, key, value).unwrap();
@@ -2788,16 +2791,15 @@ mod tests {
     /// Writes scip_symbols / scip_simple_names / scip_positions directly.
     fn populate_ambiguity_fixture(db_path: &Path) -> (String, String, String) {
         let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
-        let mut wtxn = env.write_txn().expect("wtxn");
 
         let validate1 = "csharp Ns . V#Validate().".to_string();
         let validate2 = "csharp Ns . V#Validate(System.String).".to_string();
         let compute = "csharp Ns . C#Compute().".to_string();
 
-        let symbols: Database<Str, Bytes> = env
-            .open_database(&wtxn, Some(SCIP_DB_NAME))
+        let symbols = open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)
             .unwrap()
             .unwrap();
+        let mut wtxn = env.write_txn().expect("wtxn");
         for key in [&validate1, &validate2, &compute] {
             let refs = serialize_refs(&[StoredReference {
                 file: PathBuf::from("src/v.cs"),
@@ -2809,8 +2811,7 @@ mod tests {
             symbols.put(&mut wtxn, key.as_str(), &refs).unwrap();
         }
 
-        let names: Database<Str, Bytes> = env
-            .open_database(&wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))
+        let names = open_named_db::<Str, Bytes>(&env, SCIP_SIMPLE_NAMES_DB_NAME)
             .unwrap()
             .unwrap();
         // Stored deliberately out of order: resolution must sort.
@@ -2829,8 +2830,7 @@ mod tests {
             )
             .unwrap();
 
-        let positions: Database<Str, Bytes> = env
-            .open_database(&wtxn, Some(SCIP_POSITION_DB_NAME))
+        let positions = open_named_db::<Str, Bytes>(&env, SCIP_POSITION_DB_NAME)
             .unwrap()
             .unwrap();
         positions
@@ -2975,9 +2975,12 @@ mod tests {
         // batch write paths use: version byte + bincode Vec<String>).
         let env = crate::symbols::get_shared_scip_env(&db).unwrap();
         {
+            let warnings_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)
+                .unwrap()
+                .unwrap();
             let mut wtxn = env.write_txn().unwrap();
             store_ref_warnings(
-                &env,
+                &warnings_db,
                 &mut wtxn,
                 &v1,
                 &[
@@ -3006,8 +3009,11 @@ mod tests {
         // it forever (a partial find-refs result that was cached and later
         // re-resolved cleanly must stop claiming partiality).
         {
+            let warnings_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)
+                .unwrap()
+                .unwrap();
             let mut wtxn = env.write_txn().unwrap();
-            store_ref_warnings(&env, &mut wtxn, &v1, &[]).unwrap();
+            store_ref_warnings(&warnings_db, &mut wtxn, &v1, &[]).unwrap();
             wtxn.commit().unwrap();
         }
         assert!(
@@ -3228,11 +3234,10 @@ mod tests {
         let key = "csharp Ns . V#Validate().";
         {
             let env = crate::symbols::get_shared_scip_env(&db).unwrap();
-            let mut wtxn = env.write_txn().unwrap();
-            let symbols: Database<Str, Bytes> = env
-                .open_database(&wtxn, Some(SCIP_DB_NAME))
+            let symbols = open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)
                 .unwrap()
                 .unwrap();
+            let mut wtxn = env.write_txn().unwrap();
             symbols
                 .put(
                     &mut wtxn,
@@ -3297,8 +3302,12 @@ mod tests {
         std::fs::write(dir.join("FakeSolution.sln"), "").unwrap();
         {
             let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+            let warnings_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)
+                .unwrap()
+                .unwrap();
             let mut wtxn = env.write_txn().unwrap();
-            store_ref_warnings(&env, &mut wtxn, FAKE_REFERENCED, &["stale".into()]).unwrap();
+            store_ref_warnings(&warnings_db, &mut wtxn, FAKE_REFERENCED, &["stale".into()])
+                .unwrap();
             wtxn.commit().unwrap();
         }
         let helper_dir = dir.join("helper");
@@ -3328,7 +3337,8 @@ mod tests {
     fn table_keys(db: &Path, table: &str) -> Vec<String> {
         let env = crate::symbols::get_shared_scip_env(db).unwrap();
         let rtxn = env.read_txn().unwrap();
-        let entries: Database<Str, Bytes> = env.open_database(&rtxn, Some(table)).unwrap().unwrap();
+        let entries: Database<'static, Str, Bytes> =
+            open_named_db::<Str, Bytes>(&env, table).unwrap().unwrap();
         let mut keys: Vec<String> = entries
             .iter(&rtxn)
             .unwrap()
@@ -3754,11 +3764,10 @@ mod tests {
         let key = "csharp Ns . V#Validate().";
         {
             let env = crate::symbols::get_shared_scip_env(&db).unwrap();
-            let mut wtxn = env.write_txn().unwrap();
-            let symbols: Database<Str, Bytes> = env
-                .open_database(&wtxn, Some(SCIP_DB_NAME))
+            let symbols = open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)
                 .unwrap()
                 .unwrap();
+            let mut wtxn = env.write_txn().unwrap();
             symbols
                 .put(
                     &mut wtxn,
@@ -3797,10 +3806,10 @@ mod tests {
         // must miss the cache and resolve properly.
         let env = crate::symbols::get_shared_scip_env(&db).unwrap();
         let rtxn = env.read_txn().unwrap();
-        let cache: Database<Str, Bytes> = env
-            .open_database(&rtxn, Some(SCIP_REF_CACHE_DB_NAME))
-            .unwrap()
-            .unwrap();
+        let cache: Database<'static, Str, Bytes> =
+            open_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)
+                .unwrap()
+                .unwrap();
         assert!(
             cache.get(&rtxn, key).unwrap().is_none(),
             "a pending find-refs must not write the ref cache"

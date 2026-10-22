@@ -49,6 +49,57 @@ use crate::cache::safe_canonicalize;
 #[allow(deprecated)]
 pub const BASE_ENV_FLAGS: heed::EnvFlags = heed::EnvFlags::NO_TLS;
 
+// ── heed 0.23 database open/create shims ────────────────────────
+
+/// Create (or type-check) one named database and commit a dedicated write
+/// transaction for it.
+///
+/// heed 0.23 removed `Env::create_database`: creation must go through
+/// `create_databases_and_commit`, which OWNS and commits its transaction —
+/// a database can no longer be created inside a transaction that does other
+/// work. Call this FIRST, then open a fresh transaction for the real work;
+/// the returned `'static` handle is environment-global and usable inside any
+/// later transaction.
+pub fn create_named_db<KC, DC>(
+    env: &heed::Env,
+    name: &str,
+) -> heed::Result<heed::Database<'static, KC, DC>>
+where
+    KC: 'static,
+    DC: 'static,
+{
+    let wtxn = env.write_txn()?;
+    Ok(env
+        .create_databases_and_commit(wtxn, |dbo, wtxn| {
+            dbo.create_database::<KC, DC>(wtxn, Some(name))
+                .map(heed::CommitOrAbort::<_, ()>::Commit)
+        })?
+        .unwrap_commit())
+}
+
+/// Open one existing named database (read-only check) and commit the read
+/// transaction the opener requires.
+///
+/// Returns `Ok(None)` when the database does not exist yet. The returned
+/// `'static` handle is environment-global and usable inside any later
+/// transaction.
+pub fn open_named_db<KC, DC>(
+    env: &heed::Env,
+    name: &str,
+) -> heed::Result<Option<heed::Database<'static, KC, DC>>>
+where
+    KC: 'static,
+    DC: 'static,
+{
+    let rtxn = env.read_txn()?;
+    Ok(env
+        .open_databases_and_commit(rtxn, |dbo, rtxn| {
+            dbo.open_database::<KC, DC>(rtxn, Some(name))
+                .map(heed::CommitOrAbort::<_, ()>::Commit)
+        })?
+        .unwrap_commit())
+}
+
 // ── Global registry ─────────────────────────────────────────────
 
 static LMDB_REGISTRY: OnceLock<DashMap<PathBuf, LmdbEntry>> = OnceLock::new();

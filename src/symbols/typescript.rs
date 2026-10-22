@@ -23,7 +23,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::lmdb_registry::TrackedEnv;
+use crate::lmdb_registry::{create_named_db, open_named_db, TrackedEnv};
 use anyhow::{Context, Result};
 use heed::types::{Bytes, Str};
 use heed::Database;
@@ -384,17 +384,18 @@ impl TypeScriptSymbolIndexer {
     fn resolve_name_key(&self, env: &TrackedEnv, symbol: &str) -> Result<KeyMatch> {
         let rtxn = env.read_txn()?;
 
-        let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
-            Some(db) => db,
-            None => return Ok(KeyMatch::NotFound),
-        };
+        let symbols_db: Database<'static, Str, Bytes> =
+            match open_named_db::<Str, Bytes>(env, SCIP_DB_NAME)? {
+                Some(db) => db,
+                None => return Ok(KeyMatch::NotFound),
+            };
 
         if symbols_db.get(&rtxn, symbol)?.is_some() {
             return Ok(KeyMatch::Resolved(symbol.to_string()));
         }
 
-        let simple_names_db: Database<Str, Bytes> =
-            match env.open_database(&rtxn, Some(SCIP_NAMES_DB_NAME))? {
+        let simple_names_db: Database<'static, Str, Bytes> =
+            match open_named_db::<Str, Bytes>(env, SCIP_NAMES_DB_NAME)? {
                 Some(db) => db,
                 None => return Ok(KeyMatch::NotFound),
             };
@@ -493,16 +494,14 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         let index = scip_proto::parse_scip_protobuf(&index_data)?;
 
         let env = self.open_scip_env(db_path)?;
-        let mut wtxn = env.write_txn()?;
 
-        let symbols_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_DB_NAME))?;
-        let meta_db: Database<Str, Str> =
-            env.create_database(&mut wtxn, Some(SCIP_META_DB_NAME))?;
-        let positions_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_POS_DB_NAME))?;
-        let simple_names_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_NAMES_DB_NAME))?;
+        // heed 0.23: creation commits its own transaction — one per database,
+        // before the single data-write transaction below.
+        let symbols_db = create_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)?;
+        let meta_db = create_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)?;
+        let positions_db = create_named_db::<Str, Bytes>(&env, SCIP_POS_DB_NAME)?;
+        let simple_names_db = create_named_db::<Str, Bytes>(&env, SCIP_NAMES_DB_NAME)?;
+        let mut wtxn = env.write_txn()?;
 
         // Full rebuild only (MVP): wipe and repopulate this language's entries.
         // NOTE: scip_symbols/scip_positions/scip_simple_names are shared physical
@@ -633,7 +632,7 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
                 // guess at a near-miss symbol.
                 let env = self.open_scip_env(db_path)?;
                 let rtxn = env.read_txn()?;
-                let present = match env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))? {
+                let present = match open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)? {
                     Some(db) => db.get(&rtxn, key as &str)?.is_some(),
                     None => false,
                 };
@@ -651,9 +650,8 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
                 let env = self.open_scip_env(db_path)?;
                 let rtxn = env.read_txn()?;
 
-                let positions_db: Database<Str, Bytes> = env
-                    .open_database(&rtxn, Some(SCIP_POS_DB_NAME))?
-                    .ok_or_else(|| {
+                let positions_db: Database<'static, Str, Bytes> =
+                    open_named_db::<Str, Bytes>(&env, SCIP_POS_DB_NAME)?.ok_or_else(|| {
                         anyhow::anyhow!("Position index not found. Run a rebuild first.")
                     })?;
 
@@ -685,10 +683,11 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         let env = self.open_scip_env(db_path)?;
 
         let rtxn = env.read_txn()?;
-        let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
-            Some(db) => db,
-            None => return Ok(vec![]),
-        };
+        let symbols_db: Database<'static, Str, Bytes> =
+            match open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)? {
+                Some(db) => db,
+                None => return Ok(vec![]),
+            };
 
         let stored = match symbols_db.get(&rtxn, canonical_key)? {
             Some(bytes) => deserialize_refs(bytes)?,
@@ -717,7 +716,7 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         let Ok(rtxn) = env.read_txn() else {
             return Vec::new();
         };
-        let raw = match env.open_database::<Str, Str>(&rtxn, Some(SCIP_META_DB_NAME)) {
+        let raw = match open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME) {
             Ok(Some(meta)) => match meta.get(&rtxn, META_INDEX_WARNINGS) {
                 Ok(Some(raw)) => raw,
                 _ => return Vec::new(),
@@ -737,10 +736,11 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
             Err(_) => return u64::MAX,
         };
 
-        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
-            Ok(Some(db)) => db,
-            _ => return u64::MAX,
-        };
+        let meta_db: Database<'static, Str, Str> =
+            match open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME) {
+                Ok(Some(db)) => db,
+                _ => return u64::MAX,
+            };
 
         let ts_str: &str = match meta_db.get(&rtxn, META_REBUILD_TS) {
             Ok(Some(s)) => s,
@@ -763,10 +763,10 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
     fn index_head_sha(&self, db_path: &Path) -> Option<String> {
         let env = self.open_scip_env(db_path).ok()?;
         let rtxn = env.read_txn().ok()?;
-        let meta_db: Database<Str, Str> = env
-            .open_database(&rtxn, Some(SCIP_META_DB_NAME))
-            .ok()
-            .flatten()?;
+        let meta_db: Database<'static, Str, Str> =
+            open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
+                .ok()
+                .flatten()?;
         let sha = meta_db.get(&rtxn, META_HEAD_SHA).ok().flatten()?;
         let sha = sha.trim().to_string();
         (!sha.is_empty()).then_some(sha)

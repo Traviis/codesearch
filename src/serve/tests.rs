@@ -4444,10 +4444,12 @@ fn build_info_overlay_reads_symbol_warnings_from_meta() {
     // Seed the meta the way a degraded rebuild does (see the roundtrip test
     // in csharp_tests for the read side).
     let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let meta = crate::lmdb_registry::create_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
-        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap();
     meta.put(
         &mut wtxn,
         crate::constants::SCIP_INDEX_WARNINGS_KEY,
@@ -4926,11 +4928,13 @@ async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
 /// tests can shape a fresh, stale or degraded index without the helper.
 fn seed_scip_meta(db: &std::path::Path, extra: &[(&str, &str)]) {
     let env = crate::symbols::get_shared_scip_env(db).unwrap();
+    let meta = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
-        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap()
-        .unwrap();
     meta.put(&mut wtxn, crate::constants::SCIP_REBUILD_TIMESTAMP_KEY, "0")
         .unwrap();
     meta.put(

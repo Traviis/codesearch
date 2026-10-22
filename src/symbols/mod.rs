@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::lmdb_registry::create_named_db;
+
 // ── Helper rendering ──────────────────────────────────────────────
 
 /// Platform-stable rendering of a helper process's exit status.
@@ -378,33 +380,32 @@ pub(crate) fn get_shared_scip_env(
         |env| {
             // Pre-create every named database (both languages') exactly once
             // per env session: LMDB requires named DBs to exist before they
-            // can be opened in read txns.
-            let mut wtxn = env.write_txn()?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_SYMBOLS_DB_NAME),
+            // can be opened in read txns. heed 0.23: each creation commits
+            // its own transaction.
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_SYMBOLS_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Str>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_META_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Str>(
+                env,
+                crate::constants::SCIP_META_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_POSITION_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_POSITION_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_SIMPLE_NAMES_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_SIMPLE_NAMES_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_REF_CACHE_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_REF_CACHE_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_REF_WARNINGS_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_REF_WARNINGS_DB_NAME,
             )?;
-            wtxn.commit()?;
             Ok(())
         },
     )
