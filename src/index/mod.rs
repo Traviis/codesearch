@@ -984,10 +984,11 @@ async fn index_with_options(
     } else {
         let pb = ProgressBar::new(files.len() as u64);
         pb.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("█▓▒░ "),
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}",
+            )
+            .expect("valid progress template")
+            .progress_chars("█▓▒░ "),
         );
         pb
     };
