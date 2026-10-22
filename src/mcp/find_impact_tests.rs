@@ -432,7 +432,10 @@ fn populate_overload_fixture(db_path: &std::path::Path) {
         .unwrap()
         .unwrap();
     let mut payload = vec![1u8];
-    payload.extend_from_slice(&bincode::serialize(&vec![v1.clone(), v2.clone()]).unwrap());
+    payload.extend_from_slice(
+        &bincode::serde::encode_to_vec(vec![v1.clone(), v2.clone()], bincode::config::legacy())
+            .unwrap(),
+    );
     names.put(&mut wtxn, "Validate", &payload).unwrap();
     wtxn.commit().unwrap();
 }
@@ -736,12 +739,10 @@ async fn without_language_a_single_installed_helper_answers_deterministically() 
 fn stored_refs_bytes(file: &str, kind: &str) -> Vec<u8> {
     let mut bytes = vec![1u8];
     bytes.extend_from_slice(
-        &bincode::serialize(&vec![(
-            std::path::PathBuf::from(file),
-            7u32,
-            9u32,
-            kind.to_string(),
-        )])
+        &bincode::serde::encode_to_vec(
+            vec![(std::path::PathBuf::from(file), 7u32, 9u32, kind.to_string())],
+            bincode::config::legacy(),
+        )
         .unwrap(),
     );
     bytes
@@ -752,7 +753,9 @@ fn stored_refs_bytes(file: &str, kind: &str) -> Vec<u8> {
 fn warnings_bytes(warnings: &[&str]) -> Vec<u8> {
     let owned: Vec<String> = warnings.iter().map(|w| w.to_string()).collect();
     let mut bytes = vec![1u8];
-    bytes.extend_from_slice(&bincode::serialize(&owned).unwrap());
+    bytes.extend_from_slice(
+        &bincode::serde::encode_to_vec(&owned, bincode::config::legacy()).unwrap(),
+    );
     bytes
 }
 
@@ -1042,7 +1045,9 @@ async fn position_miss_answers_loud_failure_not_empty_references() {
             .create_database(&mut wtxn, Some(crate::constants::SCIP_POSITION_DB_NAME))
             .unwrap();
         let mut entry = vec![1u8];
-        entry.extend_from_slice(&bincode::serialize(&vec![clean_key]).unwrap());
+        entry.extend_from_slice(
+            &bincode::serde::encode_to_vec(vec![clean_key], bincode::config::legacy()).unwrap(),
+        );
         positions.put(&mut wtxn, "src/w.cs:5", &entry).unwrap();
         wtxn.commit().unwrap();
     }

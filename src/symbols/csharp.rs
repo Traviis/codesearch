@@ -439,7 +439,8 @@ struct StoredReference {
 
 /// Serialize references with a leading version byte.
 fn serialize_refs(refs: &[StoredReference]) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(refs).with_context(|| "bincode serialize failed")?;
+    let payload = bincode::serde::encode_to_vec(refs, bincode::config::legacy())
+        .with_context(|| "bincode serialize failed")?;
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(STORED_REFERENCE_SCHEMA_VERSION);
     buf.extend_from_slice(&payload);
@@ -460,7 +461,12 @@ fn deserialize_refs(bytes: &[u8]) -> Result<Vec<StoredReference>> {
             STORED_REFERENCE_SCHEMA_VERSION
         );
     }
-    bincode::deserialize(&bytes[1..]).with_context(|| "bincode deserialize failed")
+    bincode::serde::decode_from_slice::<Vec<StoredReference>, _>(
+        &bytes[1..],
+        bincode::config::legacy(),
+    )
+    .map(|(refs, _)| refs)
+    .with_context(|| "bincode deserialize failed")
 }
 
 // ── Key-list serialization (for position + simple-name indexes) ─────
@@ -470,7 +476,8 @@ const KEYS_LIST_SCHEMA_VERSION: u8 = 1;
 
 /// Serialize a list of symbol keys with a leading version byte.
 fn serialize_keys_v1(keys: &[String]) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(keys).with_context(|| "bincode serialize keys failed")?;
+    let payload = bincode::serde::encode_to_vec(keys, bincode::config::legacy())
+        .with_context(|| "bincode serialize keys failed")?;
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(KEYS_LIST_SCHEMA_VERSION);
     buf.extend_from_slice(&payload);
@@ -491,7 +498,9 @@ fn deserialize_keys_v1(bytes: &[u8]) -> Result<Vec<String>> {
             KEYS_LIST_SCHEMA_VERSION
         );
     }
-    bincode::deserialize(&bytes[1..]).with_context(|| "bincode deserialize keys failed")
+    bincode::serde::decode_from_slice::<Vec<String>, _>(&bytes[1..], bincode::config::legacy())
+        .map(|(keys, _)| keys)
+        .with_context(|| "bincode deserialize keys failed")
 }
 
 /// Context for a SCIP LMDB write. A bare `MDB_BAD_VALSIZE` names neither the
@@ -2634,7 +2643,10 @@ mod tests {
         let bytes = serialize_refs(&refs).unwrap();
         assert_eq!(bytes[0], STORED_REFERENCE_SCHEMA_VERSION);
         // Verify the rest is valid bincode
-        let decoded: Vec<StoredReference> = bincode::deserialize(&bytes[1..]).unwrap();
+        let decoded: Vec<StoredReference> =
+            bincode::serde::decode_from_slice(&bytes[1..], bincode::config::legacy())
+                .unwrap()
+                .0;
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].kind, "definition");
     }

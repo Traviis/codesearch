@@ -81,7 +81,8 @@ struct StoredReference {
 }
 
 fn serialize_refs(refs: &[StoredReference]) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(refs).with_context(|| "bincode serialize failed")?;
+    let payload = bincode::serde::encode_to_vec(refs, bincode::config::legacy())
+        .with_context(|| "bincode serialize failed")?;
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(STORED_REFERENCE_SCHEMA_VERSION);
     buf.extend_from_slice(&payload);
@@ -101,13 +102,19 @@ fn deserialize_refs(bytes: &[u8]) -> Result<Vec<StoredReference>> {
             STORED_REFERENCE_SCHEMA_VERSION
         );
     }
-    bincode::deserialize(&bytes[1..]).with_context(|| "bincode deserialize failed")
+    bincode::serde::decode_from_slice::<Vec<StoredReference>, _>(
+        &bytes[1..],
+        bincode::config::legacy(),
+    )
+    .map(|(refs, _)| refs)
+    .with_context(|| "bincode deserialize failed")
 }
 
 const KEYS_LIST_SCHEMA_VERSION: u8 = 1;
 
 fn serialize_keys_v1(keys: &[String]) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(keys).with_context(|| "bincode serialize keys failed")?;
+    let payload = bincode::serde::encode_to_vec(keys, bincode::config::legacy())
+        .with_context(|| "bincode serialize keys failed")?;
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(KEYS_LIST_SCHEMA_VERSION);
     buf.extend_from_slice(&payload);
@@ -127,7 +134,9 @@ fn deserialize_keys_v1(bytes: &[u8]) -> Result<Vec<String>> {
             KEYS_LIST_SCHEMA_VERSION
         );
     }
-    bincode::deserialize(&bytes[1..]).with_context(|| "bincode deserialize keys failed")
+    bincode::serde::decode_from_slice::<Vec<String>, _>(&bytes[1..], bincode::config::legacy())
+        .map(|(keys, _)| keys)
+        .with_context(|| "bincode deserialize keys failed")
 }
 
 /// Extracts the last segment of a canonical SCIP symbol as a simple name.
