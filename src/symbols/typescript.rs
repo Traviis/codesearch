@@ -802,6 +802,27 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
 mod tests {
     use super::*;
 
+    /// Golden bytes produced by real bincode 1.3.3 (`bincode::serialize`) for
+    /// `vec!["alpha", "b"]`. Pins `config::legacy()` to the bincode-1 wire
+    /// format so stored key lists keep decoding without a reindex.
+    #[test]
+    fn test_keys_still_read_bincode1_bytes() {
+        const GOLDEN: [u8; 30] = [
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // vec len = 2
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x61, 0x6c, 0x70, 0x68,
+            0x61, // "alpha"
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, // "b"
+        ];
+        let keys = vec!["alpha".to_string(), "b".to_string()];
+        let encoded = serialize_keys_v1(&keys).unwrap();
+        assert_eq!(encoded[0], KEYS_LIST_SCHEMA_VERSION);
+        assert_eq!(&encoded[1..], GOLDEN, "legacy() must match bincode 1");
+
+        let mut bytes = vec![KEYS_LIST_SCHEMA_VERSION];
+        bytes.extend_from_slice(&GOLDEN);
+        assert_eq!(deserialize_keys_v1(&bytes).unwrap(), keys);
+    }
+
     #[test]
     fn test_extract_simple_name() {
         assert_eq!(

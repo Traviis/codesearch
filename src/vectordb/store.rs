@@ -1434,7 +1434,8 @@ pub struct SearchResult {
 #[derive(Debug, Clone)]
 /// Real LMDB page-level statistics for accurate bloat detection.
 pub struct LmdbPageStats {
-    /// Bytes occupied by non-free (live) pages — from `env.non_free_pages_size()`.
+    /// Bytes occupied by live pages — summed per-database via `stat()`
+    /// (heed 0.23 removed `Env::non_free_pages_size`).
     pub used_bytes: u64,
     /// Actual file size on disk — from `env.real_disk_size()`.
     pub disk_size: u64,
@@ -1526,6 +1527,33 @@ mod tests {
         assert_eq!(
             store.next_id, before,
             "ids consumed by the aborted attempt must be handed back"
+        );
+    }
+
+    /// `lmdb_page_stats()` feeds doctor's bloat detection; the heed 0.23
+    /// migration replaced `Env::non_free_pages_size` with a per-database
+    /// `stat()` sum. Pin the arithmetic: an insert must occupy pages and the
+    /// live-page total must stay within the file on disk.
+    #[test]
+    fn page_stats_count_occupied_pages_after_insert() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("stats.db");
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let empty = store.lmdb_page_stats().expect("stats on a fresh store");
+
+        store
+            .insert_chunks_with_ids(vec![drift_chunk("src/a.rs", "fn a() {}", 0)])
+            .expect("fixture insert");
+        let after = store.lmdb_page_stats().expect("stats after insert");
+
+        assert!(
+            after.used_bytes > empty.used_bytes,
+            "insert must occupy pages"
+        );
+        assert!(after.used_bytes > 0, "live pages must be counted");
+        assert!(
+            after.disk_size >= after.used_bytes,
+            "live pages cannot exceed the file on disk"
         );
     }
 

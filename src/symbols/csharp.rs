@@ -2667,6 +2667,40 @@ mod tests {
         );
     }
 
+    /// Golden bytes produced by real bincode 1.3.3 (`bincode::serialize`).
+    /// Pins `config::legacy()` to the bincode-1 wire format: existing on-disk
+    /// indexes must keep decoding after the bincode 2 migration, no reindex.
+    #[test]
+    fn test_deserialize_refs_still_reads_bincode1_bytes() {
+        const GOLDEN: [u8; 44] = [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // vec len = 1
+            0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // "src/lib.rs"
+            0x73, 0x72, 0x63, 0x2f, 0x6c, 0x69, 0x62, 0x2e, 0x72, 0x73, //
+            0x0a, 0x00, 0x00, 0x00, // start_line = 10
+            0x14, 0x00, 0x00, 0x00, // end_line = 20
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x6e, // "fn"
+        ];
+        let refs = vec![StoredReference {
+            file: PathBuf::from("src/lib.rs"),
+            start_line: 10,
+            end_line: 20,
+            kind: "fn".into(),
+        }];
+        // Round-trip: the bincode 2 legacy encoder must emit the same bytes.
+        let encoded = serialize_refs(&refs).unwrap();
+        assert_eq!(encoded[0], STORED_REFERENCE_SCHEMA_VERSION);
+        assert_eq!(&encoded[1..], GOLDEN, "legacy() must match bincode 1");
+
+        let mut bytes = vec![STORED_REFERENCE_SCHEMA_VERSION];
+        bytes.extend_from_slice(&GOLDEN);
+        let decoded = deserialize_refs(&bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].file, PathBuf::from("src/lib.rs"));
+        assert_eq!(decoded[0].start_line, 10);
+        assert_eq!(decoded[0].end_line, 20);
+        assert_eq!(decoded[0].kind, "fn");
+    }
+
     #[test]
     fn test_deserialize_refs_rejects_empty() {
         let err = deserialize_refs(&[]).unwrap_err();
