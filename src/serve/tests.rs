@@ -288,6 +288,52 @@ async fn remove_repo_reports_db_deleted_when_delete_succeeds() {
     assert!(!db_path.exists(), "DB directory must be removed from disk");
 }
 
+/// `remove_repo` must release a CACHE-ONLY shared env (the strong
+/// process-lifetime cache — no live caller Arc) before deleting the DB dir.
+///
+/// Regression pin for the Windows handle-leak fix's wipe-flow wiring: without
+/// the `close_shared_envs_under` call, the cached env keeps `data.mdb`/
+/// `lock.mdb` open for the process lifetime — the delete burns its whole
+/// retry budget on a sharing violation (Windows) and a `.removed-` tombstone
+/// leaks until the next serve restart. Cross-platform signal:
+/// `heed::env_closing_event` must be gone after the removal, which fails on
+/// every OS when the hook is deleted, even where the unlink itself succeeds.
+#[tokio::test]
+#[serial_test::serial]
+async fn remove_repo_releases_cache_only_shared_env_before_delete() {
+    let (_tmp, repo_path, state) = state_with_repo("cachewipe");
+    let db_path = repo_path.join(DB_DIR_NAME);
+
+    // get_shared_scip_env creates db_path/scip and caches the env; dropping
+    // our Arc leaves the cache as the only holder — the state a long-running
+    // serve accumulates after the first query on every repo.
+    let env = crate::symbols::get_shared_scip_env(&db_path).expect("shared scip env");
+    drop(env);
+    assert!(
+        crate::lmdb_registry::open_holders_under(&db_path).is_empty(),
+        "cache-only env must not report as a holder"
+    );
+    let scip_key = crate::cache::safe_canonicalize(&db_path.join("scip")).unwrap();
+    assert!(
+        heed::env_closing_event(&scip_key).is_some(),
+        "precondition: the cached env is alive before the removal"
+    );
+
+    let outcome = state.remove_repo("cachewipe").await.expect("remove_repo");
+
+    assert!(
+        outcome.db_deleted,
+        "cache-only env must be released before the delete, got: {:?}",
+        outcome.db_delete_error
+    );
+    assert!(!db_path.exists(), "DB directory must be removed from disk");
+    assert!(
+        heed::env_closing_event(&scip_key).is_none(),
+        "remove_repo must close the cache-only shared env — a surviving env \
+         means the close_shared_envs_under hook is missing"
+    );
+}
+
 #[tokio::test]
 async fn remove_repo_reports_db_locked_when_delete_fails() {
     // FINDINGS #2: when the DB path CANNOT be removed, `RepoRemovalOutcome`

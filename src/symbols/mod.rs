@@ -355,7 +355,11 @@ pub enum RebuildScope {
 /// (`LMDB double-open prevented`, surfaced as a red `C#!` in the TUI).
 /// Routing every open through this getter hands all concurrent users the SAME
 /// environment: writers serialise on LMDB's single-writer mutex, readers never
-/// block, and the double-open error class cannot occur.
+/// block, and the double-open error class cannot occur. The env lives for the
+/// process lifetime (strong cache in `lmdb_registry`) — reusing it across
+/// queries avoids per-operation open/close churn, which on Windows leaks two
+/// kernel mutex handles per `mdb_env_open`; deletion paths release it via
+/// `lmdb_registry::close_shared_envs_under`.
 pub(crate) fn get_shared_scip_env(
     db_path: &Path,
 ) -> Result<std::sync::Arc<crate::lmdb_registry::TrackedEnv>> {

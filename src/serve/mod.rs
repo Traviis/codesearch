@@ -997,6 +997,10 @@ impl ServeState {
             ));
         }
 
+        // Release the process-lifetime shared env(s) under the DB dir before
+        // the wipe — same reason as remove_repo's delete flow.
+        crate::lmdb_registry::close_shared_envs_under(&db_path);
+
         let deadline =
             Instant::now() + Duration::from_secs(crate::constants::DB_DELETE_RETRY_BUDGET_SECS);
         let mut backoff_ms = crate::constants::DB_DELETE_RETRY_INITIAL_MS;
@@ -2390,6 +2394,11 @@ impl ServeState {
         // transient search holding the LMDB mmap). We now track the real
         // outcome and surface it via `RepoRemovalOutcome` so the caller can
         // report honestly.
+        // Release the process-lifetime shared env(s) under the DB dir (the
+        // SCIP cache) BEFORE the delete/wait flow: otherwise the strong cache
+        // keeps the directory locked for the process lifetime and every wait
+        // on `open_holders_under` burns the whole retry budget.
+        crate::lmdb_registry::close_shared_envs_under(&db_path);
         let mut db_deleted = !db_path.exists();
         let mut db_delete_error: Option<String> = None;
         // True when the DB dir's cleanup is owned by the still-running index
@@ -2834,6 +2843,9 @@ impl ServeState {
     /// right after releasing it. Failures are non-fatal — the repo is already
     /// unregistered, and a serve restart reaps any leftover.
     fn remove_orphaned_db_dir(alias: &str, db_path: &std::path::Path) {
+        // The strong shared-env cache may still hold the SCIP env for this
+        // dir; release it or the delete below fails with a sharing violation.
+        crate::lmdb_registry::close_shared_envs_under(db_path);
         match std::fs::remove_dir_all(db_path) {
             Ok(()) => tracing::info!(
                 "Self-cleanup deleted orphaned DB dir for '{}': {}",
