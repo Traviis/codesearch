@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.0]
+
+### Fixed
+
+- **The serve hub no longer leaks Windows kernel mutex handles until the OS handle table saturates and the hub dies.** Two stacked causes, both measured live on a hub that crashed with `os error 1450` (`Insufficient system resources`) and tokio `failed to spawn thread` after holding the process-limit 2²⁴ ≈ 16.7M handles. (1) LMDB's Windows port (lmdb-master-sys 0.2.6, heed 0.23's backend) leaks two anonymous kernel mutex handles per `mdb_env_open`: the env's reader/writer-lock mutexes are created unconditionally but `mdb_env_close` destroys only the resize mutex. (2) The shared SCIP env cache held only `Weak` references by design, so the environment died between operations and every later query re-opened it — ~250 opens/sec on a busy hub, ≈1.7M opens ≈ 3.4M leaked handles, saturating the handle table in about a day. The cache now holds strong references: the SCIP env lives for the process lifetime and `mdb_env_open` runs once per directory (the leak drops to ~2 handles per rebuild, the env-open count itself). A new `close_shared_envs_under` releases the cached env before every in-process DB-directory delete (`index rm`/`clear`/force rebuild in the CLI; `remove_repo`, corruption format-recovery and the orphan-cleanup backstop in serve — the cache-only env would otherwise lock the directory forever), and `open_holders_under` no longer counts a cache-only env as a holder, so idle eviction and the held-in-process status keep their old semantics. The timing after the heed 0.23 bump was churn volume, not new code: lmdb-master-sys 0.2.6 predates the bump and is still the latest release; an upstream fix remains the endgame for the residual per-open leak.
+
 ## [1.6.1]
 
 ### Fixed
