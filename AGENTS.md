@@ -236,11 +236,13 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|---|
+| `fix/bash-grep-guard` | Close the bash escape hatch in the grep guards (opencode plugin + Claude Code hooks) |
 
 ---
 
 ## Changelog highlights (recent)
 
+- **v1.7.0** — bash grep-guard: raw shell `grep`/`rg` through the Bash tool is denied on covered+live repos by both guard surfaces (opencode plugin every mode but `off` with `guards.bash`/`CODESEARCH_PLUGIN_BASH_GUARD`; Claude Code hook via `Grep|Bash` matcher), same whole-token detector in plugin + sh + ps1 twins
 - **v1.6.0** — status CPU = whole serve process tree (incl. scip/dotnet children) instead of the serve process alone
 - **v1.6.0** — Razor refs mapped to source: helper emits `GetMappedLineSpan()` paths/lines (#line → .razor/.cshtml), SCIP stamp split (`SCIP_INDEX_BUILDER_VERSION`) so symbol rebuilds skip the text re-embed wave
 - **v1.6.0** — FTS commit-failure hardening: per-file transient redrive, crash-safe vector rollback, mixed-generation sweep in refresh, stale note on get_chunk
