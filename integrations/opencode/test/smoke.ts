@@ -368,6 +368,11 @@ async function main(): Promise<void> {
   await bashBefore({ tool: "read", input: { path: "x.ts" }, sessionID: "s1" })
 
   // Kill switch: CODESEARCH_PLUGIN_BASH_GUARD=0 re-allows shell grep and the tip.
+  // Ordering matters: without resolveSettings' structuredClone(DEFAULTS), the
+  // env=0 mutation below poisons the shared DEFAULTS.guards for every LATER
+  // plugin in this process — so this section must stay BEFORE the hub-down
+  // section, whose nudge assertion is the canary that fails if the leak
+  // regresses (see maybeNudgeBashGrep's guards.bash gate).
   process.env.CODESEARCH_PLUGIN_BASH_GUARD = "0"
   const bashOff = await setupPlugin("/work/my-service")
   await bashOff.app.toolHooks["execute.before"][0]({ tool: "bash", input: { command: "grep -rn x ." }, sessionID: "sb1" })
