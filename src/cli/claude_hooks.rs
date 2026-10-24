@@ -487,8 +487,8 @@ mod tests {
                 if let Some(out) = run_detector_probe(
                     "bash",
                     &[
-                        "-c",
-                        ". \"$0\"/codesearch-common.sh; if command_grep_family \"$CODESEARCH_TEST_CMD\"; then echo YES; else echo no; fi",
+                    "-c",
+                    ". \"$CODESEARCH_TEST_DIR\"/codesearch-common.sh; if command_grep_family \"$CODESEARCH_TEST_CMD\"; then echo YES; else echo no; fi",
                     ],
                     &dir,
                     cmd,
