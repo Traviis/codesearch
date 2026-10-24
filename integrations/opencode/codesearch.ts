@@ -1124,7 +1124,7 @@ function bashToolCommand(event: Loose): string {
  */
 export function bashCommandGrep(command: string): boolean {
   const bare = String(command ?? "").replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, " ")
-  for (const raw of bare.split(/[\s;&|()]+/)) {
+  for (const raw of bare.split(/[\s;&|()`]+/)) {
     if (!raw) continue
     const word = raw.replace(/\.exe$/i, "").split(/[\\/]/).pop() ?? ""
     if (BASH_GREP_WORDS.has(word.toLowerCase())) return true

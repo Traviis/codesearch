@@ -234,6 +234,7 @@ function testBashCommandGrep(): void {
   assert.equal(bashCommandGrep("/usr/bin/grep -i x file"), true, "absolute-path grep")
   assert.equal(bashCommandGrep("C:/tools/grep.exe -i x"), true, "windows grep.exe")
   assert.equal(bashCommandGrep("timeout 5 grep -r x ."), true, "grep behind another command")
+  assert.equal(bashCommandGrep("echo `grep -rn foo src/`"), true, "backtick substitution is an invocation")
   assert.equal(bashCommandGrep('echo "grep is slow, use codesearch"'), false, "grep mentioned in quotes is not an invocation")
   assert.equal(bashCommandGrep("cargo build --release"), false, "unrelated command")
   assert.equal(bashCommandGrep("progress --all"), false, "word boundary: progress is not grep")

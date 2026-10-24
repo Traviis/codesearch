@@ -53,14 +53,17 @@ struct GuardHook {
 }
 
 /// The guards installed by `hooks claude install`:
-/// - `Grep` → codesearch-first for internal code discovery.
+/// - `Grep` → codesearch-first for internal code discovery. `Bash` is in the
+///   same matcher: a shell grep/rg through the Bash tool is the escape hatch
+///   around the Grep denial, so grep-guard.sh/.ps1 guard it identically
+///   (detector: codesearch-common's command_grep_family / Test-GrepFamilyCommand).
 /// - `Agent` → inject a codesearch-first preamble into subagent prompts.
 /// - `WebSearch`/`WebFetch` → steer to remote doc mounts before the open web.
 /// - `Edit`/`Write`/`MultiEdit` → require a recent codesearch consultation
 ///   (find_impact / find kind="usages") per file before edits.
 static GUARD_HOOKS: &[GuardHook] = &[
     GuardHook {
-        matcher: "Grep",
+        matcher: "Grep|Bash",
         stem: "grep-guard",
         files: &[
             ("grep-guard.sh", GREP_GUARD_SH),
@@ -141,7 +144,10 @@ fn hook_command(hooks_dest: &Path, stem: &str) -> String {
 
 /// Ensure `settings.hooks.<event>` contains a `{matcher, hooks:[…]}` entry
 /// for `command`. Idempotent: returns `Ok(false)` without modifying anything if
-/// an entry with this exact `command` already exists anywhere in `<event>`.
+/// an entry with this exact `command` AND `matcher` already exists in `<event>`.
+/// An entry with the same command but an older matcher is upgraded in place
+/// (returns `Ok(true)`) — a re-install after a matcher change (e.g. `Grep` →
+/// `Grep|Bash`) must reach already-installed settings, not silently skip.
 /// Returns an error if a pre-existing `hooks`/`<event>` value has a shape
 /// incompatible with the expected object/array.
 fn add_matcher_hook(
@@ -164,18 +170,26 @@ fn add_matcher_hook(
         .as_array_mut()
         .context("settings.hooks.{event} must be a JSON array")?;
 
-    let already = list.iter().any(|entry| {
-        entry
+    for entry in list.iter_mut() {
+        let has_command = entry
             .get("hooks")
             .and_then(Value::as_array)
             .map(|hs| {
                 hs.iter()
                     .any(|h| h.get("command").and_then(Value::as_str) == Some(command))
             })
-            .unwrap_or(false)
-    });
-    if already {
-        return Ok(false);
+            .unwrap_or(false);
+        if !has_command {
+            continue;
+        }
+        if entry.get("matcher").and_then(Value::as_str) == Some(matcher) {
+            return Ok(false);
+        }
+        entry
+            .as_object_mut()
+            .context("hooks entry must be a JSON object")?
+            .insert("matcher".to_string(), json!(matcher));
+        return Ok(true);
     }
 
     list.push(json!({
@@ -300,6 +314,22 @@ mod tests {
     }
 
     #[test]
+    fn add_matcher_hook_upgrades_matcher_in_place() {
+        let mut settings = json!({});
+        let cmd = "bash /x/grep-guard.sh";
+        assert!(add_matcher_hook(&mut settings, "PreToolUse", "Grep", cmd).unwrap());
+        // Same command, new matcher -> upgrade in place, never a duplicate
+        // (a re-install after "Grep" -> "Grep|Bash" must reach installed settings).
+        assert!(add_matcher_hook(&mut settings, "PreToolUse", "Grep|Bash", cmd).unwrap());
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1, "matcher upgrade must not duplicate the entry");
+        assert_eq!(pre[0]["matcher"], "Grep|Bash");
+        assert_eq!(pre[0]["hooks"][0]["command"], cmd);
+        // Upgraded shape is idempotent again.
+        assert!(!add_matcher_hook(&mut settings, "PreToolUse", "Grep|Bash", cmd).unwrap());
+    }
+
+    #[test]
     fn post_tool_use_hook_is_idempotent_by_command() {
         let mut settings = json!({});
         let cmd = "bash /x/edit-guard-post.sh";
@@ -367,7 +397,10 @@ mod tests {
     #[test]
     fn guard_hooks_cover_grep_agent_edit_and_web() {
         let matchers: Vec<&str> = GUARD_HOOKS.iter().map(|g| g.matcher).collect();
-        assert!(matchers.contains(&"Grep"));
+        assert!(
+            matchers.contains(&"Grep|Bash"),
+            "grep-guard must fire on the Grep tool AND the Bash escape hatch"
+        );
         assert!(matchers.contains(&"Agent"));
         assert!(matchers.contains(&"WebSearch|WebFetch"));
         assert!(matchers.contains(&"Edit|Write|MultiEdit"));
