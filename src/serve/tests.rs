@@ -6768,3 +6768,77 @@ async fn finish_force_reindex_starts_fsw_and_keeps_guard_contract() {
     );
     state.end_indexing("repo", IndexingOwner::Reindex);
 }
+
+#[tokio::test]
+#[serial]
+async fn backfill_group_identities_fills_missing_and_persists() {
+    // The git-serialization lock must be dropped before the first .await
+    // (clippy await_holding_lock): scope it around the synchronous git setup.
+    // `tmp` lives for the whole test — the backfill's git spawns need the
+    // repo paths to still exist.
+    let tmp = tempfile::tempdir().unwrap();
+    let (main_alias, wt_alias, config, config_file) = {
+        let _serial = crate::db_discovery::repos::test_support::git_serial_lock();
+        // Main tree + linked worktree: two registered repos sharing one
+        // identity, so the backfill has something real to compute via git.
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
+        let wt = tmp.path().join("wt");
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+
+        let mut config = ReposConfig::default();
+        let main_alias = config.register(main.clone());
+        let wt_alias = config.register(wt.clone());
+        config
+            .add_group(
+                "fam".to_string(),
+                vec![main_alias.clone(), wt_alias.clone()],
+            )
+            .unwrap();
+        // Simulate pre-existing entries registered before the field existed.
+        config
+            .repos_meta
+            .get_mut(&main_alias)
+            .unwrap()
+            .git_common_dir = None;
+        config.repos_meta.get_mut(&wt_alias).unwrap().git_common_dir = None;
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+        (main_alias, wt_alias, config, config_file)
+    };
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    state.backfill_group_identities("fam").await;
+
+    let snap = state.config_snapshot();
+    let main_identity = snap.meta(&main_alias).git_common_dir.clone();
+    assert!(
+        main_identity.is_some(),
+        "backfill must fill the missing identity"
+    );
+    assert_eq!(
+        main_identity,
+        snap.meta(&wt_alias).git_common_dir.clone(),
+        "backfilled identities must agree across the family"
+    );
+    // Persisted: a fresh load from disk sees the identity, so a later
+    // deletion of the main tree cannot lose it.
+    let reloaded = ReposConfig::load_from(&config_file).unwrap();
+    assert_eq!(
+        reloaded.meta(&main_alias).git_common_dir,
+        main_identity,
+        "backfilled identity must be persisted to repos.json"
+    );
+}

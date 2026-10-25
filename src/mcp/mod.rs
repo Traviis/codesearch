@@ -1276,6 +1276,9 @@ impl CodesearchService {
         }
 
         if let Some(ref group_name) = group {
+            // Backfill missing git identities before expansion reads them, so
+            // repos registered before the field existed still expand once.
+            serve_state.backfill_group_identities(group_name).await;
             let aliases = serve_state.resolve_group_aliases(group_name)?;
             if aliases.is_empty() {
                 return Err(format!("Group '{}' has no members.", group_name));

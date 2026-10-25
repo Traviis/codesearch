@@ -45,7 +45,7 @@ use crate::constants::{
     REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
     STATUS_PATH,
 };
-use crate::db_discovery::repos::{config_dir, ReposConfig};
+use crate::db_discovery::repos::{config_dir, git_common_dir_for, ReposConfig};
 use crate::index::{
     CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback, SharedStores,
     SymbolRebuildSignal,
@@ -3791,6 +3791,80 @@ impl ServeState {
             .get(group)
             .cloned()
             .ok_or_else(|| format!("Unknown group '{}'", group))
+    }
+
+    /// Lazily backfill `repos_meta[].git_common_dir` for a group's local
+    /// members.
+    ///
+    /// Repos registered before the identity field existed have no recorded
+    /// common dir; group expansion needs it. Computed off-thread (one git
+    /// spawn per member), written back under the config write lock and
+    /// persisted once, so a later deletion of the main tree cannot lose the
+    /// identity again. Best-effort: a member whose identity cannot be
+    /// resolved simply stays unexpanded. The virtual "all" group never
+    /// expands, so it never backfills either.
+    pub(crate) async fn backfill_group_identities(&self, group: &str) {
+        if group == crate::constants::ALL_GROUP_NAME {
+            return;
+        }
+        let missing: Vec<(String, std::path::PathBuf)> = {
+            let config = self.config_snapshot();
+            let Some(members) = config.groups.get(group) else {
+                return;
+            };
+            members
+                .iter()
+                .filter(|m| !m.starts_with(crate::db_discovery::repos::REMOTE_REF_PREFIX))
+                .filter_map(|alias| {
+                    let path = config.repos.get(alias)?;
+                    let known = config
+                        .repos_meta
+                        .get(alias)
+                        .and_then(|m| m.git_common_dir.as_ref())
+                        .is_some();
+                    (!known).then(|| (alias.clone(), path.clone()))
+                })
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+        let computed = tokio::task::spawn_blocking(move || {
+            missing
+                .into_iter()
+                .map(|(alias, path)| (alias, git_common_dir_for(&path)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .ok();
+        let Some(computed) = computed else {
+            return;
+        };
+        let mut config = match self.config.write() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut changed = false;
+        for (alias, identity) in computed {
+            let Some(identity) = identity else {
+                continue;
+            };
+            // Only fill when still absent: a concurrent registration may have
+            // captured a fresher identity meanwhile.
+            let entry = config.repos_meta.entry(alias).or_default();
+            if entry.git_common_dir.is_none() {
+                entry.git_common_dir = Some(identity);
+                changed = true;
+            }
+        }
+        // Persist while still holding the write guard, exactly like every
+        // sibling persist site: persisting a clone after dropping the lock
+        // could revert a concurrent writer's change back onto disk (the
+        // "ghost loss" class persist_config's mtime adoption exists for).
+        if changed {
+            let _ = self.persist_config(&config);
+        }
+        drop(config);
     }
 
     /// Record that a repo was just accessed (query or reindex).

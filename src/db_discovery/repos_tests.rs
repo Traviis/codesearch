@@ -1,3 +1,4 @@
+use super::test_support::{git_serial_lock, init_git_repo_with_commit};
 use super::*;
 use std::io::Write;
 
@@ -15,21 +16,6 @@ fn canon_norm(p: &Path) -> String {
 /// Process-wide lock serializing the git-spawning / directory-renaming
 /// relocation tests.
 ///
-/// These tests `git init` a directory and then rename it. On Windows the OS
-/// indexer / antivirus scans each freshly-created `.git` tree and holds
-/// handles on it, which blocks the rename ("Access is denied"). When many
-/// such tests run concurrently the scanner is overwhelmed and the handles
-/// linger for many seconds — long enough to exhaust even a generous
-/// `rename_retry`. Serializing them so only one `.git` tree is created/
-/// renamed at a time keeps each scan window short and the rename reliable.
-static GIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Acquire the relocation-test serialization lock, recovering from a
-/// poisoned mutex (a panic in one test must not cascade-fail the rest).
-fn git_serial_lock() -> std::sync::MutexGuard<'static, ()> {
-    GIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Initialise a git repo at `dir` with an `origin` remote pointing at `url`.
 fn init_git_remote(dir: &Path, url: &str) {
     // Retry on transient spawn failure (fork exhaustion under parallel test
@@ -1335,4 +1321,73 @@ fn remotes_alias_base_url_field() {
     std::fs::write(&path, json).unwrap();
     let cfg = ReposConfig::load_from(&path).unwrap();
     assert_eq!(cfg.remotes.get("cloud").unwrap().url, "https://cloud");
+}
+
+#[test]
+fn captures_git_common_dir_on_register_and_links_worktrees() {
+    let _serial = git_serial_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    init_git_repo_with_commit(&main);
+
+    let wt = tmp.path().join("wt");
+    let run = |args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    run(&["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"]);
+
+    let mut cfg = ReposConfig::default();
+    let main_alias = cfg.register(main.clone());
+    let wt_alias = cfg.register(wt.clone());
+
+    let main_identity = cfg.meta(&main_alias).git_common_dir.clone();
+    let wt_identity = cfg.meta(&wt_alias).git_common_dir.clone();
+    assert!(
+        main_identity.is_some(),
+        "main tree must capture a git identity"
+    );
+    assert_eq!(
+        main_identity, wt_identity,
+        "main tree and its worktree must share one identity"
+    );
+    // The identity is the canonical common dir, not the worktree gitdir.
+    let expected = identity_string(&main.join(".git"));
+    assert_eq!(main_identity, Some(expected));
+}
+
+#[test]
+fn git_common_dir_fs_fallback_resolves_worktree_and_main_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Main tree: `.git` is a directory — the common dir is that dir itself.
+    let main = tmp.path().join("main");
+    let main_git = main.join(".git");
+    std::fs::create_dir_all(&main_git).unwrap();
+    // Worktree: `.git` is a FILE ("gitdir: ...") whose gitdir holds a
+    // `commondir` file pointing back at the shared dir (relative form).
+    let wt = tmp.path().join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    let wt_gitdir = tmp.path().join(".git-worktrees-wt");
+    std::fs::create_dir_all(&wt_gitdir).unwrap();
+    std::fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", wt_gitdir.display()),
+    )
+    .unwrap();
+    std::fs::write(wt_gitdir.join("commondir"), "../main/.git\n").unwrap();
+
+    let main_identity = git_common_dir_fs_fallback(&main).unwrap();
+    let wt_identity = git_common_dir_fs_fallback(&wt).unwrap();
+    assert_eq!(main_identity, wt_identity);
+    assert_eq!(main_identity, identity_string(&main_git));
 }

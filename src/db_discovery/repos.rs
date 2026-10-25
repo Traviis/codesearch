@@ -125,6 +125,13 @@ pub struct RepoMeta {
     /// Used to re-locate a repo whose folder was renamed/moved (best-effort).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_remote: Option<String>,
+    /// Git identity: canonical path of the repo's shared common dir
+    /// (`git rev-parse --git-common-dir`), captured at registration time.
+    /// Worktrees of one clone share this dir, so two registered repos with
+    /// the same value are family members (main tree + linked worktrees).
+    /// Persisted so a later deletion of the main tree keeps the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,6 +436,12 @@ impl ReposConfig {
         if let Some(remote) = git_remote_url(&canonical) {
             self.repos_meta.entry(alias.clone()).or_default().git_remote = Some(remote);
         }
+        if let Some(common) = git_common_dir_for(&canonical) {
+            self.repos_meta
+                .entry(alias.clone())
+                .or_default()
+                .git_common_dir = Some(common);
+        }
         self.repos.insert(alias.clone(), canonical);
         alias
     }
@@ -463,6 +476,12 @@ impl ReposConfig {
                 .entry(final_alias.clone())
                 .or_default()
                 .git_remote = Some(remote);
+        }
+        if let Some(common) = git_common_dir_for(&canonical) {
+            self.repos_meta
+                .entry(final_alias.clone())
+                .or_default()
+                .git_common_dir = Some(common);
         }
         self.repos.insert(final_alias.clone(), canonical);
         Ok(final_alias)
@@ -1270,6 +1289,104 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     }
 }
 
+/// Best-effort lookup of a directory's git identity: the canonical path of the
+/// repository's shared common dir (`git rev-parse --git-common-dir`).
+///
+/// Worktrees of one clone share this dir, so two registered repos with the
+/// same value are family members (main tree + linked worktrees). Returns
+/// `None` when the path is not a git repo. The spawn retry pattern mirrors
+/// `git_remote_url`; when the git binary cannot be spawned at all, a
+/// filesystem-only fallback resolves the common dir from the `.git` entry
+/// (file → `gitdir:` → `commondir` climb), so a worktree registered on a
+/// machine without git still records its identity.
+pub(crate) fn git_common_dir_for(path: &Path) -> Option<String> {
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut output = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--git-common-dir"])
+            .output()
+        {
+            Ok(o) => {
+                output = Some(o);
+                break;
+            }
+            // git binary genuinely absent — the fs fallback is all we have.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return git_common_dir_fs_fallback(path)
+            }
+            // Transient spawn failure (fork exhaustion). Back off and retry.
+            Err(_) => {
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+
+    let output = output?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if dir.is_empty() {
+        return None;
+    }
+    // git may print the common dir relative to the `-C` directory (".git",
+    // "../.git"); join before canonicalizing so both forms land on the same
+    // absolute identity string.
+    let joined = PathBuf::from(&dir);
+    let resolved = if joined.is_absolute() {
+        joined
+    } else {
+        path.join(joined)
+    };
+    Some(identity_string(&resolved))
+}
+
+/// Filesystem-only resolution of the git common dir, used when `git` cannot
+/// be spawned (binary absent). Mirrors `resolve_hooks_dir_manual` in
+/// src/cli/mod.rs: a worktree's `.git` is a FILE pointing at its per-worktree
+/// gitdir, which holds a `commondir` file pointing at the shared dir; a main
+/// tree's `.git` is the shared dir itself.
+fn git_common_dir_fs_fallback(path: &Path) -> Option<String> {
+    let dot_git = path.join(".git");
+    let git_dir = if dot_git.is_file() {
+        let content = std::fs::read_to_string(&dot_git).ok()?;
+        let first_line = content.lines().next()?.trim();
+        let rel = first_line.strip_prefix("gitdir: ")?.trim();
+        let resolved = path.join(rel);
+        match std::fs::read_to_string(resolved.join("commondir")) {
+            Ok(cd) => {
+                let common = resolved.join(cd.trim());
+                if common.exists() {
+                    common
+                } else {
+                    resolved
+                }
+            }
+            Err(_) => resolved,
+        }
+    } else if dot_git.is_dir() {
+        dot_git
+    } else {
+        return None;
+    };
+    Some(identity_string(&git_dir))
+}
+
+/// Canonical identity string for a path: `safe_canonicalize` (strips `\\?\`,
+/// translates MSYS forms) with the `normalize_user_path` fallback for paths
+/// that do not exist yet — the same convention `register()` uses for repo
+/// paths, so identity strings and repo paths compare equal byte-for-byte.
+fn identity_string(path: &Path) -> String {
+    let canonical = safe_canonicalize(path).unwrap_or_else(|_| normalize_user_path(path));
+    canonical.to_string_lossy().to_string()
+}
+
 /// Configured relocation scan depth (`CODESEARCH_RELOCATE_MAX_DEPTH`, default 3).
 fn relocate_max_depth() -> usize {
     std::env::var(crate::constants::RELOCATE_MAX_DEPTH_ENV)
@@ -1317,6 +1434,65 @@ fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<
                 scan_for_remote(&child, target_remote, depth - 1, out);
             }
         }
+    }
+}
+
+/// Shared git-spawning test helpers, used by this module's tests and by
+/// serve/tests.rs (backfill needs real repos with a shared worktree identity).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    /// Process-wide lock serializing the git-spawning / directory-renaming
+    /// tests: on Windows the OS indexer / antivirus holds `.git` handles
+    /// while scanning freshly-created trees, and concurrent git subprocesses
+    /// transiently fail under that load.
+    static GIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the serialization lock, recovering from a poisoned mutex (a
+    /// panic in one test must not cascade-fail the rest).
+    pub(crate) fn git_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+        GIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Initialise a git repo at `dir` with one commit, so `git worktree add`
+    /// has a HEAD to branch from. Same transient-spawn retry posture as the
+    /// relocation tests' `init_git_remote`.
+    pub(crate) fn init_git_repo_with_commit(dir: &Path) {
+        let run = |args: &[&str]| {
+            const MAX_ATTEMPTS: u64 = 8;
+            for attempt in 0..MAX_ATTEMPTS {
+                match std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                {
+                    Ok(o) => {
+                        assert!(
+                            o.status.success(),
+                            "git {args:?} failed: {}",
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                        return o;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        panic!("git not available in test env: {e}");
+                    }
+                    Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                        std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                    }
+                    Err(e) => panic!("git spawn failed after retries: {e}"),
+                }
+            }
+            unreachable!("loop returns or panics")
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "test\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
     }
 }
 
