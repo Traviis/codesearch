@@ -1391,3 +1391,130 @@ fn git_common_dir_fs_fallback_resolves_worktree_and_main_tree() {
     assert_eq!(main_identity, wt_identity);
     assert_eq!(main_identity, identity_string(&main_git));
 }
+
+/// Hand-set identity helper: registers two paths as repos and stamps both
+/// with one shared git identity, without spawning git (the expansion logic
+/// reads only the recorded identity, so the unit tests exercise exactly that).
+fn register_family(cfg: &mut ReposConfig, a: &Path, b: &Path) -> (String, String) {
+    let alias_a = cfg.register(a.to_path_buf());
+    let alias_b = cfg.register(b.to_path_buf());
+    let identity = format!("{}/.git", a.display());
+    cfg.repos_meta
+        .entry(alias_a.clone())
+        .or_default()
+        .git_common_dir = Some(identity.clone());
+    cfg.repos_meta
+        .entry(alias_b.clone())
+        .or_default()
+        .git_common_dir = Some(identity);
+    (alias_a, alias_b)
+}
+
+#[test]
+fn expand_group_members_appends_same_identity_repos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(&mut cfg, &tmp.path().join("main"), &tmp.path().join("wt"));
+    // An unrelated repo must not be pulled in.
+    let other = cfg.register(tmp.path().join("other"));
+    cfg.add_group("g".to_string(), vec![main.clone()]).unwrap();
+
+    let expanded = cfg.expand_group_members("g", cfg.groups.get("g").unwrap());
+    assert_eq!(expanded, vec![main.clone(), wt.clone()]);
+    // The unrelated repo is absent.
+    assert!(!expanded.contains(&other));
+
+    // resolve_group_targets fans out to both family members.
+    let targets = cfg.resolve_group_targets("g");
+    let mut aliases: Vec<String> = targets
+        .into_iter()
+        .filter_map(|t| match t {
+            Target::Local { alias, .. } => Some(alias),
+            _ => None,
+        })
+        .collect();
+    aliases.sort();
+    assert_eq!(aliases, vec![main, wt]);
+}
+
+#[test]
+fn expand_group_members_respects_per_group_opt_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, _wt) = register_family(&mut cfg, &tmp.path().join("main"), &tmp.path().join("wt"));
+    cfg.add_group("g".to_string(), vec![main.clone()]).unwrap();
+    cfg.groups_meta.insert(
+        "g".to_string(),
+        GroupMeta {
+            expand_worktrees: false,
+        },
+    );
+
+    let expanded = cfg.expand_group_members("g", cfg.groups.get("g").unwrap());
+    assert_eq!(expanded, vec![main], "opt-out must keep the group exact");
+    // The opt-out is recorded; an absent entry (unknown group) stays default-on.
+    assert!(!cfg.group_expands_worktrees("g"));
+    assert!(cfg.group_expands_worktrees("unknown-group"));
+}
+
+#[test]
+fn expand_group_members_works_from_persisted_identity_after_main_tree_deletion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(&mut cfg, &tmp.path().join("main"), &tmp.path().join("wt"));
+    cfg.add_group("g".to_string(), vec![main.clone()]).unwrap();
+    // Round-trip through repos.json: the identity must survive as a plain
+    // string, independent of the main tree's directory.
+    let file = tmp.path().join("repos.json");
+    cfg.save_to(&file).unwrap();
+    let mut reloaded = ReposConfig::load_from(&file).unwrap();
+    assert!(
+        reloaded.repos_meta[&main].git_common_dir.is_some(),
+        "identity must survive the repos.json round-trip"
+    );
+    // Expansion works purely from recorded identities; @peer refs pass
+    // through untouched.
+    reloaded
+        .groups
+        .insert("fed".to_string(), vec!["@cloud".to_string(), wt.clone()]);
+    reloaded.remotes.insert(
+        "cloud".to_string(),
+        RemotePeer {
+            url: "http://127.0.0.1:1".to_string(),
+            api_key: "k".to_string(),
+            group: None,
+            timeout_secs: None,
+        },
+    );
+    let expanded = reloaded.expand_group_members("fed", reloaded.groups.get("fed").unwrap());
+    // Members keep their order; `wt`'s family identity pulls in `main`
+    // (persisted, directory-independent) as a sorted extra; `@cloud` passes
+    // through untouched.
+    assert_eq!(expanded, vec!["@cloud".to_string(), wt, main]);
+}
+
+#[test]
+fn reconcile_prunes_orphan_groups_meta() {
+    let mut cfg = ReposConfig::default();
+    let tmp = tempfile::tempdir().unwrap();
+    let alias = cfg.register(tmp.path().join("r"));
+    cfg.add_group("g".to_string(), vec![alias]).unwrap();
+    cfg.groups_meta.insert(
+        "g".to_string(),
+        GroupMeta {
+            expand_worktrees: false,
+        },
+    );
+    cfg.groups_meta.insert(
+        "ghost".to_string(),
+        GroupMeta {
+            expand_worktrees: false,
+        },
+    );
+    cfg.reconcile();
+    assert!(cfg.groups_meta.contains_key("g"));
+    assert!(
+        !cfg.groups_meta.contains_key("ghost"),
+        "orphan override must be pruned"
+    );
+}

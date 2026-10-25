@@ -135,6 +135,12 @@ pub enum GroupsCommands {
         /// Aliases to include in the group (space-separated)
         #[arg(short, long, num_args = 1..)]
         aliases: Vec<String>,
+
+        /// Do NOT expand this group with linked worktrees of its members
+        /// (default: expansion is on — every registered repo sharing a
+        /// member's git identity joins the group's queries).
+        #[arg(long, default_value_t = false)]
+        no_worktrees: bool,
     },
 
     /// Remove a group
@@ -1549,7 +1555,11 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
                 println!("  {}: {}", name, aliases.join(", "));
             }
         }
-        GroupsCommands::Add { name, aliases } => {
+        GroupsCommands::Add {
+            name,
+            aliases,
+            no_worktrees,
+        } => {
             if name == ALL_GROUP_NAME {
                 return Err(anyhow::anyhow!(
                     "Group name '{}' is reserved — it always resolves to all registered repos automatically.",
@@ -1572,6 +1582,17 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
                 }
             }
             config.add_group(name.clone(), aliases)?;
+            if no_worktrees {
+                config.groups_meta.insert(
+                    name.clone(),
+                    crate::db_discovery::repos::GroupMeta {
+                        expand_worktrees: false,
+                    },
+                );
+            } else {
+                // Re-adding without the flag clears a previous opt-out.
+                config.groups_meta.remove(name.as_str());
+            }
             config.save()?;
             println!("Group '{}' created/updated.", name);
         }
@@ -2592,5 +2613,54 @@ mod tests {
             }
             _ => panic!("expected Index::Reindex with --remote and --force"),
         }
+    }
+
+    /// `groups add --no-worktrees` records the expansion opt-out in
+    /// groups_meta; re-adding the group without the flag clears it
+    /// (card #261 TODO 2). Drives run_groups_command against a hermetic
+    /// config via CODESEARCH_REPOS_CONFIG.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn groups_add_no_worktrees_records_and_clears_opt_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("repos.json");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut seed = crate::db_discovery::repos::ReposConfig::default();
+        seed.register_with_alias(repo, Some("alpha".to_string()))
+            .unwrap();
+        seed.save_to(&config_file).unwrap();
+
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::REPOS_CONFIG_ENV,
+            config_file.to_str().unwrap(),
+        )]);
+
+        run_groups_command(GroupsCommands::Add {
+            name: "g".to_string(),
+            aliases: vec!["alpha".to_string()],
+            no_worktrees: true,
+        })
+        .await
+        .unwrap();
+        let cfg = crate::db_discovery::load_repos_config().unwrap();
+        assert!(
+            !cfg.group_expands_worktrees("g"),
+            "--no-worktrees must record the opt-out"
+        );
+
+        // Re-adding without the flag clears a previous opt-out.
+        run_groups_command(GroupsCommands::Add {
+            name: "g".to_string(),
+            aliases: vec!["alpha".to_string()],
+            no_worktrees: false,
+        })
+        .await
+        .unwrap();
+        let cfg = crate::db_discovery::load_repos_config().unwrap();
+        assert!(
+            cfg.group_expands_worktrees("g"),
+            "re-add without the flag must clear the opt-out"
+        );
     }
 }

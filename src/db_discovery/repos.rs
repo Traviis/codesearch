@@ -79,6 +79,9 @@ pub struct ReposConfig {
     pub repos: HashMap<String, PathBuf>,
     #[serde(default)]
     pub groups: HashMap<String, Vec<String>>,
+    /// Per-group behavior overrides. Absent entry = all defaults.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub groups_meta: HashMap<String, GroupMeta>,
     #[serde(default)]
     pub repos_meta: HashMap<String, RepoMeta>,
     /// Per-repo read-only flag. Aliases mapped to `true` are opened **read-only**
@@ -132,6 +135,30 @@ pub struct RepoMeta {
     /// Persisted so a later deletion of the main tree keeps the identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_common_dir: Option<String>,
+}
+
+/// Per-group behavior overrides (`groups_meta` in repos.json). An absent
+/// entry means every field takes its default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupMeta {
+    /// Expand group resolution with every registered repo sharing a member's
+    /// git identity (linked worktrees of the same clone). Default: true —
+    /// set `false` (`codesearch groups add --no-worktrees`) to keep a group
+    /// pointing at exactly the aliases it was created with.
+    #[serde(default = "default_true")]
+    pub expand_worktrees: bool,
+}
+
+impl Default for GroupMeta {
+    fn default() -> Self {
+        Self {
+            expand_worktrees: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +308,20 @@ impl ReposConfig {
         for group in empty_groups {
             tracing::warn!("repos.json: dropping now-empty group '{}'", group);
             self.groups.remove(&group);
+        }
+
+        // 3b. Same for orphan group overrides: a `groups_meta` entry whose
+        //     group no longer exists would survive every round-trip and
+        //     silently re-apply its opt-outs if the group name is reused.
+        let orphan_groups_meta: Vec<String> = self
+            .groups_meta
+            .keys()
+            .filter(|group| !self.groups.contains_key(*group))
+            .cloned()
+            .collect();
+        for group in orphan_groups_meta {
+            tracing::warn!("repos.json: dropping orphan group override for '{}'", group);
+            self.groups_meta.remove(&group);
         }
 
         // 4. Prune mounted remote projects whose peer is unknown or whose name
@@ -596,6 +637,62 @@ impl ReposConfig {
             .collect()
     }
 
+    /// Per-group opt-out switch for worktree expansion. Absent
+    /// `groups_meta` entry = expansion on (the default).
+    pub fn group_expands_worktrees(&self, group: &str) -> bool {
+        self.groups_meta
+            .get(group)
+            .map(|g| g.expand_worktrees)
+            .unwrap_or(true)
+    }
+
+    /// Expand a group's member list with every registered repo sharing a
+    /// member's git identity (linked worktrees of the same clone).
+    ///
+    /// The original members keep their order (de-duplicated); discovered
+    /// extras are appended sorted, so fan-out order stays deterministic.
+    /// `@peer` refs and unknown aliases pass through untouched — identity is
+    /// a local-repo concept. Uses only the recorded `repos_meta` identities:
+    /// no git spawn, so a deleted main tree still expands from its persisted
+    /// identity. Opt out per group via `groups_meta[group].expand_worktrees`.
+    pub fn expand_group_members(&self, group: &str, members: &[String]) -> Vec<String> {
+        if !self.group_expands_worktrees(group) {
+            return members.to_vec();
+        }
+        let mut out: Vec<String> = Vec::with_capacity(members.len());
+        for m in members {
+            if !out.contains(m) {
+                out.push(m.clone());
+            }
+        }
+        // Identity index for registered locals.
+        let identity_of: std::collections::HashMap<&str, &str> = self
+            .repos_meta
+            .iter()
+            .filter_map(|(alias, meta)| {
+                meta.git_common_dir
+                    .as_deref()
+                    .map(|id| (alias.as_str(), id))
+            })
+            .collect();
+        let member_identities: std::collections::HashSet<&str> = out
+            .iter()
+            .filter_map(|m| identity_of.get(m.as_str()).copied())
+            .collect();
+        let mut extras: Vec<&str> = identity_of
+            .iter()
+            .filter(|(alias, id)| {
+                member_identities.contains(**id) && !out.iter().any(|m| m.as_str() == **alias)
+            })
+            .map(|(alias, _)| *alias)
+            .collect();
+        extras.sort_unstable();
+        for extra in extras {
+            out.push(extra.to_string());
+        }
+        out
+    }
+
     /// Federation-aware group resolution.
     ///
     /// Like [`resolve_group`](Self::resolve_group) but also expands `"@<peer>"`
@@ -624,9 +721,13 @@ impl ReposConfig {
         let Some(members) = self.groups.get(group) else {
             return Vec::new();
         };
+        // Worktree expansion: every registered repo sharing a member's git
+        // identity joins the fan-out (default on, per-group opt-out). The
+        // virtual "all" group early-returned above and never expands.
+        let members = self.expand_group_members(group, members);
 
         let mut out = Vec::new();
-        for member in members {
+        for member in &members {
             if let Some(peer_name) = member.strip_prefix(REMOTE_REF_PREFIX) {
                 match self.remotes.get(peer_name) {
                     Some(peer) => out.push(Target::Remote {

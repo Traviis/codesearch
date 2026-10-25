@@ -2423,6 +2423,64 @@ fn resolve_group_aliases_all_returns_every_repo() {
     assert!(state.resolve_group_aliases("does-not-exist").is_err());
 }
 
+/// Group resolution through the serve layer must expand to every registered
+/// repo sharing a member's git identity, and a `groups_meta` opt-out must
+/// keep the group exact (card #261 TODO 2).
+#[test]
+fn resolve_group_aliases_expands_worktrees_and_honors_opt_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    let wt = tmp.path().join("wt");
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&main).unwrap();
+    std::fs::create_dir(&wt).unwrap();
+    std::fs::create_dir(&other).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(main, Some("main".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(wt, Some("wt".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(other, Some("other".to_string()))
+        .unwrap();
+    let identity = format!("{}/.git", tmp.path().join("main").display());
+    config
+        .repos_meta
+        .entry("main".to_string())
+        .or_default()
+        .git_common_dir = Some(identity.clone());
+    config
+        .repos_meta
+        .entry("wt".to_string())
+        .or_default()
+        .git_common_dir = Some(identity);
+    config
+        .add_group("g".to_string(), vec!["main".to_string()])
+        .unwrap();
+
+    let state = state_with_config(config.clone());
+    let aliases = state.resolve_group_aliases("g").expect("group resolves");
+    assert_eq!(
+        aliases,
+        vec!["main".to_string(), "wt".to_string()],
+        "serve-side resolution must expand to the family, sorted extras last"
+    );
+
+    // Opt-out: the group resolves to exactly its member again.
+    config.groups_meta.insert(
+        "g".to_string(),
+        crate::db_discovery::repos::GroupMeta {
+            expand_worktrees: false,
+        },
+    );
+    let state = state_with_config(config);
+    let aliases = state.resolve_group_aliases("g").expect("group resolves");
+    assert_eq!(aliases, vec!["main".to_string()]);
+}
+
 /// Tests for `build_streamable_http_config` — DNS rebinding defence env vars
 /// (`CODESEARCH_ALLOWED_HOSTS`, `CODESEARCH_DISABLE_HOST_VALIDATION`) added
 /// for issue #149 / GHSA-89vp-x53w-74fx.

@@ -3789,7 +3789,12 @@ impl ServeState {
         config
             .groups
             .get(group)
-            .cloned()
+            .map(|members| {
+                // Worktree expansion: every registered repo sharing a member's
+                // git identity joins the alias list (default on, per-group
+                // opt-out). The virtual "all" branch above never expands.
+                config.expand_group_members(group, members)
+            })
             .ok_or_else(|| format!("Unknown group '{}'", group))
     }
 
