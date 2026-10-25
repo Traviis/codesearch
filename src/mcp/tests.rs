@@ -248,6 +248,7 @@ fn ns_item(path: &str) -> super::SearchResultItem {
         context_prev: None,
         context_next: None,
         source: None,
+        also_in: Vec::new(),
         chunk_ref: None,
     }
 }
@@ -415,6 +416,7 @@ fn test_normal_response_omits_confidence_fields() {
             kind: "Function".to_string(),
             score: 0.5,
             signature: Some("fn test()".to_string()),
+            also_in: Vec::new(),
             content: None,
             context_prev: None,
             context_next: None,
@@ -715,6 +717,7 @@ async fn group_lexical_search_attributes_each_hit_to_its_repo() {
             vec![stores_a.clone(), stores_b.clone()],
             &["alpha".to_string(), "beta".to_string()],
             &alias_roots,
+            &std::collections::HashMap::new(),
         )
         .await
         .expect("group search must succeed");
@@ -733,6 +736,236 @@ async fn group_lexical_search_attributes_each_hit_to_its_repo() {
     assert_eq!(paths.len(), 2, "both repos must answer, paths: {paths:?}");
     assert!(paths.contains(&"alpha/src/lib.rs"), "paths: {paths:?}");
     assert!(paths.contains(&"beta/src/util.rs"), "paths: {paths:?}");
+}
+
+/// One store seeded with a single lexical+vector chunk — the minimal group
+/// member for the family-collapse tests below.
+async fn seed_group_store(
+    root: &tempfile::TempDir,
+    content: &str,
+    rel_path: &str,
+    embedding: [f32; 2],
+) -> std::sync::Arc<crate::index::SharedStores> {
+    let stores = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root.path().join(".codesearch.db"), 2).expect("stores"),
+    );
+    {
+        let mut vs = stores.vector_store.write().await;
+        let chunk = crate::chunker::Chunk::new(
+            content.to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            rel_path.to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            embedding.to_vec(),
+        )])
+        .expect("insert chunk");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(0, content, rel_path, None, "Function")
+            .expect("fts doc");
+        fts.commit().expect("commit");
+    }
+    stores
+}
+
+// === worktree-family collapse (card #261 TODO 3) ===
+
+#[tokio::test]
+async fn group_search_collapses_family_duplicates_and_backfills() {
+    use rmcp::model::ContentBlock;
+
+    // alpha and alpha-wt are worktrees of one clone (same family identity):
+    // their identical copy of the chunk (same relative path + content hash)
+    // must collapse to the best-scoring origin with the alternates recorded
+    // in also_in — and the vacated slot must backfill from beta, which the
+    // old take(limit) would have crowded out with the duplicate.
+    let root_a = tempfile::tempdir().expect("tempdir a");
+    let stores_a = seed_group_store(&root_a, "fn gadget() {}", "src/lib.rs", [0.0, 1.0]).await;
+    let root_wt = tempfile::tempdir().expect("tempdir wt");
+    let stores_wt = seed_group_store(&root_wt, "fn gadget() {}", "src/lib.rs", [0.0, 1.0]).await;
+    let root_b = tempfile::tempdir().expect("tempdir b");
+    let stores_b = seed_group_store(&root_b, "gadget helper", "src/util.rs", [1.0, 0.0]).await;
+
+    let service = super::CodesearchService::new_with_stores(
+        Some(root_a.path().to_path_buf()),
+        Some(stores_a.clone()),
+    )
+    .expect("service");
+
+    let request = super::SemanticSearchRequest {
+        query: "gadget".to_string(),
+        limit: Some(2),
+        compact: Some(false),
+        filter_path: None,
+        mode: Some("lexical".to_string()),
+        project: None,
+        group: Some("all".to_string()),
+        min_score: None,
+    };
+    let mut alias_roots = std::collections::HashMap::new();
+    alias_roots.insert(
+        "alpha".to_string(),
+        crate::cache::normalize_path_str(&root_a.path().to_string_lossy()),
+    );
+    alias_roots.insert(
+        "alpha-wt".to_string(),
+        crate::cache::normalize_path_str(&root_wt.path().to_string_lossy()),
+    );
+    alias_roots.insert(
+        "beta".to_string(),
+        crate::cache::normalize_path_str(&root_b.path().to_string_lossy()),
+    );
+    let mut families = std::collections::HashMap::new();
+    families.insert("alpha".to_string(), "fam".to_string());
+    families.insert("alpha-wt".to_string(), "fam".to_string());
+
+    let result = service
+        .semantic_search_multi(
+            &request,
+            &[],
+            2,
+            false,
+            vec![stores_a.clone(), stores_wt.clone(), stores_b.clone()],
+            &[
+                "alpha".to_string(),
+                "alpha-wt".to_string(),
+                "beta".to_string(),
+            ],
+            &alias_roots,
+            &families,
+        )
+        .await
+        .expect("group search must succeed");
+
+    let json = match &result.content[0] {
+        ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json response");
+    let results = parsed["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2, "results: {results:?}");
+
+    let first = &results[0];
+    assert_eq!(first["path"], "alpha/src/lib.rs", "results: {results:?}");
+    assert_eq!(first["source"], "alpha", "results: {results:?}");
+    assert_eq!(
+        first["also_in"],
+        serde_json::json!(["alpha-wt"]),
+        "results: {results:?}"
+    );
+
+    let second = &results[1];
+    assert_eq!(second["path"], "beta/src/util.rs", "results: {results:?}");
+    assert_eq!(second["source"], "beta", "results: {results:?}");
+    assert!(
+        second.get("also_in").is_none(),
+        "non-family hit must not carry also_in: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn group_search_family_collapse_keeps_ranking_balanced() {
+    use rmcp::model::ContentBlock;
+
+    // Three worktrees of one clone plus two unrelated repos at limit 5: the
+    // family must yield exactly ONE hit (alternates in also_in), and the
+    // unrelated repos must stay present — a duplicate must never consume a
+    // top-N slot another repo's hit earned (ranking-balance regression).
+    let root_a = tempfile::tempdir().expect("tempdir a");
+    let stores_a = seed_group_store(&root_a, "fn gadget() {}", "src/lib.rs", [0.0, 1.0]).await;
+    let root_w1 = tempfile::tempdir().expect("tempdir w1");
+    let stores_w1 = seed_group_store(&root_w1, "fn gadget() {}", "src/lib.rs", [0.0, 1.0]).await;
+    let root_w2 = tempfile::tempdir().expect("tempdir w2");
+    let stores_w2 = seed_group_store(&root_w2, "fn gadget() {}", "src/lib.rs", [0.0, 1.0]).await;
+    let root_b = tempfile::tempdir().expect("tempdir b");
+    let stores_b = seed_group_store(&root_b, "gadget helper", "src/util.rs", [1.0, 0.0]).await;
+    let root_g = tempfile::tempdir().expect("tempdir g");
+    let stores_g = seed_group_store(&root_g, "gadget widget", "src/other.rs", [1.0, 0.0]).await;
+
+    let service = super::CodesearchService::new_with_stores(
+        Some(root_a.path().to_path_buf()),
+        Some(stores_a.clone()),
+    )
+    .expect("service");
+
+    let request = super::SemanticSearchRequest {
+        query: "gadget".to_string(),
+        limit: Some(5),
+        compact: Some(false),
+        filter_path: None,
+        mode: Some("hybrid".to_string()),
+        project: None,
+        group: Some("all".to_string()),
+        min_score: None,
+    };
+    let aliases = ["alpha", "alpha-wt1", "alpha-wt2", "beta", "gamma"];
+    let roots = [&root_a, &root_w1, &root_w2, &root_b, &root_g];
+    let stores = [&stores_a, &stores_w1, &stores_w2, &stores_b, &stores_g];
+    let mut alias_roots = std::collections::HashMap::new();
+    for (alias, root) in aliases.iter().zip(roots.iter()) {
+        alias_roots.insert(
+            alias.to_string(),
+            crate::cache::normalize_path_str(&root.path().to_string_lossy()),
+        );
+    }
+    let mut families = std::collections::HashMap::new();
+    for alias in ["alpha", "alpha-wt1", "alpha-wt2"] {
+        families.insert(alias.to_string(), "fam".to_string());
+    }
+
+    let result = service
+        .semantic_search_multi(
+            &request,
+            &[],
+            5,
+            false,
+            stores.iter().map(|s| (*s).clone()).collect(),
+            &aliases.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            &alias_roots,
+            &families,
+        )
+        .await
+        .expect("group search must succeed");
+
+    let json = match &result.content[0] {
+        ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json response");
+    let results = parsed["results"].as_array().expect("results array");
+    let paths: Vec<&str> = results
+        .iter()
+        .map(|r| r["path"].as_str().expect("path string"))
+        .collect();
+
+    let family_hits: Vec<&serde_json::Value> = results
+        .iter()
+        .filter(|r| r["path"].as_str().map(|p| p.ends_with("src/lib.rs")) == Some(true))
+        .collect();
+    assert_eq!(
+        family_hits.len(),
+        1,
+        "one hit per family key, paths: {paths:?}"
+    );
+    assert_eq!(
+        family_hits[0]["path"], "alpha/src/lib.rs",
+        "best-scoring origin wins, paths: {paths:?}"
+    );
+    assert_eq!(
+        family_hits[0]["also_in"],
+        serde_json::json!(["alpha-wt1", "alpha-wt2"]),
+        "alternates recorded, paths: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"beta/src/util.rs") && paths.contains(&"gamma/src/other.rs"),
+        "unrelated repos keep their slots, paths: {paths:?}"
+    );
 }
 
 #[test]
@@ -1161,6 +1394,7 @@ fn test_semantic_search_response_with_results() {
             kind: "Function".to_string(),
             score: 0.8,
             signature: Some("fn test()".to_string()),
+            also_in: Vec::new(),
             content: None,
             context_prev: None,
             context_next: None,
@@ -1266,6 +1500,8 @@ fn test_has_chunk_id_and_score_search_result() {
         score: 0.75,
         context_prev: None,
         context_next: None,
+        origin: None,
+        also_in: Vec::new(),
     };
     assert_eq!(super::HasChunkId::chunk_id(&result), 99);
     assert!((super::HasScore::score(&result) - 0.75).abs() < f32::EPSILON);
@@ -2377,6 +2613,8 @@ fn group_fusion_interning_gives_colliding_chunk_ids_distinct_synthetic_ids() {
             score,
             context_prev: None,
             context_next: None,
+            origin: None,
+            also_in: Vec::new(),
         }
     }
 
@@ -3515,6 +3753,7 @@ async fn lexical_group_search_degrades_per_repo_when_a_store_is_write_locked() {
             vec![stores_a.clone(), stores_b.clone()],
             &["alpha".to_string(), "beta".to_string()],
             &alias_roots,
+            &std::collections::HashMap::new(),
         )
         .await
         .expect("group search must succeed despite one busy store");
