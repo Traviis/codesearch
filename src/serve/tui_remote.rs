@@ -76,6 +76,9 @@ impl RepoInfo {
             // activity is always live; the stale-marker only applies to the
             // embedded TUI's federated mounts.
             activity_stale: false,
+            // The remote dashboard polls the peer's /status; it does not see the
+            // peer's config, so no family annotation here.
+            family_note: None,
         }
     }
 }

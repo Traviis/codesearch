@@ -1058,6 +1058,58 @@ impl ReposConfig {
         self.groups.remove(name).is_some()
     }
 
+    /// Map each worktree alias to its family's main-tree alias: among all
+    /// registered aliases sharing one git identity (common dir), the main
+    /// tree is the SHORTEST registered path (a worktree lives under the main
+    /// tree), ties broken by the lexicographically smallest alias. Only
+    /// worktree aliases appear as keys — main-tree aliases map to themselves
+    /// and are omitted. Annotation-only: consumers (status, the scope error,
+    /// dashboard/CLI rendering) use it to label provenance; resolution never
+    /// depends on it.
+    pub fn worktree_family_map(&self) -> std::collections::HashMap<String, String> {
+        use std::collections::HashMap;
+
+        // identity -> (shortest path seen so far, its alias)
+        let mut mains: HashMap<&str, (usize, &str)> = HashMap::new();
+        for (alias, path) in &self.repos {
+            let Some(meta) = self.repos_meta.get(alias) else {
+                continue;
+            };
+            let Some(identity) = meta.git_common_dir.as_deref() else {
+                continue;
+            };
+            let path_len = path.as_os_str().len();
+            match mains.get_mut(identity) {
+                Some((best_len, best_alias)) => {
+                    let shorter = path_len < *best_len
+                        || (path_len == *best_len && alias.as_str() < *best_alias);
+                    if shorter {
+                        *best_len = path_len;
+                        *best_alias = alias.as_str();
+                    }
+                }
+                None => {
+                    mains.insert(identity, (path_len, alias.as_str()));
+                }
+            }
+        }
+        let mut out: HashMap<String, String> = HashMap::new();
+        for alias in self.repos.keys() {
+            let Some(meta) = self.repos_meta.get(alias) else {
+                continue;
+            };
+            let Some(identity) = meta.git_common_dir.as_deref() else {
+                continue;
+            };
+            if let Some((_, main_alias)) = mains.get(identity) {
+                if *main_alias != alias.as_str() {
+                    out.insert(alias.clone(), (*main_alias).to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// Register (or overwrite) a remote federation peer under `name`.
     ///
     /// The peer becomes referenceable from a group as `"@<name>"`. Adding a
@@ -1263,6 +1315,26 @@ impl ReposConfig {
             }
         }
         (relocated, removed)
+    }
+}
+
+/// Display-only family-note vocabulary shared by the TUI repo table and the
+/// CLI `groups list`: a worktree alias annotates as `worktree of <main>`, a
+/// family's main alias as `+ N worktrees` (singular for one), anything else
+/// gets no note. The counting scope is the caller's choice — the CLI counts
+/// within a group, the TUI across the whole fleet — which is why `counts`
+/// is a parameter.
+pub fn family_note(
+    family_map: &std::collections::HashMap<String, String>,
+    counts: &std::collections::HashMap<String, usize>,
+    alias: &str,
+) -> Option<String> {
+    if let Some(main) = family_map.get(alias) {
+        return Some(format!("worktree of {main}"));
+    }
+    match counts.get(alias) {
+        Some(&n) if n > 0 => Some(format!("+ {n} worktree{}", if n == 1 { "" } else { "s" })),
+        _ => None,
     }
 }
 

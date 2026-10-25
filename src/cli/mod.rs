@@ -1534,6 +1534,32 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Human-facing grouped rendering for `groups list`: a member that is a
+/// worktree of another member is annotated `"(worktree of <main>)"`, and a
+/// family's main tree in the list gets `"+ N worktrees"` (counted within the
+/// group). The alias list itself stays flat — display only.
+fn render_group_members(
+    family_map: &std::collections::HashMap<String, String>,
+    aliases: &[String],
+) -> Vec<String> {
+    // Counting scope: within the group (display only).
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for alias in aliases {
+        if let Some(main) = family_map.get(alias.as_str()) {
+            *counts.entry(main.clone()).or_insert(0) += 1;
+        }
+    }
+    aliases
+        .iter()
+        .map(
+            |alias| match crate::db_discovery::repos::family_note(family_map, &counts, alias) {
+                Some(note) => format!("{alias} ({note})"),
+                None => alias.clone(),
+            },
+        )
+        .collect()
+}
+
 /// Handle groups subcommands
 async fn run_groups_command(command: GroupsCommands) -> Result<()> {
     use crate::constants::ALL_GROUP_NAME;
@@ -1551,8 +1577,12 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
                 let count = config.repos.len();
                 println!("  {} (virtual): {} repos", ALL_GROUP_NAME, count);
             }
+            // Human-facing grouped rendering (display only — the alias list
+            // itself stays flat).
+            let family_map = config.worktree_family_map();
             for (name, aliases) in &config.groups {
-                println!("  {}: {}", name, aliases.join(", "));
+                let rendered = render_group_members(&family_map, aliases);
+                println!("  {}: {}", name, rendered.join(", "));
             }
         }
         GroupsCommands::Add {
@@ -2661,6 +2691,30 @@ mod tests {
         assert!(
             cfg.group_expands_worktrees("g"),
             "re-add without the flag must clear the opt-out"
+        );
+    }
+
+    /// `groups list` grouped rendering is display-only: worktree members get
+    /// the "(worktree of <main>)" annotation, the family's main tree gets
+    /// "+ N worktrees" counted within the group, others stay bare.
+    #[test]
+    fn groups_list_renders_family_annotations() {
+        let mut family_map = std::collections::HashMap::new();
+        family_map.insert("wt1".to_string(), "main".to_string());
+        family_map.insert("wt2".to_string(), "main".to_string());
+        let aliases: Vec<String> = ["main", "wt1", "wt2", "solo"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let rendered = render_group_members(&family_map, &aliases);
+        assert_eq!(
+            rendered,
+            vec![
+                "main (+ 2 worktrees)".to_string(),
+                "wt1 (worktree of main)".to_string(),
+                "wt2 (worktree of main)".to_string(),
+                "solo".to_string(),
+            ]
         );
     }
 }

@@ -4673,6 +4673,15 @@ async fn status_handler(
         }));
     };
 
+    // Worktree-family provenance: flat `worktree_of` on the aliases that are
+    // worktrees of a shorter-path registered main tree (main-tree aliases get
+    // no key). Computed from the config snapshot, never from the live lock.
+    // A reload failure ( poisoned lock) just serves the previous file state.
+    let _ = state.reload_if_changed();
+    let worktree_of = match state.config.read() {
+        Ok(c) => c.worktree_family_map(),
+        Err(_) => std::collections::HashMap::new(),
+    };
     let repo_json: Vec<serde_json::Value> = snap
         .repos
         .iter()
@@ -4705,7 +4714,7 @@ async fn status_handler(
                 CSharpIndexStatus::Error => "error",
                 CSharpIndexStatus::Indexing => "indexing",
             };
-            json!({
+            let mut entry = json!({
                 "alias": alias,
                 "status": status_str,
                 "lock_mode": lock_mode,
@@ -4715,7 +4724,13 @@ async fn status_handler(
                 "csharp_index": csharp_str,
                 "csharp_error": info.csharp_error,
                 "typescript_index": ts_str,
-            })
+            });
+            // Flat annotation, inserted conditionally: `json!` would render a
+            // missing main as an explicit `null`.
+            if let Some(main) = worktree_of.get(alias.as_str()) {
+                entry["worktree_of"] = json!(main);
+            }
+            entry
         })
         .collect();
 

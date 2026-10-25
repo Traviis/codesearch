@@ -461,6 +461,15 @@ fn map_repo_rows(
     state: &Arc<ServeState>,
 ) -> Vec<RepoRow> {
     let config = state.config_snapshot();
+    // Grouped rendering (human-facing only): each family's main-tree row gets
+    // a "+ N worktrees" note, each worktree row a "worktree of <main>" note.
+    // Counting scope: the whole fleet (the TUI lists every registered repo).
+    let family_map = config.worktree_family_map();
+    let mut family_sizes: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for main in family_map.values() {
+        *family_sizes.entry(main.clone()).or_insert(0) += 1;
+    }
     repos
         .iter()
         .map(|(alias, info)| {
@@ -519,6 +528,11 @@ fn map_repo_rows(
                 is_remote: false,
                 // Local repos carry live serve state — never stale.
                 activity_stale: false,
+                family_note: crate::db_discovery::repos::family_note(
+                    &family_map,
+                    &family_sizes,
+                    alias,
+                ),
             }
         })
         .collect()
@@ -724,6 +738,8 @@ fn build_remote_rows(
                 // Computed per-tick by the render loop from the per-peer refresh
                 // time; discovery itself leaves it fresh-neutral.
                 activity_stale: false,
+                // Mounted remote projects carry no local family identity.
+                family_note: None,
             }
         })
         .collect()
@@ -1327,4 +1343,88 @@ pub fn maybe_spawn_tui(
             tracing::error!("TUI error: {}", e);
         }
     }))
+}
+
+#[cfg(test)]
+mod family_note_tests {
+    use super::*;
+
+    /// map_repo_rows' family_note wiring: the main-tree row reads
+    /// "+ N worktrees", the worktree row "worktree of <main>", an unrelated
+    /// repo gets None (card #261 TODO 4; the note vocabulary itself is
+    /// pinned by the family_note unit test in repos_tests.rs).
+    #[test]
+    fn map_repo_rows_annotates_family_members() {
+        use crate::db_discovery::repos::ReposConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = ReposConfig::default();
+        let main_path = tmp.path().join("m");
+        let wt_path = tmp.path().join("m-wt");
+        let main = config.register(main_path.clone());
+        let wt = config.register(wt_path.clone());
+        let identity = format!("{}/.git", main_path.display());
+        config
+            .repos_meta
+            .entry(main.clone())
+            .or_default()
+            .git_common_dir = Some(identity.clone());
+        config
+            .repos_meta
+            .entry(wt.clone())
+            .or_default()
+            .git_common_dir = Some(identity);
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+        let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+
+        let info = crate::serve::RepoStatusInfo {
+            status: crate::serve::RepoStateLabel::Warm,
+            changes: 0,
+            last_tool_call: None,
+            tool_call_count: 0,
+            csharp_index: crate::serve::CSharpIndexStatus::None,
+            csharp_error: None,
+            typescript_index: crate::serve::CSharpIndexStatus::None,
+        };
+        let repos = vec![
+            (main.clone(), info),
+            (
+                wt.clone(),
+                crate::serve::RepoStatusInfo {
+                    status: crate::serve::RepoStateLabel::Warm,
+                    changes: 0,
+                    last_tool_call: None,
+                    tool_call_count: 0,
+                    csharp_index: crate::serve::CSharpIndexStatus::None,
+                    csharp_error: None,
+                    typescript_index: crate::serve::CSharpIndexStatus::None,
+                },
+            ),
+            (
+                "solo".to_string(),
+                crate::serve::RepoStatusInfo {
+                    status: crate::serve::RepoStateLabel::Warm,
+                    changes: 0,
+                    last_tool_call: None,
+                    tool_call_count: 0,
+                    csharp_index: crate::serve::CSharpIndexStatus::None,
+                    csharp_error: None,
+                    typescript_index: crate::serve::CSharpIndexStatus::None,
+                },
+            ),
+        ];
+        let rows = map_repo_rows(&repos, &state);
+        let by_alias: std::collections::HashMap<&str, &RepoRow> =
+            rows.iter().map(|r| (r.alias.as_str(), r)).collect();
+        assert_eq!(
+            by_alias[wt.as_str()].family_note.as_deref(),
+            Some("worktree of m")
+        );
+        assert_eq!(
+            by_alias[main.as_str()].family_note.as_deref(),
+            Some("+ 1 worktree")
+        );
+        assert_eq!(by_alias["solo"].family_note, None);
+    }
 }

@@ -6900,3 +6900,112 @@ async fn backfill_group_identities_fills_missing_and_persists() {
         "backfilled identity must be persisted to repos.json"
     );
 }
+
+// === worktree-family surfaces (card #261 TODO 4) ===
+
+/// Family config for the surface tests: two registered aliases sharing one
+/// hand-set git identity, saved to a temp repos.json wired to the state.
+fn family_state() -> (tempfile::TempDir, String, String, ServeState) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = ReposConfig::default();
+    // The main tree is the SHORTEST registered path (worktrees live under
+    // it), so the short dir is the main tree and the worktree path longer.
+    let main_path = tmp.path().join("m");
+    let wt_path = tmp.path().join("m-wt");
+    let main = config.register(main_path.clone());
+    let wt = config.register(wt_path.clone());
+    let identity = format!("{}/.git", main_path.display());
+    config
+        .repos_meta
+        .entry(main.clone())
+        .or_default()
+        .git_common_dir = Some(identity.clone());
+    config
+        .repos_meta
+        .entry(wt.clone())
+        .or_default()
+        .git_common_dir = Some(identity);
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = ServeState::new(config, Some(config_file));
+    (tmp, main, wt, state)
+}
+
+#[tokio::test]
+async fn status_annotates_worktree_of_from_family_identity() {
+    let (_tmp, main, wt, state) = family_state();
+    let info = |status| RepoStatusInfo {
+        status,
+        changes: 0,
+        last_tool_call: None,
+        tool_call_count: 0,
+        csharp_index: CSharpIndexStatus::None,
+        csharp_error: None,
+        typescript_index: CSharpIndexStatus::None,
+    };
+    state
+        .status_snapshot
+        .store(status_snapshot::StatusSnapshot {
+            repos: vec![
+                (main.clone(), info(RepoStateLabel::Warm)),
+                (wt.clone(), info(RepoStateLabel::Warm)),
+            ],
+            projects: Vec::new(),
+            projects_warnings: Vec::new(),
+            active_sessions: 0,
+            cpu_percent: "0%".to_string(),
+            csharp_helper: false,
+            ts_helper: false,
+            generated_at: std::time::Instant::now(),
+        });
+
+    let resp = status_handler(axum::extract::State(std::sync::Arc::new(state))).await;
+    let json = resp.0;
+    let repos = json["repos"].as_array().expect("repos array");
+    let wt_entry = repos
+        .iter()
+        .find(|r| r["alias"] == wt.as_str())
+        .expect("wt entry");
+    assert_eq!(wt_entry["worktree_of"], main.as_str(), "json: {json}");
+    let main_entry = repos
+        .iter()
+        .find(|r| r["alias"] == main.as_str())
+        .expect("main entry");
+    assert!(
+        main_entry.get("worktree_of").is_none(),
+        "main trees carry no worktree_of: {json}"
+    );
+}
+
+#[tokio::test]
+async fn scope_error_lists_worktree_families_and_clean_projects() {
+    let (_tmp, main, wt, state) = family_state();
+    let service =
+        crate::mcp::CodesearchService::new_for_serve(std::sync::Arc::new(state)).expect("service");
+    let payload: serde_json::Value =
+        serde_json::from_str(&service.format_scope_error()).expect("scope payload");
+
+    assert_eq!(
+        payload["worktree_families"][wt.as_str()],
+        main.as_str(),
+        "payload: {payload}"
+    );
+    assert!(
+        payload["worktree_families"].get(main.as_str()).is_none(),
+        "main trees are not in the families map: {payload}"
+    );
+    let projects: Vec<&str> = payload["available_projects"]
+        .as_array()
+        .expect("projects array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        projects.contains(&main.as_str()) && projects.contains(&wt.as_str()),
+        "available_projects stay clean aliases: {projects:?}"
+    );
+    assert!(
+        !payload.to_string().contains("(worktree of"),
+        "machine-readable payload must stay flat: {payload}"
+    );
+}

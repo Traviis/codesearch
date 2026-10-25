@@ -1518,3 +1518,93 @@ fn reconcile_prunes_orphan_groups_meta() {
         "orphan override must be pruned"
     );
 }
+
+#[test]
+fn worktree_family_map_annotates_shortest_path_main_and_omits_mains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(
+        &mut cfg,
+        &tmp.path().join("main"),
+        &tmp.path().join("main/sub-wt"),
+    );
+    let (fmain, fwt) = register_family(
+        &mut cfg,
+        &tmp.path().join("fam"),
+        &tmp.path().join("fam-wt"),
+    );
+    let solo = cfg.register(tmp.path().join("solo"));
+
+    let map = cfg.worktree_family_map();
+    assert_eq!(
+        map.get(wt.as_str()).map(String::as_str),
+        Some(main.as_str())
+    );
+    assert_eq!(
+        map.get(fwt.as_str()).map(String::as_str),
+        Some(fmain.as_str())
+    );
+    assert!(
+        !map.contains_key(main.as_str()),
+        "main trees are not annotated"
+    );
+    assert!(!map.contains_key(fmain.as_str()));
+    assert!(
+        !map.contains_key(solo.as_str()),
+        "identity-less repos are skipped"
+    );
+}
+
+#[test]
+fn worktree_family_map_tie_breaks_on_alias() {
+    // Same-length paths, same identity: the lexicographically smallest alias
+    // is the main tree.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let p1 = tmp.path().join("braa");
+    let p2 = tmp.path().join("brzz");
+    let a1 = cfg.register(p1.clone());
+    let a2 = cfg.register(p2);
+    for alias in [&a1, &a2] {
+        cfg.repos_meta
+            .entry(alias.clone())
+            .or_default()
+            .git_common_dir = Some(format!("{}/.git", p1.display()));
+    }
+    let map = cfg.worktree_family_map();
+    assert_eq!(
+        map.get(a2.as_str()).map(String::as_str),
+        Some(a1.as_str()),
+        "map: {map:?}"
+    );
+    assert!(!map.contains_key(a1.as_str()));
+}
+
+#[test]
+fn family_note_covers_both_arms_and_pluralization() {
+    use super::family_note;
+    let mut family_map = std::collections::HashMap::new();
+    family_map.insert("wt1".to_string(), "main".to_string());
+    let mut counts = std::collections::HashMap::new();
+    counts.insert("main".to_string(), 2);
+    counts.insert("lonely".to_string(), 1);
+    counts.insert("zero".to_string(), 0);
+    assert_eq!(
+        family_note(&family_map, &counts, "wt1").as_deref(),
+        Some("worktree of main")
+    );
+    assert_eq!(
+        family_note(&family_map, &counts, "main").as_deref(),
+        Some("+ 2 worktrees")
+    );
+    assert_eq!(
+        family_note(&family_map, &counts, "lonely").as_deref(),
+        Some("+ 1 worktree")
+    );
+    assert_eq!(
+        family_note(&family_map, &counts, "zero").as_deref(),
+        None,
+        "a zero count renders no note"
+    );
+    assert_eq!(family_note(&family_map, &counts, "solo").as_deref(), None);
+}
