@@ -1069,41 +1069,61 @@ impl ReposConfig {
     pub fn worktree_family_map(&self) -> std::collections::HashMap<String, String> {
         use std::collections::HashMap;
 
-        // identity -> (shortest path seen so far, its alias)
-        let mut mains: HashMap<&str, (usize, &str)> = HashMap::new();
+        // identity -> (exact main alias if seen, shortest-path fallback so
+        // far). A member whose own `<repo>/.git` IS the recorded common dir
+        // is the main tree — a worktree's common dir lives under the main's
+        // path, never its own, so only the main can match exactly. Shortest
+        // path is the fallback for families whose main tree is not (or no
+        // longer) registered, so a worktree parked at a shorter path cannot
+        // steal the main label.
+        let mut exact: HashMap<&str, Option<&str>> = HashMap::new();
+        let mut shortest: HashMap<&str, (usize, &str)> = HashMap::new();
         for (alias, path) in &self.repos {
-            let Some(meta) = self.repos_meta.get(alias) else {
+            let Some(identity) = self
+                .repos_meta
+                .get(alias)
+                .and_then(|m| m.git_common_dir.as_deref())
+            else {
                 continue;
             };
-            let Some(identity) = meta.git_common_dir.as_deref() else {
-                continue;
-            };
+            let slot = exact.entry(identity).or_insert(None);
+            if slot.is_none()
+                && normalize_path_for_compare(&path.join(".git"))
+                    == normalize_path_for_compare(Path::new(identity))
+            {
+                *slot = Some(alias.as_str());
+            }
             let path_len = path.as_os_str().len();
-            match mains.get_mut(identity) {
+            match shortest.get_mut(identity) {
                 Some((best_len, best_alias)) => {
-                    let shorter = path_len < *best_len
+                    let better = path_len < *best_len
                         || (path_len == *best_len && alias.as_str() < *best_alias);
-                    if shorter {
+                    if better {
                         *best_len = path_len;
                         *best_alias = alias.as_str();
                     }
                 }
                 None => {
-                    mains.insert(identity, (path_len, alias.as_str()));
+                    shortest.insert(identity, (path_len, alias.as_str()));
                 }
             }
         }
         let mut out: HashMap<String, String> = HashMap::new();
         for alias in self.repos.keys() {
-            let Some(meta) = self.repos_meta.get(alias) else {
+            let Some(identity) = self
+                .repos_meta
+                .get(alias)
+                .and_then(|m| m.git_common_dir.as_deref())
+            else {
                 continue;
             };
-            let Some(identity) = meta.git_common_dir.as_deref() else {
-                continue;
-            };
-            if let Some((_, main_alias)) = mains.get(identity) {
-                if *main_alias != alias.as_str() {
-                    out.insert(alias.clone(), (*main_alias).to_string());
+            let main = exact
+                .get(identity)
+                .and_then(|m| *m)
+                .or_else(|| shortest.get(identity).map(|(_, a)| *a));
+            if let Some(main) = main {
+                if main != alias.as_str() {
+                    out.insert(alias.clone(), main.to_string());
                 }
             }
         }

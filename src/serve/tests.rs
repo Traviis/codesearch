@@ -6905,11 +6905,18 @@ async fn backfill_group_identities_fills_missing_and_persists() {
 
 /// Family config for the surface tests: two registered aliases sharing one
 /// hand-set git identity, saved to a temp repos.json wired to the state.
-fn family_state() -> (tempfile::TempDir, String, String, ServeState) {
+/// Two-repo worktree family on a tempdir: `m` (main tree, identity
+/// `<tmp>/m/.git`) + `m-wt` sharing it, config saved to `<tmp>/repos.json`.
+/// Shared by the status/scope tests here and the TUI row tests. The
+/// returned TempDir must outlive every use of the state.
+pub(crate) fn family_state() -> (
+    tempfile::TempDir,
+    String,
+    String,
+    std::sync::Arc<ServeState>,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = ReposConfig::default();
-    // The main tree is the SHORTEST registered path (worktrees live under
-    // it), so the short dir is the main tree and the worktree path longer.
     let main_path = tmp.path().join("m");
     let wt_path = tmp.path().join("m-wt");
     let main = config.register(main_path.clone());
@@ -6927,7 +6934,7 @@ fn family_state() -> (tempfile::TempDir, String, String, ServeState) {
         .git_common_dir = Some(identity);
     let config_file = tmp.path().join("repos.json");
     config.save_to(&config_file).unwrap();
-    let state = ServeState::new(config, Some(config_file));
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
     (tmp, main, wt, state)
 }
 
@@ -6959,7 +6966,7 @@ async fn status_annotates_worktree_of_from_family_identity() {
             generated_at: std::time::Instant::now(),
         });
 
-    let resp = status_handler(axum::extract::State(std::sync::Arc::new(state))).await;
+    let resp = status_handler(axum::extract::State(state)).await;
     let json = resp.0;
     let repos = json["repos"].as_array().expect("repos array");
     let wt_entry = repos
@@ -6980,8 +6987,7 @@ async fn status_annotates_worktree_of_from_family_identity() {
 #[tokio::test]
 async fn scope_error_lists_worktree_families_and_clean_projects() {
     let (_tmp, main, wt, state) = family_state();
-    let service =
-        crate::mcp::CodesearchService::new_for_serve(std::sync::Arc::new(state)).expect("service");
+    let service = crate::mcp::CodesearchService::new_for_serve(state).expect("service");
     let payload: serde_json::Value =
         serde_json::from_str(&service.format_scope_error()).expect("scope payload");
 

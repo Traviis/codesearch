@@ -1355,28 +1355,7 @@ mod family_note_tests {
     /// pinned by the family_note unit test in repos_tests.rs).
     #[test]
     fn map_repo_rows_annotates_family_members() {
-        use crate::db_discovery::repos::ReposConfig;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = ReposConfig::default();
-        let main_path = tmp.path().join("m");
-        let wt_path = tmp.path().join("m-wt");
-        let main = config.register(main_path.clone());
-        let wt = config.register(wt_path.clone());
-        let identity = format!("{}/.git", main_path.display());
-        config
-            .repos_meta
-            .entry(main.clone())
-            .or_default()
-            .git_common_dir = Some(identity.clone());
-        config
-            .repos_meta
-            .entry(wt.clone())
-            .or_default()
-            .git_common_dir = Some(identity);
-        let config_file = tmp.path().join("repos.json");
-        config.save_to(&config_file).unwrap();
-        let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+        let (_tmp, main, wt, state) = crate::serve::tests::family_state();
 
         let info = crate::serve::RepoStatusInfo {
             status: crate::serve::RepoStateLabel::Warm,

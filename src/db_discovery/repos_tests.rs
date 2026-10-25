@@ -1556,6 +1556,29 @@ fn worktree_family_map_annotates_shortest_path_main_and_omits_mains() {
 }
 
 #[test]
+fn worktree_family_map_prefers_exact_git_dir_main_over_shortest_path() {
+    // The main tree is the member whose own `.git` IS the family identity —
+    // a worktree parked at a shorter path must not steal the main label
+    // (centralized worktree dirs are a common layout).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(
+        &mut cfg,
+        &tmp.path().join("somewhere-longer/main-tree"),
+        &tmp.path().join("w/main-wt"),
+    );
+    let map = cfg.worktree_family_map();
+    assert_eq!(
+        map.get(wt.as_str()).map(String::as_str),
+        Some(main.as_str())
+    );
+    assert!(
+        !map.contains_key(main.as_str()),
+        "the real main tree is never annotated as a worktree"
+    );
+}
+
+#[test]
 fn worktree_family_map_tie_breaks_on_alias() {
     // Same-length paths, same identity: the lexicographically smallest alias
     // is the main tree.

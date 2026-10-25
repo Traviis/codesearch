@@ -767,9 +767,36 @@ async fn seed_group_store(
     }
     {
         let mut fts = stores.fts_store.write().await;
-        fts.add_chunk(0, content, rel_path, None, "Function")
-            .expect("fts doc");
-        fts.commit().expect("commit");
+        // Transient Windows AV race on fresh tantivy `.store` files: redrive
+        // the whole add+commit pass via the production classifier — a failed
+        // commit discards the writer, so a bare commit retry cannot heal it.
+        let mut err: Option<String> = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let pass = async {
+                fts.add_chunk(0, content, rel_path, None, "Function")?;
+                fts.commit()
+            };
+            match pass.await {
+                Ok(()) => {
+                    err = None;
+                    break;
+                }
+                Err(e) => {
+                    let rendered = format!("{e:#}");
+                    if crate::fts::FtsStore::is_transient_fts_commit_error(&rendered) {
+                        err = Some(rendered);
+                        continue;
+                    }
+                    panic!("seed fts: {rendered}");
+                }
+            }
+        }
+        if let Some(e) = err {
+            panic!("seed fts (transient after retries): {e}");
+        }
     }
     stores
 }
