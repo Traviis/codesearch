@@ -175,12 +175,14 @@ jobs:
       # macos-latest is a floating image: after runner-image drift its SDK (26.x)
       # compiles ort_sys's CoreML objects with a newer minos than rustc's default
       # aarch64 deployment target (11.0), and ld refuses the link ("built for
-      # newer macOS version than being linked"; Undefined symbols:
-      # ___isPlatformVersionAtLeast). The ort_sys CoreML objects themselves come
-      # out at minos 13.4 (onnxruntime's own floor — it ignores lower values),
-      # so the link target must be >= 13.4 for ld to resolve its
-      # availability-check symbol. Pin one target for rustc, cc and dotnet alike.
-      MACOSX_DEPLOYMENT_TARGET: "13.4"
+      # newer macOS version than being linked"). Pin one target for rustc, cc
+      # and dotnet alike.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      # ort (version < the April-2025 fix) statically links CoreML, whose objects
+      # call ___isPlatformVersionAtLeast from clang's compiler-rt — newer Xcode
+      # no longer adds libclang_rt to mixed rustc/cc links automatically.
+      # https://ort.pyke.io/setup/linking — rustc flag from the ort docs.
+      RUSTFLAGS: -Clink-arg=-fapple-link-rtlib
     steps:
       # pin@v4
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
