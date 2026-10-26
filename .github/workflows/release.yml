@@ -306,8 +306,15 @@ jobs:
           path: codesearch-macos-arm64-with-csharp.tar.gz.sha256
 
   release:
-    needs: [build]
-    if: always() && needs.build.result == 'success'
+    needs: [build, build-macos]
+    # always()+skipped so a dispatch without include_macos still publishes
+    # (build-macos skipped); with macOS enabled it must have SUCCEEDED — a
+    # needs on build alone raced it: the release job once ran while macOS was
+    # still uploading, publishing only 11 of 12 artifacts (missing sidecar).
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
