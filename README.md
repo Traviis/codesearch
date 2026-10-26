@@ -80,7 +80,26 @@ graph TB
 
 ### Install
 
-Download pre-built binaries from [Releases](https://github.com/flupkede/codesearch/releases):
+One line — the installer asks for an install path on first use and updates an existing install in place (stopping a running serve from that directory first):
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://github.com/flupkede/codesearch/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1
+```
+
+**Linux / macOS (bash):**
+
+```bash
+curl -fsSLO https://github.com/flupkede/codesearch/releases/latest/download/install.sh && bash install.sh && rm install.sh
+```
+
+(The download-then-run form matters: piping straight into `bash` shares stdin with the script, which breaks the first-install path prompt.)
+
+Downloads the `-with-csharp` build by default (codesearch + `scip-csharp`, self-contained); add `-NoCSharp` / `--no-csharp` for the base build. Archives carry a `.sha256` sidecar and the installer verifies it when present. `--destination <path>` / `-Destination <path>` skips the prompt.
+
+<details>
+<summary>Manual install — download pre-built binaries from <a href="https://github.com/flupkede/codesearch/releases">Releases</a></summary>
 
 | Platform | Download |
 |----------|----------|
@@ -90,6 +109,10 @@ Download pre-built binaries from [Releases](https://github.com/flupkede/codesear
 | Linux x86_64 + C# | `codesearch-linux-x86_64-with-csharp.tar.gz` |
 | macOS ARM64 | `codesearch-macos-arm64.tar.gz` |
 | macOS ARM64 + C# | `codesearch-macos-arm64-with-csharp.tar.gz` |
+
+Unzip, put `codesearch(.exe)` on your `PATH`; for the C# builds keep `scip-csharp(.exe)` next to it.
+
+</details>
 
 Or build from source:
 
