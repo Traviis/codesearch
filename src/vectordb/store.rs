@@ -585,9 +585,12 @@ impl VectorStore {
             )?
         };
 
-        // Open databases (read-only, no create)
-        let rtxn = env.read_txn()?;
-
+        // Open databases (read-only, no create). Each `open_named_db` runs and
+        // commits its OWN read transaction — heed 0.23 requires that commit to
+        // persist the dbi handles env-globally — so the transaction used for
+        // the data reads below must start only AFTER all of them: one started
+        // earlier does not know the handles and every use fails with EINVAL
+        // (os error 22).
         let vectors: ArroyDatabase<'static, Cosine> =
             open_named_db::<KeyCodec, NodeCodec<Cosine>>(&env, "vectors")?
                 .ok_or_else(|| anyhow::anyhow!("vectors database not found"))?;
@@ -600,6 +603,8 @@ impl VectorStore {
         // informational here anyway.
         let id_hwm_db: Option<Database<'static, Str, SerdeBincode<u32>>> =
             open_named_db(&env, "meta")?;
+
+        let rtxn = env.read_txn()?;
 
         // Get the next ID from the maximum existing key + 1 and the persisted
         // high-water mark, whichever is higher — see `next_id_from`.
