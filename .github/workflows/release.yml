@@ -171,6 +171,13 @@ jobs:
   build-macos:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.include_macos)
     runs-on: macos-latest
+    env:
+      # macos-latest is a floating image: after runner-image drift its SDK (26.x)
+      # compiles ort_sys's CoreML objects with a newer minos than rustc's default
+      # aarch64 deployment target (11.0), and ld refuses the link ("built for
+      # newer macOS version than being linked"). Pin one target for rustc, cc
+      # (ort CoreML) and dotnet alike — onnxruntime needs >= 12, 13 has headroom.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       # pin@v4
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
