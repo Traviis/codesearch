@@ -545,12 +545,18 @@ fn store_ref_warnings(
 /// Read one canonical key's warnings. Missing database or entry — and an
 /// undecodable value — read as empty (complete): a warning that cannot be
 /// read must not fail a lookup that has valid references.
-fn read_ref_warnings(env: &TrackedEnv, rtxn: &heed::RoTxn<'_>, canonical: &str) -> Vec<String> {
-    match open_named_db::<Str, Bytes>(env, SCIP_REF_WARNINGS_DB_NAME) {
-        Ok(Some(db)) => match db.get(rtxn, canonical) {
-            Ok(Some(bytes)) => deserialize_keys_v1(bytes).unwrap_or_default(),
-            _ => Vec::new(),
-        },
+fn read_ref_warnings(env: &TrackedEnv, canonical: &str) -> Vec<String> {
+    // Open the named DB before the read txn: the open commits its own txn,
+    // and a rtxn started earlier would not know the handle.
+    let db = match open_named_db::<Str, Bytes>(env, SCIP_REF_WARNINGS_DB_NAME) {
+        Ok(Some(db)) => db,
+        _ => return Vec::new(),
+    };
+    let Ok(rtxn) = env.read_txn() else {
+        return Vec::new();
+    };
+    match db.get(&rtxn, canonical) {
+        Ok(Some(bytes)) => deserialize_keys_v1(bytes).unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -1180,25 +1186,24 @@ impl CSharpSymbolIndexer {
     /// candidate, which hid overloads (`Validate()` vs `Validate(string)`)
     /// from the caller and answered about the wrong symbol.
     fn resolve_name_key(&self, env: &TrackedEnv, symbol: &str) -> Result<KeyMatch> {
-        let rtxn = env.read_txn()?;
-
         let symbols_db: Database<'static, Str, Bytes> =
             match open_named_db::<Str, Bytes>(env, SCIP_DB_NAME)? {
                 Some(db) => db,
                 None => return Ok(KeyMatch::NotFound),
             };
-
-        // Exact match first
-        if symbols_db.get(&rtxn, symbol)?.is_some() {
-            return Ok(KeyMatch::Resolved(symbol.to_string()));
-        }
-
-        // Fuzzy via simple-name index
         let simple_names_db: Database<'static, Str, Bytes> =
             match open_named_db::<Str, Bytes>(env, SCIP_SIMPLE_NAMES_DB_NAME)? {
                 Some(db) => db,
                 None => return Ok(KeyMatch::NotFound),
             };
+        // Open the named DBs before the read txn: each open commits its own
+        // txn, and a rtxn started earlier would not know the handles.
+        let rtxn = env.read_txn()?;
+
+        // Exact match first
+        if symbols_db.get(&rtxn, symbol)?.is_some() {
+            return Ok(KeyMatch::Resolved(symbol.to_string()));
+        }
 
         let simple = extract_simple_name(symbol);
         let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple as &str)? {
@@ -1244,10 +1249,14 @@ impl CSharpSymbolIndexer {
 
         // ── Read phase ─────────────────────────────────────────────
         {
+            // Open the named DBs before the read txn: each open commits its
+            // own txn, and a rtxn started earlier would not know the handles.
+            let symbols_db = open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)?;
+            let ref_cache_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?;
             let rtxn = env.read_txn()?;
 
             // 1. Load definitions from scip_symbols
-            if let Some(symbols_db) = open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)? {
+            if let Some(symbols_db) = symbols_db {
                 if let Some(bytes) = symbols_db.get(&rtxn, canonical)? {
                     match deserialize_refs(bytes) {
                         Ok(defs) => all_stored.extend(defs),
@@ -1261,9 +1270,7 @@ impl CSharpSymbolIndexer {
             }
 
             // 2. Check reference cache
-            cache_hit = if let Some(ref_cache_db) =
-                open_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?
-            {
+            cache_hit = if let Some(ref_cache_db) = ref_cache_db {
                 match ref_cache_db.get(&rtxn, canonical)? {
                     Some(cached_bytes) => match deserialize_refs(cached_bytes) {
                         Ok(cached_refs) => {
@@ -1287,10 +1294,7 @@ impl CSharpSymbolIndexer {
             // A cached answer replays the warnings persisted WITH it — the
             // honesty is part of the cached fact, so a partial result can
             // never quietly pass for complete on the 2nd+ call.
-            let warnings = {
-                let rtxn = env.read_txn()?;
-                read_ref_warnings(&env, &rtxn, canonical)
-            };
+            let warnings = read_ref_warnings(&env, canonical);
             for w in &warnings {
                 tracing::warn!("cached refs for '{}' may be incomplete: {}", canonical, w);
             }
@@ -1312,11 +1316,12 @@ impl CSharpSymbolIndexer {
         // Resolve repo_path: read from LMDB meta (written during rebuild),
         // fall back to db_path.parent() for backward compat with old indexes.
         let repo_path = {
-            let rtxn = env.read_txn()?;
+            // Open the named DB before the read txn (the open commits its own).
             let meta_db: Database<'static, Str, Str> =
                 open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)?.unwrap_or_else(|| {
                     panic!("scip_meta DB should exist (created during open_scip_env)")
                 });
+            let rtxn = env.read_txn()?;
             match meta_db.get(&rtxn, META_REPO_PATH)? {
                 Some(path_str) => PathBuf::from(path_str),
                 None => {
@@ -1438,11 +1443,12 @@ impl CSharpSymbolIndexer {
     /// the meta is unreadable.
     pub fn refs_coverage(&self, db_path: &Path) -> Option<String> {
         let env = self.open_scip_env(db_path).ok()?;
-        let rtxn = env.read_txn().ok()?;
+        // Open the named DB before the read txn (the open commits its own).
         let meta_db: Database<'static, Str, Str> =
             open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
                 .ok()
                 .flatten()?;
+        let rtxn = env.read_txn().ok()?;
         meta_db
             .get(&rtxn, META_REFS_COVERAGE)
             .ok()
@@ -1455,14 +1461,15 @@ impl CSharpSymbolIndexer {
     /// Used by Phase 3 to skip symbols whose refs are already in the cache.
     pub fn collect_uncached_symbol_keys(&self, db_path: &Path) -> Result<Vec<String>> {
         let env = self.open_scip_env(db_path)?;
-        let rtxn = env.read_txn()?;
-
+        // Open the named DBs before the read txn: each open commits its own
+        // txn, and a rtxn started earlier would not know the handles.
         let symbols_db: Database<'static, Str, Bytes> =
             open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)?
                 .ok_or_else(|| anyhow::anyhow!("scip_symbols database not found"))?;
 
         let ref_cache_db: Option<Database<'static, Str, Bytes>> =
             open_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?;
+        let rtxn = env.read_txn()?;
 
         let mut uncached = Vec::new();
         let iter = symbols_db.iter(&rtxn)?;
@@ -2367,9 +2374,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 // the handler turns that into a loud failure, never a
                 // guess at a near-miss symbol.
                 let env = self.open_scip_env(db_path)?;
-                let rtxn = env.read_txn()?;
                 let present = match open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)? {
-                    Some(db) => db.get(&rtxn, key as &str)?.is_some(),
+                    Some(db) => {
+                        // Open the named DB before the read txn (the open
+                        // commits its own).
+                        let rtxn = env.read_txn()?;
+                        db.get(&rtxn, key as &str)?.is_some()
+                    }
                     None => false,
                 };
                 Ok(if present {
@@ -2384,12 +2395,14 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             }
             ImpactQuery::Position { file, line } => {
                 let env = self.open_scip_env(db_path)?;
-                let rtxn = env.read_txn()?;
 
                 let positions_db: Database<'static, Str, Bytes> =
                     open_named_db::<Str, Bytes>(&env, SCIP_POSITION_DB_NAME)?.ok_or_else(|| {
                         anyhow::anyhow!("Position index not found. Run a rebuild first.")
                     })?;
+                // Open the named DB before the read txn (the open commits
+                // its own).
+                let rtxn = env.read_txn()?;
 
                 // Normalize file path to forward-slash (Windows compat)
                 let pos_key = format!("{}:{}", file.to_string_lossy().replace('\\', "/"), line);
@@ -2427,11 +2440,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
-        let rtxn = match env.read_txn() {
-            Ok(t) => t,
-            Err(_) => return Vec::new(),
-        };
-        read_ref_warnings(&env, &rtxn, canonical)
+        read_ref_warnings(&env, canonical)
     }
 
     fn restore_pending(&self, db_path: &Path) -> bool {
@@ -2446,16 +2455,17 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Ok(e) => e,
             Err(_) => return u64::MAX,
         };
-        let rtxn = match env.read_txn() {
-            Ok(t) => t,
-            Err(_) => return u64::MAX,
-        };
 
         let meta_db: Database<'static, Str, Str> =
             match open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME) {
                 Ok(Some(db)) => db,
                 _ => return u64::MAX,
             };
+        // Open the named DB before the read txn (the open commits its own).
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return u64::MAX,
+        };
 
         let ts_str: &str = match meta_db.get(&rtxn, META_REBUILD_TS) {
             Ok(Some(s)) => s,
@@ -2477,11 +2487,12 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
     fn index_head_sha(&self, db_path: &Path) -> Option<String> {
         let env = self.open_scip_env(db_path).ok()?;
-        let rtxn = env.read_txn().ok()?;
+        // Open the named DB before the read txn (the open commits its own).
         let meta_db: Database<'static, Str, Str> =
             open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
                 .ok()
                 .flatten()?;
+        let rtxn = env.read_txn().ok()?;
         let sha = meta_db.get(&rtxn, META_HEAD_SHA).ok().flatten()?;
         let sha = sha.trim().to_string();
         (!sha.is_empty()).then_some(sha)
@@ -2499,15 +2510,16 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
-        let rtxn = match env.read_txn() {
-            Ok(t) => t,
-            Err(_) => return Vec::new(),
-        };
         let meta_db: Database<'static, Str, Str> =
             match open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME) {
                 Ok(Some(db)) => db,
                 _ => return Vec::new(),
             };
+        // Open the named DB before the read txn (the open commits its own).
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
         let json = match meta_db.get(&rtxn, META_INDEX_WARNINGS) {
             Ok(Some(s)) => s,
             _ => return Vec::new(),
@@ -2524,15 +2536,16 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Ok(e) => e,
             Err(_) => return None,
         };
-        let rtxn = match env.read_txn() {
-            Ok(t) => t,
-            Err(_) => return None,
-        };
         let meta_db: Database<'static, Str, Str> =
             match open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME) {
                 Ok(Some(db)) => db,
                 _ => return None,
             };
+        // Open the named DB before the read txn (the open commits its own).
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
         meta_db
             .get(&rtxn, META_BUILDER_VERSION)
             .ok()
@@ -2576,14 +2589,15 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Ok(e) => e,
             Err(_) => return false,
         };
-        let rtxn = match env.read_txn() {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
         let meta_db: Option<Database<'static, Str, Str>> =
             open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
                 .ok()
                 .flatten();
+        // Open the named DB before the read txn (the open commits its own).
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
         let stored = meta_db
             .and_then(|db| db.get(&rtxn, META_KEY_FORMAT).ok().flatten())
             .map(|s| s.trim().to_string());

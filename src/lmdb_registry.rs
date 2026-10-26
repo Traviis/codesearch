@@ -192,22 +192,29 @@ pub fn open_holders_under(path: &Path) -> Vec<String> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
+    let Some(registry) = LMDB_REGISTRY.get() else {
+        return Vec::new();
+    };
+    // Take the registry shard's read guard ONLY while iterating: probing
+    // SHARED_ENVS inside the loop would hold two shard locks at once, and
+    // get_or_open_shared_env's Vacant arm holds a SHARED_ENVS write guard
+    // across TrackedEnv::open → register() (an LMDB_REGISTRY write) — a
+    // cross-shard ABBA deadlock.
+    let candidates: Vec<(PathBuf, String)> = registry
+        .iter()
+        .filter(|entry| entry.key().starts_with(&canonical))
+        .map(|entry| (entry.key().clone(), entry.value().description.clone()))
+        .collect();
     let shared_cache = SHARED_ENVS.get();
-    match LMDB_REGISTRY.get() {
-        Some(registry) => registry
-            .iter()
-            .filter(|entry| entry.key().starts_with(&canonical))
-            .filter(
-                |entry| match shared_cache.and_then(|c| c.get(entry.key())) {
-                    // strong_count == 1 means the cache itself is the only holder.
-                    Some(env) => Arc::strong_count(env.value()) > 1,
-                    None => true,
-                },
-            )
-            .map(|entry| entry.value().description.clone())
-            .collect(),
-        None => Vec::new(),
-    }
+    candidates
+        .into_iter()
+        .filter(|(key, _)| match shared_cache.and_then(|c| c.get(key)) {
+            // strong_count == 1 means the cache itself is the only holder.
+            Some(env) => Arc::strong_count(env.value()) > 1,
+            None => true,
+        })
+        .map(|(_, description)| description)
+        .collect()
 }
 
 // ── Shared-env cache ────────────────────────────────────────────

@@ -382,23 +382,24 @@ impl TypeScriptSymbolIndexer {
     /// behaviour silently picked the shortest candidate, which hid
     /// overloads from the caller.
     fn resolve_name_key(&self, env: &TrackedEnv, symbol: &str) -> Result<KeyMatch> {
-        let rtxn = env.read_txn()?;
-
         let symbols_db: Database<'static, Str, Bytes> =
             match open_named_db::<Str, Bytes>(env, SCIP_DB_NAME)? {
                 Some(db) => db,
                 None => return Ok(KeyMatch::NotFound),
             };
 
-        if symbols_db.get(&rtxn, symbol)?.is_some() {
-            return Ok(KeyMatch::Resolved(symbol.to_string()));
-        }
-
         let simple_names_db: Database<'static, Str, Bytes> =
             match open_named_db::<Str, Bytes>(env, SCIP_NAMES_DB_NAME)? {
                 Some(db) => db,
                 None => return Ok(KeyMatch::NotFound),
             };
+        // Open the named DBs before the read txn: each open commits its own
+        // txn, and a rtxn started earlier would not know the handles.
+        let rtxn = env.read_txn()?;
+
+        if symbols_db.get(&rtxn, symbol)?.is_some() {
+            return Ok(KeyMatch::Resolved(symbol.to_string()));
+        }
 
         let simple = extract_simple_name(symbol);
         let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple as &str)? {
@@ -631,9 +632,13 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
                 // the handler turns that into a loud failure, never a
                 // guess at a near-miss symbol.
                 let env = self.open_scip_env(db_path)?;
-                let rtxn = env.read_txn()?;
                 let present = match open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)? {
-                    Some(db) => db.get(&rtxn, key as &str)?.is_some(),
+                    Some(db) => {
+                        // Open the named DB before the read txn (the open
+                        // commits its own).
+                        let rtxn = env.read_txn()?;
+                        db.get(&rtxn, key as &str)?.is_some()
+                    }
                     None => false,
                 };
                 Ok(if present {
@@ -648,12 +653,14 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
             }
             ImpactQuery::Position { file, line } => {
                 let env = self.open_scip_env(db_path)?;
-                let rtxn = env.read_txn()?;
 
                 let positions_db: Database<'static, Str, Bytes> =
                     open_named_db::<Str, Bytes>(&env, SCIP_POS_DB_NAME)?.ok_or_else(|| {
                         anyhow::anyhow!("Position index not found. Run a rebuild first.")
                     })?;
+                // Open the named DB before the read txn (the open commits
+                // its own).
+                let rtxn = env.read_txn()?;
 
                 let pos_key = format!("{}:{}", file.to_string_lossy().replace('\\', "/"), line);
 
@@ -682,12 +689,13 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
     ) -> Result<Vec<SymbolReference>> {
         let env = self.open_scip_env(db_path)?;
 
-        let rtxn = env.read_txn()?;
         let symbols_db: Database<'static, Str, Bytes> =
             match open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)? {
                 Some(db) => db,
                 None => return Ok(vec![]),
             };
+        // Open the named DB before the read txn (the open commits its own).
+        let rtxn = env.read_txn()?;
 
         let stored = match symbols_db.get(&rtxn, canonical_key)? {
             Some(bytes) => deserialize_refs(bytes)?,
@@ -713,26 +721,27 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
         let Some(env) = self.open_scip_env(db_path).ok() else {
             return Vec::new();
         };
-        let Ok(rtxn) = env.read_txn() else {
-            return Vec::new();
-        };
+        // Open the named DB before the read txn (the open commits its own).
         let raw = match open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME) {
-            Ok(Some(meta)) => match meta.get(&rtxn, META_INDEX_WARNINGS) {
-                Ok(Some(raw)) => raw,
-                _ => return Vec::new(),
-            },
+            Ok(Some(meta)) => {
+                let Ok(rtxn) = env.read_txn() else {
+                    return Vec::new();
+                };
+                match meta.get(&rtxn, META_INDEX_WARNINGS) {
+                    // Owned: the txn ends with this arm, the value must not
+                    // borrow from it.
+                    Ok(Some(raw)) => raw.to_string(),
+                    _ => return Vec::new(),
+                }
+            }
             _ => return Vec::new(),
         };
-        serde_json::from_str(raw).unwrap_or_default()
+        serde_json::from_str(&raw).unwrap_or_default()
     }
 
     fn index_age(&self, db_path: &Path) -> u64 {
         let env = match self.open_scip_env(db_path) {
             Ok(e) => e,
-            Err(_) => return u64::MAX,
-        };
-        let rtxn = match env.read_txn() {
-            Ok(t) => t,
             Err(_) => return u64::MAX,
         };
 
@@ -741,6 +750,11 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
                 Ok(Some(db)) => db,
                 _ => return u64::MAX,
             };
+        // Open the named DB before the read txn (the open commits its own).
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return u64::MAX,
+        };
 
         let ts_str: &str = match meta_db.get(&rtxn, META_REBUILD_TS) {
             Ok(Some(s)) => s,
@@ -762,11 +776,12 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
 
     fn index_head_sha(&self, db_path: &Path) -> Option<String> {
         let env = self.open_scip_env(db_path).ok()?;
-        let rtxn = env.read_txn().ok()?;
+        // Open the named DB before the read txn (the open commits its own).
         let meta_db: Database<'static, Str, Str> =
             open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
                 .ok()
                 .flatten()?;
+        let rtxn = env.read_txn().ok()?;
         let sha = meta_db.get(&rtxn, META_HEAD_SHA).ok().flatten()?;
         let sha = sha.trim().to_string();
         (!sha.is_empty()).then_some(sha)
@@ -821,6 +836,67 @@ mod tests {
         let mut bytes = vec![KEYS_LIST_SCHEMA_VERSION];
         bytes.extend_from_slice(&GOLDEN);
         assert_eq!(deserialize_keys_v1(&bytes).unwrap(), keys);
+    }
+
+    /// Pins the read-txn ordering every symbol adapter needs under heed 0.23:
+    /// `open_named_db` commits its own txn (persisting the DBI handle), so a
+    /// read txn started BEFORE the open does not know the handle and fails
+    /// with EINVAL (os error 22) — the `readonly_reopen` landmine, symbol
+    /// side. `get_shared_scip_env`'s init normally masks this by pre-opening
+    /// every named DB; this test reopens the env WITHOUT init (the DBs are
+    /// already on disk) so each adapter's own ordering is load-bearing.
+    #[test]
+    fn symbol_query_opens_named_dbs_before_read_txn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path();
+
+        // First open runs init: all six named DBs exist on disk afterwards.
+        let env1 = crate::symbols::get_shared_scip_env(db_path).unwrap();
+        drop(env1);
+        let closed = crate::lmdb_registry::close_shared_envs_under(db_path);
+        assert_eq!(closed.len(), 1, "the scip env must leave the shared cache");
+
+        // Reopen WITHOUT init — production adapters must open every named DB
+        // themselves before their first read txn.
+        let env2 = crate::lmdb_registry::get_or_open_shared_env(
+            &db_path.join("scip"),
+            "SCIP(ordering-pin)",
+            |opts| {
+                let map_size_mb = std::env::var(crate::constants::SCIP_LMDB_MAP_SIZE_MB_ENV)
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(crate::constants::SCIP_LMDB_DEFAULT_MAP_SIZE_MB);
+                opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
+                // SAFETY: `NO_TLS` only changes reader-slot tracking. See `BASE_ENV_FLAGS`.
+                unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        // TypeScript: ExactKey resolves through symbols_db (rtxn AFTER the open).
+        let ts = TypeScriptSymbolIndexer::new();
+        let m = ts
+            .resolve_query(
+                db_path,
+                &ImpactQuery::ExactKey("definitely-not-a-key".into()),
+            )
+            .unwrap();
+        assert_eq!(m, KeyMatch::NotFound);
+
+        // C#: same query shape through its own adapter.
+        let cs = crate::symbols::csharp::CSharpSymbolIndexer::new();
+        let m = cs
+            .resolve_query(
+                db_path,
+                &ImpactQuery::ExactKey("definitely-not-a-key".into()),
+            )
+            .unwrap();
+        assert_eq!(m, KeyMatch::NotFound);
+
+        drop(env2);
+        crate::lmdb_registry::close_shared_envs_under(db_path);
+        // tmp cleans up only once no open LMDB env remains under it.
     }
 
     #[test]
