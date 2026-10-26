@@ -1276,6 +1276,9 @@ impl CodesearchService {
         }
 
         if let Some(ref group_name) = group {
+            // Backfill missing git identities before expansion reads them, so
+            // repos registered before the field existed still expand once.
+            serve_state.backfill_group_identities(group_name).await;
             let aliases = serve_state.resolve_group_aliases(group_name)?;
             if aliases.is_empty() {
                 return Err(format!("Group '{}' has no members.", group_name));
@@ -1378,31 +1381,44 @@ impl CodesearchService {
     /// Build a structured `scope_required` error JSON for multi-repo mode.
     ///
     /// Returns a JSON string containing `error_code`, `message`, `available_projects`,
-    /// `available_groups`, `project_groups`, and `hint_for_agent` so that LLM
-    /// agents can programmatically react to the scope requirement. `project_groups`
-    /// maps each project to the named group(s) it belongs to, so an agent can tell
-    /// that picking a single project would miss sibling repos in the same group
-    /// (e.g. a separate config / import-data repo).
-    fn format_scope_error(&self) -> String {
-        let (projects, mut groups, project_groups) = if let Some(ref serve_state) = self.serve_state
-        {
-            let cfg = serve_state.config_snapshot();
-            let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
-            // Include opt-in mounted remote projects so an agent can discover and
-            // route to them by name (they are first-class `project=` targets).
-            projects.extend(
-                cfg.mounted_remote_projects()
-                    .into_iter()
-                    .map(|(name, _)| name),
-            );
-            projects.sort();
-            projects.dedup();
-            let mut groups: Vec<String> = cfg.groups.keys().cloned().collect();
-            groups.sort();
-            (projects, groups, cfg.project_groups())
-        } else {
-            (vec![], vec![], std::collections::HashMap::new())
-        };
+    /// `available_groups`, `project_groups`, `worktree_families`, and `hint_for_agent`
+    /// so that LLM agents can programmatically react to the scope requirement.
+    /// `project_groups` maps each project to the named group(s) it belongs to, so an
+    /// agent can tell that picking a single project would miss sibling repos in the
+    /// same group (e.g. a separate config / import-data repo). `worktree_families`
+    /// maps each worktree alias to its family's main-tree alias — searching a
+    /// worktree alias means the main tree (and its siblings) answer through the
+    /// same identity, and a group over the family collapses duplicate hits.
+    pub(crate) fn format_scope_error(&self) -> String {
+        let (projects, mut groups, project_groups, worktree_families) =
+            if let Some(ref serve_state) = self.serve_state {
+                let cfg = serve_state.config_snapshot();
+                let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
+                // Include opt-in mounted remote projects so an agent can discover and
+                // route to them by name (they are first-class `project=` targets).
+                projects.extend(
+                    cfg.mounted_remote_projects()
+                        .into_iter()
+                        .map(|(name, _)| name),
+                );
+                projects.sort();
+                projects.dedup();
+                let mut groups: Vec<String> = cfg.groups.keys().cloned().collect();
+                groups.sort();
+                (
+                    projects,
+                    groups,
+                    cfg.project_groups(),
+                    cfg.worktree_family_map(),
+                )
+            } else {
+                (
+                    vec![],
+                    vec![],
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                )
+            };
         // The "all" virtual group is always available when there are projects to
         // search — advertise it so agents discover the cross-repo shortcut.
         // (scope_required only fires when >1 repo is registered, so this is safe.)
@@ -1418,7 +1434,8 @@ impl CodesearchService {
             "available_projects": projects,
             "available_groups": groups,
             "project_groups": project_groups,
-            "hint_for_agent": "If the user has not indicated which repository to search, ask them to choose. Show available_projects and available_groups as options. IMPORTANT: project_groups maps each project to the group(s) it belongs to — if the project you would pick is listed there, prefer group= over project= so related repos (e.g. a separate config or import-data repo) are searched too."
+            "worktree_families": worktree_families,
+            "hint_for_agent": "If the user has not indicated which repository to search, ask them to choose. Show available_projects and available_groups as options. IMPORTANT: project_groups maps each project to the group(s) it belongs to — if the project you would pick is listed there, prefer group= over project= so related repos (e.g. a separate config or import-data repo) are searched too. worktree_families maps each worktree alias to its main-tree alias — a group= search over that main tree already covers the worktrees (duplicate hits collapse), so prefer the main alias or group=."
         });
         payload.to_string()
     }

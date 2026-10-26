@@ -85,6 +85,11 @@ pub struct RepoRow {
     /// "Xh ago". Always `false` for local repos (which carry live serve state)
     /// and for the standalone remote dashboard.
     pub activity_stale: bool,
+    /// Worktree-family annotation rendered as a dim suffix on the alias:
+    /// `"+ N worktrees"` on a family's main-tree row, `"worktree of <main>"`
+    /// on a worktree row. Display-only — actions and identity use `alias`.
+    /// `None` on remote rows and familyless repos.
+    pub family_note: Option<String>,
 }
 
 /// Actions returned by key handling.
@@ -531,9 +536,11 @@ pub fn render_table(
         .map(|r| {
             // Each indicator is a suffix like " C#·"; ⚠ (the partial glyph)
             // is double-width (unicode-width EAW=W) so its variant budgets
-            // 6 display cols instead of 4.
+            // 6 display cols instead of 4. The family note is a plain-ASCII
+            // dim suffix and budgets its own width.
             let extra = indicator_cols(&r.csharp_index) + indicator_cols(&r.typescript_index);
-            r.alias.len() + extra
+            let note = r.family_note.as_deref().map(|n| n.len() + 1).unwrap_or(0);
+            r.alias.len() + extra + note
         })
         .max()
         .unwrap_or(10)
@@ -581,6 +588,15 @@ pub fn render_table(
             };
             let mut alias_spans: Vec<Span> =
                 vec![Span::styled(repo.alias.clone(), base_alias_style)];
+
+            // Family note: dim, after the alias, before the language
+            // indicators — grouped rendering only, never interactive.
+            if let Some(note) = repo.family_note.as_deref() {
+                alias_spans.push(Span::styled(
+                    format!(" {note}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
 
             if let Some((glyph, style)) =
                 csharp_indicator(repo.csharp_index.as_str(), pulse_bright())

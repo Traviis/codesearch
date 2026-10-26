@@ -2423,6 +2423,64 @@ fn resolve_group_aliases_all_returns_every_repo() {
     assert!(state.resolve_group_aliases("does-not-exist").is_err());
 }
 
+/// Group resolution through the serve layer must expand to every registered
+/// repo sharing a member's git identity, and a `groups_meta` opt-out must
+/// keep the group exact (card #261 TODO 2).
+#[test]
+fn resolve_group_aliases_expands_worktrees_and_honors_opt_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    let wt = tmp.path().join("wt");
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&main).unwrap();
+    std::fs::create_dir(&wt).unwrap();
+    std::fs::create_dir(&other).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(main, Some("main".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(wt, Some("wt".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(other, Some("other".to_string()))
+        .unwrap();
+    let identity = format!("{}/.git", tmp.path().join("main").display());
+    config
+        .repos_meta
+        .entry("main".to_string())
+        .or_default()
+        .git_common_dir = Some(identity.clone());
+    config
+        .repos_meta
+        .entry("wt".to_string())
+        .or_default()
+        .git_common_dir = Some(identity);
+    config
+        .add_group("g".to_string(), vec!["main".to_string()])
+        .unwrap();
+
+    let state = state_with_config(config.clone());
+    let aliases = state.resolve_group_aliases("g").expect("group resolves");
+    assert_eq!(
+        aliases,
+        vec!["main".to_string(), "wt".to_string()],
+        "serve-side resolution must expand to the family, sorted extras last"
+    );
+
+    // Opt-out: the group resolves to exactly its member again.
+    config.groups_meta.insert(
+        "g".to_string(),
+        crate::db_discovery::repos::GroupMeta {
+            expand_worktrees: false,
+        },
+    );
+    let state = state_with_config(config);
+    let aliases = state.resolve_group_aliases("g").expect("group resolves");
+    assert_eq!(aliases, vec!["main".to_string()]);
+}
+
 /// Tests for `build_streamable_http_config` — DNS rebinding defence env vars
 /// (`CODESEARCH_ALLOWED_HOSTS`, `CODESEARCH_DISABLE_HOST_VALIDATION`) added
 /// for issue #149 / GHSA-89vp-x53w-74fx.
@@ -6767,4 +6825,193 @@ async fn finish_force_reindex_starts_fsw_and_keeps_guard_contract() {
         "the tail must not release the reindex guard — callers own that"
     );
     state.end_indexing("repo", IndexingOwner::Reindex);
+}
+
+#[tokio::test]
+#[serial]
+async fn backfill_group_identities_fills_missing_and_persists() {
+    // The git-serialization lock must be dropped before the first .await
+    // (clippy await_holding_lock): scope it around the synchronous git setup.
+    // `tmp` lives for the whole test — the backfill's git spawns need the
+    // repo paths to still exist.
+    let tmp = tempfile::tempdir().unwrap();
+    let (main_alias, wt_alias, config, config_file) = {
+        let _serial = crate::db_discovery::repos::test_support::git_serial_lock();
+        // Main tree + linked worktree: two registered repos sharing one
+        // identity, so the backfill has something real to compute via git.
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
+        let wt = tmp.path().join("wt");
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+
+        let mut config = ReposConfig::default();
+        let main_alias = config.register(main.clone());
+        let wt_alias = config.register(wt.clone());
+        config
+            .add_group(
+                "fam".to_string(),
+                vec![main_alias.clone(), wt_alias.clone()],
+            )
+            .unwrap();
+        // Simulate pre-existing entries registered before the field existed.
+        config
+            .repos_meta
+            .get_mut(&main_alias)
+            .unwrap()
+            .git_common_dir = None;
+        config.repos_meta.get_mut(&wt_alias).unwrap().git_common_dir = None;
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+        (main_alias, wt_alias, config, config_file)
+    };
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    state.backfill_group_identities("fam").await;
+
+    let snap = state.config_snapshot();
+    let main_identity = snap.meta(&main_alias).git_common_dir.clone();
+    assert!(
+        main_identity.is_some(),
+        "backfill must fill the missing identity"
+    );
+    assert_eq!(
+        main_identity,
+        snap.meta(&wt_alias).git_common_dir.clone(),
+        "backfilled identities must agree across the family"
+    );
+    // Persisted: a fresh load from disk sees the identity, so a later
+    // deletion of the main tree cannot lose it.
+    let reloaded = ReposConfig::load_from(&config_file).unwrap();
+    assert_eq!(
+        reloaded.meta(&main_alias).git_common_dir,
+        main_identity,
+        "backfilled identity must be persisted to repos.json"
+    );
+}
+
+// === worktree-family surfaces (card #261 TODO 4) ===
+
+/// Family config for the surface tests: two registered aliases sharing one
+/// hand-set git identity, saved to a temp repos.json wired to the state.
+/// Two-repo worktree family on a tempdir: `m` (main tree, identity
+/// `<tmp>/m/.git`) + `m-wt` sharing it, config saved to `<tmp>/repos.json`.
+/// Shared by the status/scope tests here and the TUI row tests. The
+/// returned TempDir must outlive every use of the state.
+pub(crate) fn family_state() -> (
+    tempfile::TempDir,
+    String,
+    String,
+    std::sync::Arc<ServeState>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = ReposConfig::default();
+    let main_path = tmp.path().join("m");
+    let wt_path = tmp.path().join("m-wt");
+    let main = config.register(main_path.clone());
+    let wt = config.register(wt_path.clone());
+    let identity = format!("{}/.git", main_path.display());
+    config
+        .repos_meta
+        .entry(main.clone())
+        .or_default()
+        .git_common_dir = Some(identity.clone());
+    config
+        .repos_meta
+        .entry(wt.clone())
+        .or_default()
+        .git_common_dir = Some(identity);
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    (tmp, main, wt, state)
+}
+
+#[tokio::test]
+async fn status_annotates_worktree_of_from_family_identity() {
+    let (_tmp, main, wt, state) = family_state();
+    let info = |status| RepoStatusInfo {
+        status,
+        changes: 0,
+        last_tool_call: None,
+        tool_call_count: 0,
+        csharp_index: CSharpIndexStatus::None,
+        csharp_error: None,
+        typescript_index: CSharpIndexStatus::None,
+    };
+    state
+        .status_snapshot
+        .store(status_snapshot::StatusSnapshot {
+            repos: vec![
+                (main.clone(), info(RepoStateLabel::Warm)),
+                (wt.clone(), info(RepoStateLabel::Warm)),
+            ],
+            projects: Vec::new(),
+            projects_warnings: Vec::new(),
+            active_sessions: 0,
+            cpu_percent: "0%".to_string(),
+            csharp_helper: false,
+            ts_helper: false,
+            generated_at: std::time::Instant::now(),
+        });
+
+    let resp = status_handler(axum::extract::State(state)).await;
+    let json = resp.0;
+    let repos = json["repos"].as_array().expect("repos array");
+    let wt_entry = repos
+        .iter()
+        .find(|r| r["alias"] == wt.as_str())
+        .expect("wt entry");
+    assert_eq!(wt_entry["worktree_of"], main.as_str(), "json: {json}");
+    let main_entry = repos
+        .iter()
+        .find(|r| r["alias"] == main.as_str())
+        .expect("main entry");
+    assert!(
+        main_entry.get("worktree_of").is_none(),
+        "main trees carry no worktree_of: {json}"
+    );
+}
+
+#[tokio::test]
+async fn scope_error_lists_worktree_families_and_clean_projects() {
+    let (_tmp, main, wt, state) = family_state();
+    let service = crate::mcp::CodesearchService::new_for_serve(state).expect("service");
+    let payload: serde_json::Value =
+        serde_json::from_str(&service.format_scope_error()).expect("scope payload");
+
+    assert_eq!(
+        payload["worktree_families"][wt.as_str()],
+        main.as_str(),
+        "payload: {payload}"
+    );
+    assert!(
+        payload["worktree_families"].get(main.as_str()).is_none(),
+        "main trees are not in the families map: {payload}"
+    );
+    let projects: Vec<&str> = payload["available_projects"]
+        .as_array()
+        .expect("projects array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        projects.contains(&main.as_str()) && projects.contains(&wt.as_str()),
+        "available_projects stay clean aliases: {projects:?}"
+    );
+    assert!(
+        !payload.to_string().contains("(worktree of"),
+        "machine-readable payload must stay flat: {payload}"
+    );
 }
