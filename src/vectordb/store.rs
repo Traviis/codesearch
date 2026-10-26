@@ -895,6 +895,8 @@ impl VectorStore {
                     score: 1.0 - distance, // Convert distance to similarity score
                     context_prev: metadata.context_prev,
                     context_next: metadata.context_next,
+                    origin: None,
+                    also_in: Vec::new(),
                 });
             }
         }
@@ -1388,6 +1390,8 @@ impl VectorStore {
                 score: 0.0, // Will be set by caller
                 context_prev: meta.context_prev,
                 context_next: meta.context_next,
+                origin: None,
+                also_in: Vec::new(),
             }))
         } else {
             Ok(None)
@@ -1428,6 +1432,13 @@ pub struct SearchResult {
     pub context_prev: Option<String>,
     /// Lines of code immediately after this chunk (for context)
     pub context_next: Option<String>,
+    /// Origin alias this result came from in a multi-repo fan-out (`None`
+    /// on single-store paths). Mapped to `source` on the MCP result item.
+    pub origin: Option<String>,
+    /// Aliases of OTHER family members (worktrees of the same clone) whose
+    /// identical copy of this chunk (same relative path + content hash) was
+    /// collapsed into this hit.
+    pub also_in: Vec<String>,
 }
 
 /// Statistics about the vector store
