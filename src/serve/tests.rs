@@ -4563,12 +4563,7 @@ fn build_info_overlay_reads_symbol_warnings_from_meta() {
     wtxn.commit().unwrap();
 
     let state = std::sync::Arc::new(bare);
-    let statuses = state.repo_statuses_lightweight();
-    let idx = statuses
-        .iter()
-        .position(|(alias, _)| alias == "inforepo")
-        .expect("inforepo row");
-    let overlay = build_info_overlay(idx, &statuses, &state).expect("overlay");
+    let overlay = build_info_overlay("inforepo", &state).expect("overlay");
     match overlay {
         crate::serve::tui_common::OverlayState::Info {
             symbol_warnings, ..
@@ -4979,7 +4974,7 @@ fn render_table_caps_long_alias_and_keeps_columns_on_narrow_terminal() {
         is_remote: false,
         activity_stale: false,
         family_note: note,
-        worktree_indent: indent,
+        indent,
     };
     let repos = vec![
         row(long_alias, Some("+ 1 worktree".to_string()), false),
