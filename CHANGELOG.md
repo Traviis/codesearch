@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.1] - 2026-10-27
+
+### Fixed
+
+- **Shell grep through the Bash tool no longer bypasses the codesearch-first guards.** Both guard surfaces only watched the native Grep/Glob tools, so a raw `grep`/`rg` in a shell command ran the exact workload the guards exist to reroute (reported live: `grep | head -200 --include="*.cs"` between codesearch calls). The opencode plugin now denies bash-tool commands invoking `grep`/`egrep`/`fgrep`/`zgrep`/`rg` on covered, live repos in every guard mode except `off` (`guards.bash: false` or `CODESEARCH_PLUGIN_BASH_GUARD=0` to opt out) and appends the one-per-session tip when a shell grep slips through while the hub is down; the Claude Code grep-guard hook fires on the Bash tool via the same detector (`Grep` matcher widened to `Grep|Bash`, and re-running the installer upgrades an existing settings.json entry in place). The detector strips quoted spans and compares whole tokens (`echo "grep"`, `progress`, `rgx` pass; pipes, `git grep`, `/usr/bin/grep.exe`, `$()` and backtick substitution deny). Also fixes a latent plugin leak where `resolveSettings` mutated the shared `DEFAULTS` object, so one session's env overrides leaked into every later session in the same process.
+
 ## [1.7.0] - 2026-10-26
 
 ### Added
@@ -25,8 +31,6 @@ finalized in place with a date — no renaming/migration step needed.
 - **OpenCode plugin: syntax-shaped queries are routed to ast-grep tools, but only when the host exposes them.** codesearch matches text, not code structure, so the injected guidance now adds one routing line (and the block-mode denial one alternative line) pointing at ast-grep tools such as `ast_grep_search`/`ast_grep_edit` — gated per request on the assembled tool map, so environments without an ast-grep integration see unchanged guidance and no one is pointed at tools they do not have. Unit and smoke coverage pin both the mention and its absence.
 
 ### Fixed
-
-- **Shell grep through the Bash tool no longer bypasses the codesearch-first guards.** Both guard surfaces only watched the native Grep/Glob tools, so a raw `grep`/`rg` in a shell command ran the exact workload the guards exist to reroute (reported live: `grep | head -200 --include="*.cs"` between codesearch calls). The opencode plugin now denies bash-tool commands invoking `grep`/`egrep`/`fgrep`/`zgrep`/`rg` on covered, live repos in every guard mode except `off` (`guards.bash: false` or `CODESEARCH_PLUGIN_BASH_GUARD=0` to opt out) and appends the one-per-session tip when a shell grep slips through while the hub is down; the Claude Code grep-guard hook fires on the Bash tool via the same detector (`Grep` matcher widened to `Grep|Bash`, and re-running the installer upgrades an existing settings.json entry in place). The detector strips quoted spans and compares whole tokens (`echo "grep"`, `progress`, `rgx` pass; pipes, `git grep`, `/usr/bin/grep.exe`, `$()` and backtick substitution deny). Also fixes a latent plugin leak where `resolveSettings` mutated the shared `DEFAULTS` object, so one session's env overrides leaked into every later session in the same process.
 
 - **Read-only vector stores open again after the heed 0.23 bump.** The bump's database-open shims commit their own read transaction per named database (heed 0.23 requires that commit to persist the dbi handles env-globally), but `VectorStore::open_readonly` still opened its data-read transaction BEFORE those commits — a transaction started earlier does not know the handles, so the first data read failed with a bare EINVAL (os error 22). Every `repo_read_only` repo (the whole remote DOCS corpus on the serve replica) failed to open since the bump; the write path already ordered its creates before its bootstrap transaction. The `readonly_reopen` regression test pins the ordering and is green again — it has been the one red test in CI since the bump landed.
 
