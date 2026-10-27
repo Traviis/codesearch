@@ -360,6 +360,54 @@ async function main(): Promise<void> {
   await one.app.toolHooks["execute.after"][0](nudgeAgain)
   assert.doesNotMatch(String(nudgeAgain.result.output), /tip:/, "the nudge fires once per session")
 
+  // Bash escape hatch: raw shell grep is denied in every mode except "off" —
+  // even nudge — on a covered, live repo. Poll for the startup probe first.
+  const bashBefore = one.app.toolHooks["execute.before"][0]
+  let bashThrew = ""
+  for (let i = 0; i < 30 && !bashThrew; i++) {
+    try {
+      await bashBefore({ tool: "bash", input: { command: 'grep -rn "new Uri" --include="*.cs" .' }, sessionID: "s1" })
+    } catch (err) {
+      bashThrew = String(err)
+    }
+    if (!bashThrew) await new Promise((r) => setTimeout(r, 100))
+  }
+  assert.match(bashThrew, /codesearch/, "bash grep is denied in nudge mode on a covered repo")
+  assert.match(bashThrew, /shell grep is blocked/, "bash denial names the escape hatch")
+  assert.match(bashThrew, /project "my-service"/, "bash denial names the project scope to use")
+  await bashBefore({ tool: "bash", input: { command: "cargo build --release" }, sessionID: "s1" })
+  await bashBefore({ tool: "read", input: { path: "x.ts" }, sessionID: "s1" })
+
+  // Kill switch: CODESEARCH_PLUGIN_BASH_GUARD=0 re-allows shell grep and the tip.
+  // Ordering matters: without resolveSettings' structuredClone(DEFAULTS), the
+  // env=0 mutation below poisons the shared DEFAULTS.guards for every LATER
+  // plugin in this process — so this section must stay BEFORE the hub-down
+  // section, whose nudge assertion is the canary that fails if the leak
+  // regresses (see maybeNudgeBashGrep's guards.bash gate).
+  process.env.CODESEARCH_PLUGIN_BASH_GUARD = "0"
+  const bashOff = await setupPlugin("/work/my-service")
+  await bashOff.app.toolHooks["execute.before"][0]({ tool: "bash", input: { command: "grep -rn x ." }, sessionID: "sb1" })
+  const bashOffAfter: Loose = {
+    tool: "bash",
+    status: "completed",
+    sessionID: "sb1",
+    callID: "b1",
+    input: { command: "grep -rn x ." },
+    result: { output: "match" },
+  }
+  await bashOff.app.toolHooks["execute.after"][0](bashOffAfter)
+  assert.doesNotMatch(String(bashOffAfter.result.output), /tip:/, "kill switch disables the bash nudge too")
+  await bashOff.cleanup()
+  delete process.env.CODESEARCH_PLUGIN_BASH_GUARD
+
+  // guards.mode "off" registers no tool hooks at all — bash denial included.
+  process.env.CODESEARCH_PLUGIN_GUARDS = "off"
+  const guardsOff = await setupPlugin("/work/my-service")
+  assert.equal(guardsOff.app.toolHooks["execute.before"], undefined, "mode off registers no execute.before hook")
+  assert.equal(guardsOff.app.toolHooks["execute.after"], undefined, "mode off registers no execute.after hook")
+  await guardsOff.cleanup()
+  delete process.env.CODESEARCH_PLUGIN_GUARDS
+
   // Compaction assist: recently edited files become explore outlines, and the
   // target sent to the server must be project-relative. Regression guard: an
   // alias-prefix strip left absolute targets that could never match on
@@ -476,6 +524,24 @@ async function main(): Promise<void> {
     downEvent.system.map((p: Loose) => p.text).join("\n"),
     /unreachable|acceptable fallback/,
     "guidance names the grep/glob fallback while the hub is down",
+  )
+
+  // Bash escape hatch fails open while the hub is down, and the slip-through
+  // shell grep still gets the one-time tip on execute.after.
+  const downBash: Loose = {
+    tool: "bash",
+    status: "completed",
+    sessionID: "s5b",
+    callID: "db1",
+    input: { command: "grep -rn TODO ." },
+    result: { output: "src/x.ts:1: TODO" },
+  }
+  await downPrune.app.toolHooks["execute.before"][0](downBash)
+  await downPrune.app.toolHooks["execute.after"][0](downBash)
+  assert.match(
+    String(downBash.result.output),
+    /tip: raw shell grep/,
+    "bash grep that slipped through while the hub was down is nudged",
   )
   await downPrune.cleanup()
   process.env.CODESEARCH_URL = mock.url

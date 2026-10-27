@@ -115,6 +115,7 @@ interface CodeSearchSettings {
   guards: {
     mode: GuardMode
     tools: string[]
+    bash: boolean
     rescue: boolean
     rescueLimit: number
     rescueTimeoutMs: number
@@ -186,6 +187,7 @@ const DEFAULTS: CodeSearchSettings = {
   guards: {
     mode: "nudge",
     tools: ["grep", "glob"],
+    bash: true,
     rescue: true,
     rescueLimit: 5,
     rescueTimeoutMs: 3000,
@@ -504,7 +506,10 @@ function readMcpEntry(serverName: string): { url: string; authorization: string 
 }
 
 function resolveSettings(ctx: PluginContext): CodeSearchSettings {
-  let settings = mergeDeep(DEFAULTS, ctx.options ?? {})
+  // Deep-clone DEFAULTS: mergeDeep copies the top level only, so a later
+  // `settings.guards.mode = ...` env override would mutate DEFAULTS and leak
+  // into every other resolveSettings call in the same process.
+  let settings = mergeDeep(structuredClone(DEFAULTS), ctx.options ?? {})
 
   const configPath =
     process.env.CODESEARCH_CONFIG || `${configDir()}/opencode/codesearch.json`
@@ -519,6 +524,7 @@ function resolveSettings(ctx: PluginContext): CodeSearchSettings {
   settings.debug = bool(env.CODESEARCH_PLUGIN_DEBUG, settings.debug)
 
   if (env.CODESEARCH_PLUGIN_GUARDS) settings.guards.mode = env.CODESEARCH_PLUGIN_GUARDS as GuardMode
+  if (env.CODESEARCH_PLUGIN_BASH_GUARD) settings.guards.bash = bool(env.CODESEARCH_PLUGIN_BASH_GUARD, settings.guards.bash)
   if (env.CODESEARCH_PLUGIN_SCOPE) settings.scope.inject = env.CODESEARCH_PLUGIN_SCOPE as CodeSearchSettings["scope"]["inject"]
   if (env.CODESEARCH_PLUGIN_RESCUE) settings.guards.rescue = bool(env.CODESEARCH_PLUGIN_RESCUE, settings.guards.rescue)
   if (env.CODESEARCH_PLUGIN_RECALL) settings.recall.enabled = bool(env.CODESEARCH_PLUGIN_RECALL, settings.recall.enabled)
@@ -1102,6 +1108,30 @@ export class HealthRunner {
  * Guard helpers
  * ------------------------------------------------------------------ */
 
+/** grep-family commands a bash tool call can smuggle past the native-tool guards. */
+const BASH_GREP_WORDS = new Set(["grep", "egrep", "fgrep", "zgrep", "rg"])
+
+function bashToolCommand(event: Loose): string {
+  const input = isPlainObject(event?.input) ? event.input : undefined
+  return typeof input?.command === "string" ? input.command : ""
+}
+
+/**
+ * True when the command line invokes grep/egrep/fgrep/zgrep/rg. Quoted strings
+ * are stripped first, so `echo "grep is slow"` is not an invocation; tokens are
+ * compared whole (with `.exe` and path prefixes removed), so `progress` or
+ * `rgx` never match.
+ */
+export function bashCommandGrep(command: string): boolean {
+  const bare = String(command ?? "").replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, " ")
+  for (const raw of bare.split(/[\s;&|()`]+/)) {
+    if (!raw) continue
+    const word = raw.replace(/\.exe$/i, "").split(/[\\/]/).pop() ?? ""
+    if (BASH_GREP_WORDS.has(word.toLowerCase())) return true
+  }
+  return false
+}
+
 function resultOfToolEvent(event: Loose): { output?: string; metadata?: Loose } {
   const result = isPlainObject(event?.result) ? event.result : undefined
   if (!result) return {}
@@ -1494,17 +1524,42 @@ export default {
       return lines.join("\n")
     }
 
+    function bashBlockMessage(scope: ScopeInfo, command: string): string {
+      return (
+        `codesearch: shell grep is blocked here — this repository is indexed as project "${scope.project}".\n` +
+        `Raw grep through the shell tool bypasses the grep/glob guards. Command: ${truncate(command.trim(), 120)}\n` +
+        `Use the codesearch MCP tools instead:\n` +
+        `  - search { project: "${scope.project}", query: "<concept>" }   (add mode: "literal", regex: true for exact syntax)\n` +
+        `  - find { project: "${scope.project}", symbol: "<name>", kind: "definition" | "usages" | "imports" | "dependents" }\n` +
+        `  - get_chunk { project: "${scope.project}", chunk_id: <id> }\n` +
+        `If codesearch is genuinely unavailable, set "guards": { "bash": false } in ~/.config/opencode/codesearch.json (or CODESEARCH_PLUGIN_BASH_GUARD=0) and retry.`
+      )
+    }
+
     async function onToolBefore(event: Loose): Promise<void> {
       let blocked: Error | null = null
       try {
-        if (settings.guards.mode !== "block") return
+        if (settings.guards.mode === "off") return
         const tool = String(event?.tool ?? "").toLowerCase()
-        if (!settings.guards.tools.includes(tool)) return
-        const alias = coveredAlias()
-        if (!alias) return
-        if (health.state !== "ok") return // fail open unless the hub is confirmed up
-        const astGrep = astGrepBySession.get(String(event?.sessionID ?? "")) ?? []
-        blocked = new Error(blockMessage(tool, resolveScope(), astGrep))
+        if (tool === "bash" || tool === "shell") {
+          // Shell grep is the escape hatch around the native grep/glob guards:
+          // denied in every mode except "off", because a shell grep is exactly
+          // the workaround the guards exist to stop. Kill switch: guards.bash=false.
+          if (!settings.guards.bash) return
+          const command = bashToolCommand(event)
+          if (!bashCommandGrep(command)) return
+          if (!coveredAlias()) return
+          if (health.state !== "ok") return // fail open unless the hub is confirmed up
+          blocked = new Error(bashBlockMessage(resolveScope(), command))
+        } else {
+          if (settings.guards.mode !== "block") return
+          if (!settings.guards.tools.includes(tool)) return
+          const alias = coveredAlias()
+          if (!alias) return
+          if (health.state !== "ok") return // fail open unless the hub is confirmed up
+          const astGrep = astGrepBySession.get(String(event?.sessionID ?? "")) ?? []
+          blocked = new Error(blockMessage(tool, resolveScope(), astGrep))
+        }
       } catch (err) {
         if (settings.debug) warn(`execute.before error: ${err instanceof Error ? err.message : err}`)
       }
@@ -1515,11 +1570,15 @@ export default {
       try {
         if (event?.status && event.status !== "completed") return
         const tool = String(event?.tool ?? "").toLowerCase()
+        const result = isPlainObject(event?.result) ? event.result : undefined
+        if (!result) return
+        if (tool === "bash" || tool === "shell") {
+          maybeNudgeBashGrep(event, result)
+          return
+        }
         if (!settings.guards.tools.includes(tool)) return
         const scope = resolveScope()
         if (!scope.project) return
-        const result = isPlainObject(event?.result) ? event.result : undefined
-        if (!result) return
 
         if (looksEmptyResult(event)) {
           await rescueEmptyResult(event, result, scope)
@@ -1529,6 +1588,23 @@ export default {
       } catch (err) {
         if (settings.debug) warn(`execute.after error: ${err instanceof Error ? err.message : err}`)
       }
+    }
+
+    /** A shell grep that ran anyway (hub down at before-time) still gets the one-time tip. */
+    function maybeNudgeBashGrep(event: Loose, result: Loose): void {
+      if (settings.guards.mode === "off") return
+      if (!settings.guards.bash) return
+      if (!bashCommandGrep(bashToolCommand(event))) return
+      const scope = resolveScope()
+      if (!scope.project) return
+      const sessionID = String(event?.sessionID ?? "unknown")
+      if (!markSeen(nudged, sessionID)) return
+      const existing = typeof result.output === "string" ? result.output : ""
+      result.output =
+        existing +
+        `\n[codesearch] tip: raw shell grep bypasses the codesearch guards — this repository is indexed as project "${scope.project}". ` +
+        `Prefer search (mode: "literal" for exact syntax) or find/get_chunk.`
+      logGuard(`nudged session ${sessionID} after shell grep (bash tool)`)
     }
 
     async function rescueEmptyResult(event: Loose, result: Loose, scope: ScopeInfo): Promise<void> {
