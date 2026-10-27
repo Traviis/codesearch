@@ -738,6 +738,98 @@ async fn group_lexical_search_attributes_each_hit_to_its_repo() {
     assert!(paths.contains(&"beta/src/util.rs"), "paths: {paths:?}");
 }
 
+#[tokio::test]
+async fn literal_regex_zero_bm25_hits_falls_back_to_raw_scan() {
+    use rmcp::model::ContentBlock;
+
+    // A separator-spanning regex (`ref:classification\s+search=`) has
+    // anchorable tokens, so the scan path is NOT chosen up front — the BM25
+    // path runs first: extract_bm25_query_from_regex cleans the pattern into
+    // tokens (ref classification search) and the AND query matches the chunk
+    // (which carries all three tokens but not the pattern). The raw-regex
+    // post-filter then drops it, leaving zero items — the fallback must scan
+    // raw chunk content (finding nothing here, because the pattern genuinely
+    // does not exist), and mark the response scan_fallback so the caller
+    // knows the empty result came from a token-regex miss, not a text miss.
+    // Scan recovery of a real hit is pinned CLI-side
+    // (regex_spanning_separators_falls_back_to_raw_scan).
+    let root = tempfile::tempdir().expect("tempdir");
+    let stores = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root.path().join(".codesearch.db"), 2).expect("stores"),
+    );
+    {
+        let mut vs = stores.vector_store.write().await;
+        let chunk_b = crate::chunker::Chunk::new(
+            "<ref:record search=\"x\" /> next to a classification marker".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Block,
+            "rules/other.xml".to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk_b,
+            vec![1.0, 0.0],
+        )])
+        .expect("insert chunks");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(
+            0,
+            "<ref:record search=\"x\" /> next to a classification marker",
+            "rules/other.xml",
+            None,
+            "Block",
+        )
+        .expect("fts doc b");
+        fts.commit().expect("commit");
+    }
+
+    let service = super::CodesearchService::new_with_stores(
+        Some(root.path().to_path_buf()),
+        Some(stores.clone()),
+    )
+    .expect("service");
+
+    let request = super::LiteralSearchRequest {
+        query: r"ref:classification\s+search=".to_string(),
+        regex: Some(true),
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: None,
+    };
+    let result = service
+        .literal_search(rmcp::handler::server::wrapper::Parameters(request))
+        .await
+        .expect("literal search must succeed");
+
+    let json = match &result.content[0] {
+        ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json response");
+    assert_eq!(
+        parsed["scan_fallback"],
+        serde_json::Value::Bool(true),
+        "0 BM25 hits on a separator-spanning regex must report the scan fallback: {parsed}"
+    );
+    let note = parsed["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("raw chunk-content scan"),
+        "note must name the fallback, got: {note}"
+    );
+    let results = parsed["results"].as_array().expect("results array");
+    assert!(
+        results.is_empty(),
+        "the pattern does not exist, so the scan must also come up empty: {parsed:?}"
+    );
+}
+
 /// One store seeded with a single lexical+vector chunk — the minimal group
 /// member for the family-collapse tests below.
 async fn seed_group_store(
@@ -2262,6 +2354,7 @@ fn test_literal_response_json_has_lc_fields() {
         results: vec![],
         auto_promoted_to_regex: None,
         relaxed_fallback: None,
+        scan_fallback: None,
         note: None,
         low_confidence: Some(true),
         suggested_tool: Some("search with mode='semantic'".to_string()),
@@ -2278,6 +2371,7 @@ fn test_literal_response_json_omits_lc_fields_when_none() {
         results: vec![],
         auto_promoted_to_regex: None,
         relaxed_fallback: None,
+        scan_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2427,6 +2521,7 @@ fn test_literal_search_response_shape_json() {
         }],
         auto_promoted_to_regex: None,
         relaxed_fallback: None,
+        scan_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2444,6 +2539,7 @@ fn test_literal_search_response_carries_note_when_promoted() {
         results: vec![],
         auto_promoted_to_regex: Some(true),
         relaxed_fallback: None,
+        scan_fallback: None,
         note: Some("auto-promoted".to_string()),
         low_confidence: None,
         suggested_tool: None,
@@ -3281,6 +3377,7 @@ fn literal_response_emits_warnings_and_omits_them_when_healthy() {
         results: vec![],
         auto_promoted_to_regex: None,
         relaxed_fallback: None,
+        scan_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -3296,6 +3393,7 @@ fn literal_response_emits_warnings_and_omits_them_when_healthy() {
         results: vec![],
         auto_promoted_to_regex: None,
         relaxed_fallback: None,
+        scan_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -3311,6 +3409,7 @@ fn test_literal_search_response_omits_fields_when_not_promoted() {
         results: vec![],
         auto_promoted_to_regex: None,
         relaxed_fallback: None,
+        scan_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -3335,6 +3434,7 @@ fn test_grep_format_includes_comment_when_promoted() {
         }],
         auto_promoted_to_regex: Some(true),
         relaxed_fallback: None,
+        scan_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -3370,6 +3470,7 @@ fn test_grep_format_no_comment_when_plain() {
         }],
         auto_promoted_to_regex: None,
         relaxed_fallback: None,
+        scan_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,

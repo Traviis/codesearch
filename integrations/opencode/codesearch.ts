@@ -231,7 +231,7 @@ const MAX_SEEN = 20_000
 const DEFAULT_GUIDANCE = `codesearch indexes this workspace and serves semantic code search over MCP. Prefer it over grep/glob for anything conceptual, cross-file, or symbol-shaped.
 
 Tool routing:
-- search — concepts, unknown locations, mixed natural language + identifiers. Default mode is semantic (hybrid vector + BM25); use mode="literal" with regex=true or phrase=true for exact syntax.
+- search — concepts, unknown locations, mixed natural language + identifiers. Default mode is semantic (hybrid vector + BM25); mode="literal" for exact syntax — phrase=true only for true adjacent multi-word phrases, regex=true only within a single token (punctuation never reaches the token index; a separator-spanning pattern with zero hits auto-falls back to a raw content scan).
 - find — where a symbol is defined (kind="definition"), its call-sites (kind="usages"), a file's imports (kind="imports"), or a module's dependents (kind="dependents").
 - find_impact — precise transitive call sites before a rename or edit (SCIP: C#, TypeScript; on a "no backend" answer fall back to find kind="usages").
 - explore — outline a file's top-level symbols (kind="outline") or find chunks similar to a known hit (kind="similar").

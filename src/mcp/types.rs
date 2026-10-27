@@ -415,8 +415,13 @@ pub struct LiteralSearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relaxed_fallback: Option<bool>,
 
+    /// True when the BM25 token-regex matched nothing and these results come
+    /// from the raw chunk-content scan fallback instead (unranked, score 0.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_fallback: Option<bool>,
+
     /// Actionable note for the LLM caller (present iff auto_promoted_to_regex,
-    /// relaxed_fallback or low_confidence is set).
+    /// relaxed_fallback, scan_fallback or low_confidence is set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 
