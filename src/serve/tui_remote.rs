@@ -60,6 +60,7 @@ impl RepoInfo {
     fn to_row(&self) -> RepoRow {
         RepoRow {
             alias: self.alias.clone(),
+            display_name: None,
             status: self.status.clone(),
             csharp_index: self.csharp_index.clone(),
             csharp_error: self.csharp_error.clone(),
