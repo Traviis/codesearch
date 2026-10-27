@@ -211,9 +211,9 @@ async fn run_tui_loop(
         let mut rows = map_repo_rows(&repos, &state);
         rows.extend(remote_rows.iter().cloned());
 
-        // Peer mounts group visually under their peer prefix (e.g. cloud/*):
-        // the first mount of each peer renders unindented as the anchor row,
-        // the rest get the `| ` group indent.
+        // Peer mounts group visually under a synthetic peer header row
+        // (e.g. `cloud` above `cloud/akeneo`): every mount of the peer gets
+        // the `| ` group indent so no repo reads as another's parent.
         group_peer_mounts(&mut rows);
 
         // Clamp selection
@@ -657,17 +657,57 @@ async fn poll_peer_status(
 /// Group remote peer mounts visually under their peer prefix: the first
 /// mount per peer stays unindented as the anchor, the rest get the `| `
 /// indent. Local rows and remotes without a `peer/alias` shape are skipped.
-fn group_peer_mounts(rows: &mut [RepoRow]) {
-    let mut peer_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for row in rows.iter_mut().skip_while(|r| !r.is_remote) {
-        if !row.is_remote {
-            continue;
-        }
+/// Group peer mounts under a synthetic header row: `cloud/akeneo` and
+/// `cloud/erp` render as children of a bare `cloud` header instead of the
+/// first mount doubling as an (unreadable-as-parent) anchor. Header rows are
+/// remote-shaped (empty cells, unindented); every mount of the peer is
+/// indented. Single-mount peers and bare remotes (no `/`) stay as-is — the
+/// misleading-parentage problem only exists with two or more mounts. Locals
+/// are never touched.
+fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
+    let mut mount_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for row in rows.iter().filter(|r| r.is_remote && r.alias.contains('/')) {
         let peer = row.alias.split('/').next().unwrap_or_default();
-        if row.alias.contains('/') && !peer.is_empty() {
-            row.indent = !peer_seen.insert(peer);
+        if !peer.is_empty() {
+            *mount_counts.entry(peer.to_string()).or_insert(0) += 1;
         }
     }
+    let mut grouped: Vec<RepoRow> = Vec::with_capacity(rows.len() + 4);
+    let mut headers_emitted: Vec<String> = Vec::new();
+    for row in rows.drain(..) {
+        if !row.is_remote {
+            grouped.push(row);
+            continue;
+        }
+        let peer = row.alias.split('/').next().unwrap_or_default().to_string();
+        if !row.alias.contains('/')
+            || peer.is_empty()
+            || mount_counts.get(&peer).copied().unwrap_or(0) < 2
+        {
+            grouped.push(row);
+            continue;
+        }
+        if !headers_emitted.contains(&peer) {
+            headers_emitted.push(peer.clone());
+            let mut header = row.clone();
+            header.alias = peer;
+            // Header rows are remote-shaped with EMPTY cells: clearing only
+            // status would render the first mount's live stats as the
+            // server's own.
+            header.status = String::new();
+            header.changes = 0;
+            header.tool_call_count = 0;
+            header.last_tool_call = None;
+            header.lock_mode = String::new();
+            header.indent = false;
+            grouped.push(header);
+        }
+        let mut child = row;
+        child.indent = true;
+        grouped.push(child);
+    }
+    *rows = grouped;
 }
 
 fn spawn_remote_discovery(
@@ -1534,7 +1574,7 @@ mod family_note_tests {
     }
 
     #[test]
-    fn group_peer_mounts_indents_second_and_later_mounts_per_peer() {
+    fn group_peer_mounts_groups_multi_mount_peers_under_a_synthetic_header() {
         let row = |alias: &str, is_remote: bool| RepoRow {
             alias: alias.to_string(),
             status: "warm".to_string(),
@@ -1553,16 +1593,54 @@ mod family_note_tests {
         };
         let mut rows = vec![
             row("local-repo", false),
-            row("cloud/first", true),
+            {
+                // Live stat columns on the mount: the synthetic header must
+                // clear every borrowed field, so the fixture can tell.
+                let mut r = row("cloud/first", true);
+                r.changes = 5;
+                r.tool_call_count = 7;
+                r.last_tool_call = Some("14:32".to_string());
+                r.lock_mode = "write".to_string();
+                r
+            },
             row("cloud/second", true),
             row("peer2/only", true),
             row("bare-name", true),
         ];
         group_peer_mounts(&mut rows);
-        assert!(!rows[0].indent, "local rows are never touched");
-        assert!(!rows[1].indent, "first mount per peer is the anchor");
-        assert!(rows[2].indent, "later mounts of the same peer indent");
-        assert!(!rows[3].indent, "a different peer starts its own anchor");
-        assert!(!rows[4].indent, "remotes without peer/alias shape stay put");
+        assert_eq!(rows.len(), 6, "one synthetic header inserted for cloud");
+        assert!(
+            !rows[0].indent && rows[0].alias == "local-repo",
+            "locals are never touched"
+        );
+        assert_eq!(
+            rows[1].alias, "cloud",
+            "synthetic header carries the peer name"
+        );
+        assert!(
+            !rows[1].indent && rows[1].status.is_empty(),
+            "header is an unindented blank row"
+        );
+        assert!(
+            rows[1].changes == 0
+                && rows[1].tool_call_count == 0
+                && rows[1].last_tool_call.is_none()
+                && rows[1].lock_mode.is_empty(),
+            "header clears every borrowed stat column of the first mount"
+        );
+        assert_eq!(rows[2].alias, "cloud/first");
+        assert!(
+            rows[2].indent,
+            "every mount of the peer indents under the header"
+        );
+        assert_eq!(rows[3].alias, "cloud/second");
+        assert!(rows[3].indent, "no mount doubles as the anchor any more");
+        assert_eq!(rows[4].alias, "peer2/only");
+        assert!(
+            !rows[4].indent,
+            "single-mount peers stay unindented without a header"
+        );
+        assert_eq!(rows[5].alias, "bare-name");
+        assert!(!rows[5].indent, "remotes without peer/alias shape stay put");
     }
 }
