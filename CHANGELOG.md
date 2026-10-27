@@ -14,6 +14,28 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.3]
+
+### Fixed
+
+- **The serve TUI could delete the wrong repository.** The render shows tree-ordered rows (worktrees grouped under their main, peers grouped), but the ShowInfo/RunDoctor/ForceReindex/Remove actions resolved the selected row's index against the unordered registry snapshot — so on a grouped view the confirmation dialog could name (and, once confirmed, remove) a different repo than the row under the cursor. All four action arms now resolve through the rendered rows; remote rows flash a "not supported" hint instead. Peer mounts group in the same tree style: multi-mount peers get a synthetic header row with the peer (server) name, and each of its mounts is `|`-indented beneath it — no mount reads as another's parent.
+
+- **Repos registered before identity capture now join their worktree family after a serve restart.** Startup backfills the missing git common-dir identities for every registered repo (previously only group members were backfilled during group resolution), so the TUI family tree groups all worktrees under their real main even when the main predates identity capture.
+
+- **The serve TUI no longer decays into unreadable columns, and worktree families render as a tree.** The family note ("worktree of …", up to ~40 chars) was budgeted into the alias column, so on busy fleets the alias column overflowed and ratatui clipped every column from the left. The note now renders in its own dim "Worktree" column (capped at 30 chars with ellipsis), long aliases middle-ellipsis instead of clipping, and the column-width budget accounts for the lock column and ratatui's inter-column spacing. Worktrees now group under their main tree with a `|` indent (families anchor at the main's position; orphans stay indented at the tail), the note text is the bare main alias, and `groups list` renders `alias (main)`. Also fixes main-tree election when the main repo was registered before identity capture existed (identity-less mains now win the exact `.git`-path match over a shortest-path worktree).
+
+## [1.7.2] - 2026-10-27
+
+### Added
+
+- **The CLI can now do what the MCP tool can: literal search.** `codesearch search` gained `--literal` (Tantivy primitives directly — no embeddings, no fusion, no model load), `--phrase` (true adjacent multi-word phrases) and `--regex` (matches analyzed tokens, never raw text — punctuation never reaches the token index). A separator-spanning pattern like `ref:classification\s+search=` has anchorable tokens but the token combination never co-occurs, so the BM25 token-regex returned 0 hits while the text existed; both the CLI and the MCP `literal` tool now fall back to a raw chunk-content scan when the token-regex matches nothing, reporting the results as unranked with an explicit `scan_fallback` note. Guidance (plugin + docs) now states the discipline: `phrase` only for true adjacent phrases, `regex` only within a single token.
+
+## [1.7.1] - 2026-10-27
+
+### Fixed
+
+- **Shell grep through the Bash tool no longer bypasses the codesearch-first guards.** Both guard surfaces only watched the native Grep/Glob tools, so a raw `grep`/`rg` in a shell command ran the exact workload the guards exist to reroute (reported live: `grep | head -200 --include="*.cs"` between codesearch calls). The opencode plugin now denies bash-tool commands invoking `grep`/`egrep`/`fgrep`/`zgrep`/`rg` on covered, live repos in every guard mode except `off` (`guards.bash: false` or `CODESEARCH_PLUGIN_BASH_GUARD=0` to opt out) and appends the one-per-session tip when a shell grep slips through while the hub is down; the Claude Code grep-guard hook fires on the Bash tool via the same detector (`Grep` matcher widened to `Grep|Bash`, and re-running the installer upgrades an existing settings.json entry in place). The detector strips quoted spans and compares whole tokens (`echo "grep"`, `progress`, `rgx` pass; pipes, `git grep`, `/usr/bin/grep.exe`, `$()` and backtick substitution deny). Also fixes a latent plugin leak where `resolveSettings` mutated the shared `DEFAULTS` object, so one session's env overrides leaked into every later session in the same process.
+
 ## [1.7.0] - 2026-10-26
 
 ### Added
@@ -25,8 +47,6 @@ finalized in place with a date — no renaming/migration step needed.
 - **OpenCode plugin: syntax-shaped queries are routed to ast-grep tools, but only when the host exposes them.** codesearch matches text, not code structure, so the injected guidance now adds one routing line (and the block-mode denial one alternative line) pointing at ast-grep tools such as `ast_grep_search`/`ast_grep_edit` — gated per request on the assembled tool map, so environments without an ast-grep integration see unchanged guidance and no one is pointed at tools they do not have. Unit and smoke coverage pin both the mention and its absence.
 
 ### Fixed
-
-- **Shell grep through the Bash tool no longer bypasses the codesearch-first guards.** Both guard surfaces only watched the native Grep/Glob tools, so a raw `grep`/`rg` in a shell command ran the exact workload the guards exist to reroute (reported live: `grep | head -200 --include="*.cs"` between codesearch calls). The opencode plugin now denies bash-tool commands invoking `grep`/`egrep`/`fgrep`/`zgrep`/`rg` on covered, live repos in every guard mode except `off` (`guards.bash: false` or `CODESEARCH_PLUGIN_BASH_GUARD=0` to opt out) and appends the one-per-session tip when a shell grep slips through while the hub is down; the Claude Code grep-guard hook fires on the Bash tool via the same detector (`Grep` matcher widened to `Grep|Bash`, and re-running the installer upgrades an existing settings.json entry in place). The detector strips quoted spans and compares whole tokens (`echo "grep"`, `progress`, `rgx` pass; pipes, `git grep`, `/usr/bin/grep.exe`, `$()` and backtick substitution deny). Also fixes a latent plugin leak where `resolveSettings` mutated the shared `DEFAULTS` object, so one session's env overrides leaked into every later session in the same process.
 
 - **Read-only vector stores open again after the heed 0.23 bump.** The bump's database-open shims commit their own read transaction per named database (heed 0.23 requires that commit to persist the dbi handles env-globally), but `VectorStore::open_readonly` still opened its data-read transaction BEFORE those commits — a transaction started earlier does not know the handles, so the first data read failed with a bare EINVAL (os error 22). Every `repo_read_only` repo (the whole remote DOCS corpus on the serve replica) failed to open since the bump; the write path already ordered its creates before its bootstrap transaction. The `readonly_reopen` regression test pins the ordering and is green again — it has been the one red test in CI since the bump landed.
 

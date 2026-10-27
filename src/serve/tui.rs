@@ -211,6 +211,11 @@ async fn run_tui_loop(
         let mut rows = map_repo_rows(&repos, &state);
         rows.extend(remote_rows.iter().cloned());
 
+        // Peer mounts group visually under a synthetic peer header row
+        // (e.g. `cloud` above `cloud/akeneo`): every mount of the peer gets
+        // the `| ` group indent so no repo reads as another's parent.
+        group_peer_mounts(&mut rows);
+
         // Clamp selection
         if !rows.is_empty() {
             let sel = table_state.selected().unwrap_or(0);
@@ -346,47 +351,57 @@ async fn run_tui_loop(
                         let _ = state.reload_if_changed();
                     }
                     KeyAction::ShowInfo(idx) => {
-                        if idx < repos.len() {
+                        // The table renders the REORDERED rows — resolve the
+                        // action against rows[idx], never repos[idx]: the
+                        // snapshot's order diverges once worktree families are
+                        // grouped (selection-index mismatch → wrong repo).
+                        match rows.get(idx) {
                             // Local repo — gather live on-disk index stats.
-                            if let Some(ov) = build_info_overlay(idx, &repos, &state) {
-                                overlay = Some(ov);
+                            Some(row) if !row.is_remote => {
+                                if let Some(ov) = build_info_overlay(&row.alias, &state) {
+                                    overlay = Some(ov);
+                                }
                             }
-                        } else if let Some(row) = rows.get(idx) {
                             // Mounted remote project (appended after local rows).
                             // Show federation coordinates immediately, then fetch
                             // the peer's on-disk index stats in the background.
-                            let base = build_remote_info_overlay(row);
-                            // Bump the generation UNCONDITIONALLY: this invalidates
-                            // any still-in-flight doctor/remote-info result (they
-                            // share one channel + counter) so a late reply can't
-                            // clobber this overlay via the recv guard below.
-                            doctor_gen += 1;
-                            if let Some(crate::db_discovery::repos::Target::RemoteProject {
-                                peer,
-                                remote_alias,
-                                ..
-                            }) = state.config_snapshot().resolve_remote_project(&row.alias)
-                            {
-                                overlay = Some(base.clone());
-                                spawn_remote_info(
-                                    base,
+                            Some(row) => {
+                                let base = build_remote_info_overlay(row);
+                                // Bump the generation UNCONDITIONALLY: this invalidates
+                                // any still-in-flight doctor/remote-info result (they
+                                // share one channel + counter) so a late reply can't
+                                // clobber this overlay via the recv guard below.
+                                doctor_gen += 1;
+                                if let Some(crate::db_discovery::repos::Target::RemoteProject {
                                     peer,
                                     remote_alias,
-                                    doctor_tx.clone(),
-                                    doctor_gen,
-                                );
-                            } else {
-                                // Mount no longer resolves (misconfig, or a config
-                                // reload raced this keypress). No fetch will run, so
-                                // don't leave the overlay stuck on "fetching…".
-                                overlay =
-                                    Some(with_remote_stats(base, RemoteStatsState::Unavailable));
+                                    ..
+                                }) = state.config_snapshot().resolve_remote_project(&row.alias)
+                                {
+                                    overlay = Some(base.clone());
+                                    spawn_remote_info(
+                                        base,
+                                        peer,
+                                        remote_alias,
+                                        doctor_tx.clone(),
+                                        doctor_gen,
+                                    );
+                                } else {
+                                    // Mount no longer resolves (misconfig, or a config
+                                    // reload raced this keypress). No fetch will run, so
+                                    // don't leave the overlay stuck on "fetching…".
+                                    overlay = Some(with_remote_stats(
+                                        base,
+                                        RemoteStatsState::Unavailable,
+                                    ));
+                                }
                             }
+                            None => {}
                         }
                     }
-                    KeyAction::RunDoctor(idx) => {
-                        if idx < repos.len() {
-                            let alias = repos[idx].0.clone();
+                    KeyAction::RunDoctor(idx) => match rows.get(idx) {
+                        Some(row) if !row.is_remote => {
+                            let alias = row.alias.clone();
                             // Show "running" overlay immediately
                             overlay = Some(OverlayState::DoctorRunning {
                                 alias: alias.clone(),
@@ -396,15 +411,16 @@ async fn run_tui_loop(
                             // applied if this request is still the current one.
                             doctor_gen += 1;
                             spawn_doctor(alias, state.clone(), doctor_tx.clone(), doctor_gen);
-                        } else {
+                        }
+                        _ => {
                             // Remote mount (appended after local rows) — the
                             // footer already greys this out; confirm the no-op.
                             flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
-                    }
-                    KeyAction::ForceReindex(idx) => {
-                        if idx < repos.len() {
-                            let alias = repos[idx].0.clone();
+                    },
+                    KeyAction::ForceReindex(idx) => match rows.get(idx) {
+                        Some(row) if !row.is_remote => {
+                            let alias = row.alias.clone();
                             let msg = match spawn_force_reindex(alias.clone(), &state) {
                                 ReindexLaunch::Started => {
                                     format!("⟳ Reindex started for '{alias}' …")
@@ -417,18 +433,21 @@ async fn run_tui_loop(
                                 }
                             };
                             flash = Some((msg, std::time::Instant::now()));
-                        } else {
+                        }
+                        _ => {
                             flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
-                    }
-                    KeyAction::RequestRemove(idx) => {
-                        if idx < repos.len() {
-                            let alias = repos[idx].0.clone();
-                            overlay = Some(OverlayState::ConfirmRemove { alias });
-                        } else {
+                    },
+                    KeyAction::RequestRemove(idx) => match rows.get(idx) {
+                        Some(row) if !row.is_remote => {
+                            overlay = Some(OverlayState::ConfirmRemove {
+                                alias: row.alias.clone(),
+                            });
+                        }
+                        _ => {
                             flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
-                    }
+                    },
                     KeyAction::None => {}
                 }
             }
@@ -461,18 +480,55 @@ fn map_repo_rows(
     state: &Arc<ServeState>,
 ) -> Vec<RepoRow> {
     let config = state.config_snapshot();
-    // Grouped rendering (human-facing only): each family's main-tree row gets
-    // a "+ N worktrees" note, each worktree row a "worktree of <main>" note.
-    // Counting scope: the whole fleet (the TUI lists every registered repo).
+    // Grouped rendering (human-facing only): each family renders as a tree —
+    // the main-tree row followed directly by its worktrees, each indented
+    // with `| `; the Worktree column carries only the main's "+ N worktrees"
+    // count (the tree shape carries the relationship). Counting scope: the
+    // whole fleet (the TUI lists every registered repo).
     let family_map = config.worktree_family_map();
     let mut family_sizes: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for main in family_map.values() {
         *family_sizes.entry(main.clone()).or_insert(0) += 1;
     }
-    repos
-        .iter()
-        .map(|(alias, info)| {
+    let mut by_main: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (wt, main) in &family_map {
+        by_main.entry(main.as_str()).or_default().push(wt.as_str());
+    }
+    let is_worktree: std::collections::HashSet<&str> =
+        family_map.keys().map(String::as_str).collect();
+
+    // Reorder: families anchor at the main's own position; a worktree met
+    // before its main is skipped there and emitted under the main instead.
+    // Worktrees whose main is missing from this snapshot (transient between
+    // config and status) keep their row, still indented.
+    let mut ordered: Vec<(&(String, super::RepoStatusInfo), bool)> = Vec::new();
+    let mut emitted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for entry in repos.iter() {
+        if is_worktree.contains(entry.0.as_str()) {
+            continue;
+        }
+        ordered.push((entry, false));
+        if let Some(wts) = by_main.get(entry.0.as_str()) {
+            let mut wts: Vec<&str> = wts.clone();
+            wts.sort_unstable();
+            for wt in wts {
+                if let Some(w_entry) = repos.iter().find(|(a, _)| a == wt) {
+                    ordered.push((w_entry, true));
+                }
+                emitted.insert(wt);
+            }
+        }
+    }
+    for entry in repos.iter() {
+        if is_worktree.contains(entry.0.as_str()) && !emitted.contains(entry.0.as_str()) {
+            ordered.push((entry, true));
+        }
+    }
+
+    ordered
+        .into_iter()
+        .map(|((alias, info), is_wt)| {
             let status_str = match info.status {
                 super::RepoStateLabel::Open => "open",
                 super::RepoStateLabel::Warm => "warm",
@@ -528,11 +584,14 @@ fn map_repo_rows(
                 is_remote: false,
                 // Local repos carry live serve state — never stale.
                 activity_stale: false,
-                family_note: crate::db_discovery::repos::family_note(
-                    &family_map,
-                    &family_sizes,
-                    alias,
-                ),
+                // Worktree rows show the relationship via the `| ` tree
+                // indent, so the note column stays count-only.
+                family_note: if is_wt {
+                    None
+                } else {
+                    crate::db_discovery::repos::family_note(&family_map, &family_sizes, alias)
+                },
+                indent: is_wt,
             }
         })
         .collect()
@@ -595,6 +654,62 @@ async fn poll_peer_status(
 /// window (1h on the cloud deploy) — a ~50% duty cycle on a peer nobody queried.
 /// Not keeping a peer awake past its suspend term is not the same as not waking
 /// it, and the two windows were unrelated values besides (local vs. peer).
+/// Group remote peer mounts visually under their peer prefix: the first
+/// mount per peer stays unindented as the anchor, the rest get the `| `
+/// indent. Local rows and remotes without a `peer/alias` shape are skipped.
+/// Group peer mounts under a synthetic header row: `cloud/akeneo` and
+/// `cloud/erp` render as children of a bare `cloud` header instead of the
+/// first mount doubling as an (unreadable-as-parent) anchor. Header rows are
+/// remote-shaped (empty cells, unindented); every mount of the peer is
+/// indented. Single-mount peers and bare remotes (no `/`) stay as-is — the
+/// misleading-parentage problem only exists with two or more mounts. Locals
+/// are never touched.
+fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
+    let mut mount_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for row in rows.iter().filter(|r| r.is_remote && r.alias.contains('/')) {
+        let peer = row.alias.split('/').next().unwrap_or_default();
+        if !peer.is_empty() {
+            *mount_counts.entry(peer.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut grouped: Vec<RepoRow> = Vec::with_capacity(rows.len() + 4);
+    let mut headers_emitted: Vec<String> = Vec::new();
+    for row in rows.drain(..) {
+        if !row.is_remote {
+            grouped.push(row);
+            continue;
+        }
+        let peer = row.alias.split('/').next().unwrap_or_default().to_string();
+        if !row.alias.contains('/')
+            || peer.is_empty()
+            || mount_counts.get(&peer).copied().unwrap_or(0) < 2
+        {
+            grouped.push(row);
+            continue;
+        }
+        if !headers_emitted.contains(&peer) {
+            headers_emitted.push(peer.clone());
+            let mut header = row.clone();
+            header.alias = peer;
+            // Header rows are remote-shaped with EMPTY cells: clearing only
+            // status would render the first mount's live stats as the
+            // server's own.
+            header.status = String::new();
+            header.changes = 0;
+            header.tool_call_count = 0;
+            header.last_tool_call = None;
+            header.lock_mode = String::new();
+            header.indent = false;
+            grouped.push(header);
+        }
+        let mut child = row;
+        child.indent = true;
+        grouped.push(child);
+    }
+    *rows = grouped;
+}
+
 fn spawn_remote_discovery(
     state: Arc<ServeState>,
     tx: tokio::sync::mpsc::Sender<RemoteDiscoveryUpdate>,
@@ -740,6 +855,7 @@ fn build_remote_rows(
                 activity_stale: false,
                 // Mounted remote projects carry no local family identity.
                 family_note: None,
+                indent: false,
             }
         })
         .collect()
@@ -810,15 +926,7 @@ pub(crate) fn human_age_seconds(secs: u64) -> String {
 
 /// Build an `OverlayState::Info` by gathering live stats from SharedStores or metadata.
 /// pub(crate) so the serve test module can pin the symbol-warnings wiring.
-pub(crate) fn build_info_overlay(
-    idx: usize,
-    repos: &[(String, super::RepoStatusInfo)],
-    state: &Arc<ServeState>,
-) -> Option<OverlayState> {
-    if idx >= repos.len() {
-        return None;
-    }
-    let (alias, _info) = &repos[idx];
+pub(crate) fn build_info_overlay(alias: &str, state: &Arc<ServeState>) -> Option<OverlayState> {
     let config = state.config_snapshot();
     let project_path = config.resolve(alias)?;
     let db_path = project_path.join(DB_DIR_NAME);
@@ -889,7 +997,7 @@ pub(crate) fn build_info_overlay(
     let symbol_index = state.collect_symbol_index_status(&project_path, &db_path);
 
     Some(OverlayState::Info {
-        alias: alias.clone(),
+        alias: alias.to_string(),
         path: db_path.display().to_string(),
         chunks,
         files,
@@ -1394,16 +1502,145 @@ mod family_note_tests {
             ),
         ];
         let rows = map_repo_rows(&repos, &state);
+        // Tree grouping: the main's row is followed directly by its
+        // worktree, indented; solo stays in place.
+        assert_eq!(rows[0].alias, main, "main anchors the family group");
+        assert_eq!(rows[1].alias, wt, "worktree renders under its main");
+        assert_eq!(rows[2].alias, "solo");
+        assert!(!rows[0].indent && !rows[2].indent);
+        assert!(rows[1].indent, "worktree rows carry the | indent");
         let by_alias: std::collections::HashMap<&str, &RepoRow> =
             rows.iter().map(|r| (r.alias.as_str(), r)).collect();
         assert_eq!(
-            by_alias[wt.as_str()].family_note.as_deref(),
-            Some("worktree of m")
+            by_alias[wt.as_str()].family_note,
+            None,
+            "the tree indent carries the relationship; note column stays count-only"
         );
         assert_eq!(
             by_alias[main.as_str()].family_note.as_deref(),
             Some("+ 1 worktree")
         );
         assert_eq!(by_alias["solo"].family_note, None);
+    }
+
+    #[test]
+    fn map_repo_rows_reorders_worktrees_met_before_their_main() {
+        let (_tmp, main, wt, state) = crate::serve::tests::family_state();
+
+        let info = || crate::serve::RepoStatusInfo {
+            status: crate::serve::RepoStateLabel::Warm,
+            changes: 0,
+            last_tool_call: None,
+            tool_call_count: 0,
+            csharp_index: crate::serve::CSharpIndexStatus::None,
+            csharp_error: None,
+            typescript_index: crate::serve::CSharpIndexStatus::None,
+        };
+        // Snapshot order puts the worktree BEFORE its main: the skip branch
+        // must hold it back and re-emit it under the main.
+        let repos = vec![
+            (wt.clone(), info()),
+            (main.clone(), info()),
+            ("solo".to_string(), info()),
+        ];
+        let rows = map_repo_rows(&repos, &state);
+        assert_eq!(rows[0].alias, main, "main anchors the family group");
+        assert_eq!(rows[1].alias, wt, "worktree re-emitted under its main");
+        assert_eq!(rows[2].alias, "solo", "non-family order preserved");
+        assert!(rows[1].indent);
+        assert!(!rows[0].indent && !rows[2].indent);
+    }
+
+    #[test]
+    fn map_repo_rows_keeps_orphan_worktrees_indented_at_the_tail() {
+        let (_tmp, _main, wt, state) = crate::serve::tests::family_state();
+
+        let info = || crate::serve::RepoStatusInfo {
+            status: crate::serve::RepoStateLabel::Warm,
+            changes: 0,
+            last_tool_call: None,
+            tool_call_count: 0,
+            csharp_index: crate::serve::CSharpIndexStatus::None,
+            csharp_error: None,
+            typescript_index: crate::serve::CSharpIndexStatus::None,
+        };
+        // The main is absent from the snapshot (e.g. evicted): the defensive
+        // tail still renders the worktree, indented, never dropped.
+        let repos = vec![("solo".to_string(), info()), (wt.clone(), info())];
+        let rows = map_repo_rows(&repos, &state);
+        assert_eq!(rows[0].alias, "solo");
+        assert_eq!(rows[1].alias, wt, "orphan worktree survives at the tail");
+        assert!(rows[1].indent, "orphan worktree stays indented");
+    }
+
+    #[test]
+    fn group_peer_mounts_groups_multi_mount_peers_under_a_synthetic_header() {
+        let row = |alias: &str, is_remote: bool| RepoRow {
+            alias: alias.to_string(),
+            status: "warm".to_string(),
+            csharp_index: "none".to_string(),
+            csharp_error: None,
+            typescript_index: "none".to_string(),
+            changes: 0,
+            tool_call_count: 0,
+            last_tool_call: None,
+            lock_mode: String::new(),
+            path: String::new(),
+            is_remote,
+            activity_stale: false,
+            family_note: None,
+            indent: false,
+        };
+        let mut rows = vec![
+            row("local-repo", false),
+            {
+                // Live stat columns on the mount: the synthetic header must
+                // clear every borrowed field, so the fixture can tell.
+                let mut r = row("cloud/first", true);
+                r.changes = 5;
+                r.tool_call_count = 7;
+                r.last_tool_call = Some("14:32".to_string());
+                r.lock_mode = "write".to_string();
+                r
+            },
+            row("cloud/second", true),
+            row("peer2/only", true),
+            row("bare-name", true),
+        ];
+        group_peer_mounts(&mut rows);
+        assert_eq!(rows.len(), 6, "one synthetic header inserted for cloud");
+        assert!(
+            !rows[0].indent && rows[0].alias == "local-repo",
+            "locals are never touched"
+        );
+        assert_eq!(
+            rows[1].alias, "cloud",
+            "synthetic header carries the peer name"
+        );
+        assert!(
+            !rows[1].indent && rows[1].status.is_empty(),
+            "header is an unindented blank row"
+        );
+        assert!(
+            rows[1].changes == 0
+                && rows[1].tool_call_count == 0
+                && rows[1].last_tool_call.is_none()
+                && rows[1].lock_mode.is_empty(),
+            "header clears every borrowed stat column of the first mount"
+        );
+        assert_eq!(rows[2].alias, "cloud/first");
+        assert!(
+            rows[2].indent,
+            "every mount of the peer indents under the header"
+        );
+        assert_eq!(rows[3].alias, "cloud/second");
+        assert!(rows[3].indent, "no mount doubles as the anchor any more");
+        assert_eq!(rows[4].alias, "peer2/only");
+        assert!(
+            !rows[4].indent,
+            "single-mount peers stay unindented without a header"
+        );
+        assert_eq!(rows[5].alias, "bare-name");
+        assert!(!rows[5].indent, "remotes without peer/alias shape stay put");
     }
 }

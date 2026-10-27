@@ -335,6 +335,19 @@ pub enum Commands {
         #[arg(long)]
         vector_only: bool,
 
+        /// Literal FTS-only search: no embeddings, no fusion, no model load
+        #[arg(long)]
+        literal: bool,
+
+        /// Phrase search over the analyzed tokens (implies --literal)
+        #[arg(long)]
+        phrase: bool,
+
+        /// Regex over the analyzed tokens — never raw text; punctuation does
+        /// not exist in the token index (implies --literal)
+        #[arg(long)]
+        regex: bool,
+
         /// RRF k parameter for score fusion (default 20)
         #[arg(long, default_value = "20")]
         rrf_k: f32,
@@ -1055,6 +1068,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             json,
             path,
             vector_only,
+            literal,
+            phrase,
+            regex,
             rrf_k,
             rerank,
             rerank_top,
@@ -1079,6 +1095,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 filter_path,
                 model_override: model_type.map(|mt| mt.short_name().to_string()),
                 vector_only,
+                literal: literal || phrase || regex,
+                phrase,
+                regex,
                 rrf_k: if rrf_k == 60.0 {
                     None
                 } else {
@@ -1535,7 +1554,7 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
 }
 
 /// Human-facing grouped rendering for `groups list`: a member that is a
-/// worktree of another member is annotated `"(worktree of <main>)"`, and a
+/// worktree of another member is annotated `"(<main>)"`, and a
 /// family's main tree in the list gets `"+ N worktrees"` (counted within the
 /// group). The alias list itself stays flat — display only.
 fn render_group_members(
@@ -2695,7 +2714,7 @@ mod tests {
     }
 
     /// `groups list` grouped rendering is display-only: worktree members get
-    /// the "(worktree of <main>)" annotation, the family's main tree gets
+    /// the "(<main>)" annotation, the family's main tree gets
     /// "+ N worktrees" counted within the group, others stay bare.
     #[test]
     fn groups_list_renders_family_annotations() {
@@ -2711,8 +2730,8 @@ mod tests {
             rendered,
             vec![
                 "main (+ 2 worktrees)".to_string(),
-                "wt1 (worktree of main)".to_string(),
-                "wt2 (worktree of main)".to_string(),
+                "wt1 (main)".to_string(),
+                "wt2 (main)".to_string(),
                 "solo".to_string(),
             ]
         );

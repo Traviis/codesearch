@@ -1069,14 +1069,10 @@ impl ReposConfig {
     pub fn worktree_family_map(&self) -> std::collections::HashMap<String, String> {
         use std::collections::HashMap;
 
-        // identity -> (exact main alias if seen, shortest-path fallback so
-        // far). A member whose own `<repo>/.git` IS the recorded common dir
-        // is the main tree — a worktree's common dir lives under the main's
-        // path, never its own, so only the main can match exactly. Shortest
-        // path is the fallback for families whose main tree is not (or no
-        // longer) registered, so a worktree parked at a shorter path cannot
-        // steal the main label.
-        let mut exact: HashMap<&str, Option<&str>> = HashMap::new();
+        // identity -> (shortest-path fallback so far). Shortest path is the
+        // fallback for families whose main tree is not (or no longer)
+        // registered, so a worktree parked at a shorter path cannot steal
+        // the main label.
         let mut shortest: HashMap<&str, (usize, &str)> = HashMap::new();
         for (alias, path) in &self.repos {
             let Some(identity) = self
@@ -1086,13 +1082,6 @@ impl ReposConfig {
             else {
                 continue;
             };
-            let slot = exact.entry(identity).or_insert(None);
-            if slot.is_none()
-                && normalize_path_for_compare(&path.join(".git"))
-                    == normalize_path_for_compare(Path::new(identity))
-            {
-                *slot = Some(alias.as_str());
-            }
             let path_len = path.as_os_str().len();
             match shortest.get_mut(identity) {
                 Some((best_len, best_alias)) => {
@@ -1108,6 +1097,22 @@ impl ReposConfig {
                 }
             }
         }
+        // Exact main election: a member whose `<repo>/.git` IS the recorded
+        // common dir is the main tree — a worktree's common dir lives under
+        // the main's path, never its own. Aliases without a recorded
+        // identity take part too: a main tree registered before identity
+        // capture existed has None, but its .git path still equals the
+        // family identity.
+        let identities: Vec<&str> = shortest.keys().copied().collect();
+        let mut exact: HashMap<&str, &str> = HashMap::new();
+        for (alias, path) in &self.repos {
+            let norm_git = normalize_path_for_compare(&path.join(".git"));
+            for identity in &identities {
+                if normalize_path_for_compare(Path::new(identity)) == norm_git {
+                    exact.entry(*identity).or_insert(alias.as_str());
+                }
+            }
+        }
         let mut out: HashMap<String, String> = HashMap::new();
         for alias in self.repos.keys() {
             let Some(identity) = self
@@ -1119,7 +1124,7 @@ impl ReposConfig {
             };
             let main = exact
                 .get(identity)
-                .and_then(|m| *m)
+                .copied()
                 .or_else(|| shortest.get(identity).map(|(_, a)| *a));
             if let Some(main) = main {
                 if main != alias.as_str() {
@@ -1339,7 +1344,9 @@ impl ReposConfig {
 }
 
 /// Display-only family-note vocabulary shared by the TUI repo table and the
-/// CLI `groups list`: a worktree alias annotates as `worktree of <main>`, a
+/// CLI `groups list`: a worktree alias annotates as `<main>` (the tree
+/// grouping in the TUI carries the relationship; the bare alias in
+/// parentheses reads cleaner than a "worktree of" prefix), a
 /// family's main alias as `+ N worktrees` (singular for one), anything else
 /// gets no note. The counting scope is the caller's choice — the CLI counts
 /// within a group, the TUI across the whole fleet — which is why `counts`
@@ -1350,7 +1357,7 @@ pub fn family_note(
     alias: &str,
 ) -> Option<String> {
     if let Some(main) = family_map.get(alias) {
-        return Some(format!("worktree of {main}"));
+        return Some(main.clone());
     }
     match counts.get(alias) {
         Some(&n) if n > 0 => Some(format!("+ {n} worktree{}", if n == 1 { "" } else { "s" })),

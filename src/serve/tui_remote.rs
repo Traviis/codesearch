@@ -79,6 +79,7 @@ impl RepoInfo {
             // The remote dashboard polls the peer's /status; it does not see the
             // peer's config, so no family annotation here.
             family_note: None,
+            indent: false,
         }
     }
 }
