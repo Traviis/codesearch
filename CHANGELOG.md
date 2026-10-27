@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.2]
+
+### Added
+
+- **The CLI can now do what the MCP tool can: literal search.** `codesearch search` gained `--literal` (Tantivy primitives directly — no embeddings, no fusion, no model load), `--phrase` (true adjacent multi-word phrases) and `--regex` (matches analyzed tokens, never raw text — punctuation never reaches the token index). A separator-spanning pattern like `ref:classification\s+search=` has anchorable tokens but the token combination never co-occurs, so the BM25 token-regex returned 0 hits while the text existed; both the CLI and the MCP `literal` tool now fall back to a raw chunk-content scan when the token-regex matches nothing, reporting the results as unranked with an explicit `scan_fallback` note. Guidance (plugin + docs) now states the discipline: `phrase` only for true adjacent phrases, `regex` only within a single token.
+
 ## [1.7.1] - 2026-10-27
 
 ### Fixed

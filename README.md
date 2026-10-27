@@ -571,7 +571,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | Command | Description |
 |---------|-------------|
 | `codesearch index [PATH]` | Index a repo (incremental; `--force` for full rebuild) |
-| `codesearch search <QUERY>` | CLI search (for testing) |
+| `codesearch search <QUERY>` | CLI search (for testing). `--literal` runs the FTS primitives directly (no embeddings/model load); `--phrase` for true adjacent multi-word phrases; `--regex` matches analyzed tokens only — a separator-spanning pattern with zero hits auto-falls back to a raw chunk-content scan |
 | `codesearch mcp` | Start MCP stdio server |
 | `codesearch serve` | Start multi-repo HTTP server with TUI |
 | `codesearch stats` | Show database statistics |

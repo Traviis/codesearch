@@ -335,6 +335,19 @@ pub enum Commands {
         #[arg(long)]
         vector_only: bool,
 
+        /// Literal FTS-only search: no embeddings, no fusion, no model load
+        #[arg(long)]
+        literal: bool,
+
+        /// Phrase search over the analyzed tokens (implies --literal)
+        #[arg(long)]
+        phrase: bool,
+
+        /// Regex over the analyzed tokens — never raw text; punctuation does
+        /// not exist in the token index (implies --literal)
+        #[arg(long)]
+        regex: bool,
+
         /// RRF k parameter for score fusion (default 20)
         #[arg(long, default_value = "20")]
         rrf_k: f32,
@@ -1055,6 +1068,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             json,
             path,
             vector_only,
+            literal,
+            phrase,
+            regex,
             rrf_k,
             rerank,
             rerank_top,
@@ -1079,6 +1095,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 filter_path,
                 model_override: model_type.map(|mt| mt.short_name().to_string()),
                 vector_only,
+                literal: literal || phrase || regex,
+                phrase,
+                regex,
                 rrf_k: if rrf_k == 60.0 {
                     None
                 } else {

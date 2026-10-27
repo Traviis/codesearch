@@ -568,45 +568,12 @@ fn is_import_kind(kind: &str) -> bool {
 /// chunks are found via vector-store lookup.
 const IMPORT_FTS_KEYWORDS: &[&str] = &["import", "use", "using", "from", "require", "include"];
 
-fn truncate_line_around_match(line: &str, match_start_byte: usize, max_chars: usize) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    if chars.len() <= max_chars {
-        return line.to_string();
-    }
-
-    let match_char_idx = line[..match_start_byte.min(line.len())].chars().count();
-    let half = max_chars / 2;
-    let mut start = match_char_idx.saturating_sub(half);
-    let end = (start + max_chars).min(chars.len());
-    if end - start < max_chars {
-        start = end.saturating_sub(max_chars);
-    }
-
-    chars[start..end].iter().collect()
-}
-
 fn match_line_for_literal(
     content: &str,
     query: &str,
     regex: Option<&Regex>,
 ) -> Option<(usize, String)> {
-    if query.is_empty() {
-        return None;
-    }
-
-    for (idx, line) in content.lines().enumerate() {
-        if let Some(re) = regex {
-            if let Some(m) = re.find(line) {
-                let snippet = truncate_line_around_match(line, m.start(), 200);
-                return Some((idx, snippet));
-            }
-        } else if let Some(pos) = line.find(query) {
-            let snippet = truncate_line_around_match(line, pos, 200);
-            return Some((idx, snippet));
-        }
-    }
-
-    None
+    crate::search::literal::match_line_for_literal(content, query, regex)
 }
 
 /// Returns true when a regex pattern contains at least one run of three or more
