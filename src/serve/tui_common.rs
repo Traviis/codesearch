@@ -88,13 +88,14 @@ pub struct RepoRow {
     /// Worktree-family annotation rendered in the dim Worktree column:
     /// `"+ N worktrees"` on a family's main-tree row. Worktree rows carry
     /// `None` — their relationship renders as the `| `-indented tree shape
-    /// under the main (see `worktree_indent`). Display-only — actions and
+    /// under the main (see `indent`). Display-only — actions and
     /// identity use `alias`. `None` on remote rows and familyless repos.
     pub family_note: Option<String>,
-    /// True when this row is a worktree grouped under its family's main:
-    /// the alias renders as `| <alias>` directly below the main's row.
-    /// Display-only. Always `false` on remote rows.
-    pub worktree_indent: bool,
+    /// True when this row renders with the `| ` group indent: a worktree
+    /// grouped under its family's main, or a peer mount grouped under its
+    /// peer prefix (first mount of a peer is the unindented anchor row).
+    /// Display-only.
+    pub indent: bool,
 }
 
 /// Actions returned by key handling.
@@ -591,7 +592,7 @@ pub fn render_table(
             // clip every column from the left). Worktree rows budget the
             // `| ` tree indent too.
             let extra = indicator_cols(&r.csharp_index) + indicator_cols(&r.typescript_index);
-            r.alias.len() + if r.worktree_indent { 2 } else { 0 } + extra
+            r.alias.len() + if r.indent { 2 } else { 0 } + extra
         })
         .max()
         .unwrap_or(10)
@@ -664,7 +665,7 @@ pub fn render_table(
             } else {
                 Style::default().fg(Color::White)
             };
-            let prefix = if repo.worktree_indent { "| " } else { "" };
+            let prefix = if repo.indent { "| " } else { "" };
             let extra = indicator_cols(&repo.csharp_index) + indicator_cols(&repo.typescript_index);
             let text_cap = alias_content_cap
                 .saturating_sub(prefix.len() + extra)
