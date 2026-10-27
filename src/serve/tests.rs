@@ -6978,6 +6978,77 @@ async fn backfill_group_identities_fills_missing_and_persists() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn backfill_all_missing_identities_fills_every_repo() {
+    // Startup variant: no group involved — every registered repo missing an
+    // identity gets one, so pre-capture mains join their worktree families.
+    let tmp = tempfile::tempdir().unwrap();
+    let (main_alias, wt_alias, plain_alias, config, config_file) = {
+        let _serial = crate::db_discovery::repos::test_support::git_serial_lock();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
+        let wt = tmp.path().join("wt");
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        // A plain non-git directory: the backfill must leave it identity-less.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let mut config = ReposConfig::default();
+        let main_alias = config.register(main.clone());
+        let wt_alias = config.register(wt.clone());
+        let plain_alias = config.register(plain.clone());
+        config
+            .repos_meta
+            .get_mut(&main_alias)
+            .unwrap()
+            .git_common_dir = None;
+        // The oldest pre-capture configs carry no repos_meta entry at all:
+        // remove the wt entry so the absent-meta arm of the filter is pinned.
+        config.repos_meta.remove(&wt_alias);
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+        (main_alias, wt_alias, plain_alias, config, config_file)
+    };
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    state.backfill_all_missing_identities().await;
+
+    let snap = state.config_snapshot();
+    let main_identity = snap.meta(&main_alias).git_common_dir.clone();
+    assert!(
+        main_identity.is_some(),
+        "startup backfill must fill every git repo's identity"
+    );
+    assert_eq!(
+        main_identity,
+        snap.meta(&wt_alias).git_common_dir.clone(),
+        "family members must agree on the common dir"
+    );
+    assert!(
+        snap.meta(&plain_alias).git_common_dir.is_none(),
+        "non-git directories must stay identity-less"
+    );
+    let reloaded = ReposConfig::load_from(&config_file).unwrap();
+    assert_eq!(
+        reloaded.meta(&wt_alias).git_common_dir,
+        main_identity,
+        "startup backfill must persist to repos.json"
+    );
+}
+
 // === worktree-family surfaces (card #261 TODO 4) ===
 
 /// Family config for the surface tests: two registered aliases sharing one

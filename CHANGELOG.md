@@ -18,6 +18,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Fixed
 
+- **Repos registered before identity capture now join their worktree family after a serve restart.** Startup backfills the missing git common-dir identities for every registered repo (previously only group members were backfilled during group resolution), so the TUI family tree groups all worktrees under their real main even when the main predates identity capture.
+
 - **The serve TUI no longer decays into unreadable columns, and worktree families render as a tree.** The family note ("worktree of …", up to ~40 chars) was budgeted into the alias column, so on busy fleets the alias column overflowed and ratatui clipped every column from the left. The note now renders in its own dim "Worktree" column (capped at 30 chars with ellipsis), long aliases middle-ellipsis instead of clipping, and the column-width budget accounts for the lock column and ratatui's inter-column spacing. Worktrees now group under their main tree with a `|` indent (families anchor at the main's position; orphans stay indented at the tail), the note text is the bare main alias, and `groups list` renders `alias (main)`. Also fixes main-tree election when the main repo was registered before identity capture existed (identity-less mains now win the exact `.git`-path match over a shortest-path worktree).
 
 ## [1.7.2] - 2026-10-27

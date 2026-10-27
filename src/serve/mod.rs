@@ -3831,6 +3831,34 @@ impl ServeState {
                 })
                 .collect()
         };
+        self.backfill_missing_identities(missing).await;
+    }
+
+    /// One-shot startup backfill: compute the git common dir for every
+    /// registered repo still missing one (registered before identity capture
+    /// existed, or added outside the group-resolution path). Without this, a
+    /// pre-capture main tree cannot be elected main and its worktrees fall
+    /// out of the family map until a group happens to include them.
+    pub(crate) async fn backfill_all_missing_identities(&self) {
+        let missing: Vec<(String, std::path::PathBuf)> = {
+            let config = self.config_snapshot();
+            config
+                .repos
+                .iter()
+                .filter_map(|(alias, path)| {
+                    let known = config
+                        .repos_meta
+                        .get(alias)
+                        .and_then(|m| m.git_common_dir.as_ref())
+                        .is_some();
+                    (!known).then(|| (alias.clone(), path.clone()))
+                })
+                .collect()
+        };
+        self.backfill_missing_identities(missing).await;
+    }
+
+    async fn backfill_missing_identities(&self, missing: Vec<(String, std::path::PathBuf)>) {
         if missing.is_empty() {
             return;
         }
@@ -7121,6 +7149,11 @@ pub async fn run_serve(
     // it. In particular the embedded TUI must NOT derive a poll cadence from it
     // — it never polls a federated peer on a timer at all.
     let serve_state = Arc::new(ServeState::new(config, None).with_default_model(default_model));
+
+    // Backfill git identities for repos registered before identity capture
+    // existed — awaited so the first status/TUI render already sees complete
+    // worktree families (a few git spawns at most, only for missing entries).
+    serve_state.backfill_all_missing_identities().await;
 
     // The status snapshot refresher: only this task measures. Read
     // endpoints (GET /status, MCP status) answer from its stored result,
