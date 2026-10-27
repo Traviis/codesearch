@@ -449,6 +449,77 @@ mod tests {
     }
 
     #[test]
+    fn scan_fallback_applies_filter_path_inside_the_loop() {
+        // The scan must filter BEFORE consuming a limit slot: with the first
+        // matching chunk outside the filter and max_results 1, an unfiltered
+        // break would return 0 while a filtered hit exists (round-1 review
+        // finding; this test fails under the old break-at-limit-unfiltered
+        // order because chunk 0 would consume the only slot).
+        let tmp = tempfile::tempdir().unwrap();
+        seed_filtered(tmp.path());
+        let mut o = opts("lr");
+        o.filter_path = Some("src".to_string());
+        o.max_results = 1;
+        let (hits, scan_fallback) =
+            search_fts(r"ref:classification\s+id=", tmp.path(), tmp.path(), 2, &o).unwrap();
+        assert!(scan_fallback, "separator-spanning regex must scan");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the filtered hit must survive, got {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        assert_eq!(hits[0].path, "src/a.xml");
+    }
+
+    /// Two chunks both matching the separator-spanning pattern; the FIRST one
+    /// sits outside the `src/` filter, so an unfiltered limit-break would
+    /// consume its slot before the filtered chunk is ever reached.
+    fn seed_filtered(db_path: &Path) {
+        std::fs::create_dir_all(db_path).unwrap();
+        let mut vs = VectorStore::new(db_path, 2).unwrap();
+        let outside = Chunk::new(
+            "<ref:classification id=\"@outside\" />".to_string(),
+            0,
+            0,
+            ChunkKind::Block,
+            "other/b.xml".to_string(),
+        );
+        let inside = Chunk::new(
+            "<ref:classification id=\"@inside\" />".to_string(),
+            0,
+            0,
+            ChunkKind::Block,
+            "src/a.xml".to_string(),
+        );
+        vs.insert_chunks(vec![
+            crate::embed::EmbeddedChunk::new(outside, vec![0.0, 1.0]),
+            crate::embed::EmbeddedChunk::new(inside, vec![1.0, 0.0]),
+        ])
+        .unwrap();
+        vs.build_index().unwrap();
+        drop(vs);
+        let mut fts = FtsStore::new_with_writer(db_path).unwrap();
+        fts.add_chunk(
+            0,
+            "<ref:classification id=\"@outside\" />",
+            "other/b.xml",
+            None,
+            "Block",
+        )
+        .unwrap();
+        fts.add_chunk(
+            1,
+            "<ref:classification id=\"@inside\" />",
+            "src/a.xml",
+            None,
+            "Block",
+        )
+        .unwrap();
+        fts.commit().unwrap();
+    }
+
+    #[test]
     fn regex_spanning_separators_falls_back_to_raw_scan() {
         // The HUSQ.Aprimo XML class of query: anchorable tokens exist, but the
         // token-regex can never match a separator-spanning pattern. The 0-hits
