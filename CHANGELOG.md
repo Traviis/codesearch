@@ -18,6 +18,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Fixed
 
+- **Dependency bumps: fastembed 7.3→7.5 (Qwen3 reranker: f32 scores without padding, long-text kept-prefix tokenization, shared prompt head per score call) and uuid minor/patch — no API changes on our call sites.**
+
 - **The serve TUI could delete the wrong repository.** The render shows tree-ordered rows (worktrees grouped under their main, peers grouped), but the ShowInfo/RunDoctor/ForceReindex/Remove actions resolved the selected row's index against the unordered registry snapshot — so on a grouped view the confirmation dialog could name (and, once confirmed, remove) a different repo than the row under the cursor. All four action arms now resolve through the rendered rows; remote rows flash a "not supported" hint instead. Peer mounts group in the same tree style: multi-mount peers get a synthetic header row with the peer (server) name, and each of its mounts is `|`-indented beneath it — no mount reads as another's parent.
 
 - **Repos registered before identity capture now join their worktree family after a serve restart.** Startup backfills the missing git common-dir identities for every registered repo (previously only group members were backfilled during group resolution), so the TUI family tree groups all worktrees under their real main even when the main predates identity capture.
