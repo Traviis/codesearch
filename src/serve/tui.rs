@@ -572,6 +572,7 @@ fn map_repo_rows(
 
             RepoRow {
                 alias: alias.clone(),
+                display_name: None,
                 status: status_str,
                 csharp_index: csharp_str,
                 csharp_error: info.csharp_error.clone(),
@@ -657,14 +658,37 @@ async fn poll_peer_status(
 /// Group remote peer mounts visually under their peer prefix: the first
 /// mount per peer stays unindented as the anchor, the rest get the `| `
 /// indent. Local rows and remotes without a `peer/alias` shape are skipped.
-/// Group peer mounts under a synthetic header row: `cloud/akeneo` and
-/// `cloud/erp` render as children of a bare `cloud` header instead of the
-/// first mount doubling as an (unreadable-as-parent) anchor. Header rows are
-/// remote-shaped (empty cells, unindented); every mount of the peer is
-/// indented. Single-mount peers and bare remotes (no `/`) stay as-is — the
-/// misleading-parentage problem only exists with two or more mounts. Locals
-/// are never touched.
+/// Group peer mounts under a synthetic header row carrying the peer's
+/// HOSTNAME (parsed from the mount's peer URL, falling back to the alias
+/// prefix when no URL is known): `cloud/akeneo` and `cloud/erp` render as
+/// `| akeneo` / `| erp` under a `host.example` header — the remote name
+/// ("cloud") is a local mount label, not part of the repo name. Header rows
+/// are remote-shaped (empty cells, unindented); every mount of the peer is
+/// indented and displays its bare repo name (`display_name`; `alias` stays
+/// the full query name). Single-mount peers and bare remotes (no `/`) stay
+/// as-is — the misleading-parentage problem only exists with two or more
+/// mounts. Locals are never touched.
 fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
+    fn hostname_of(url: &str, fallback: &str) -> String {
+        let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+        // IPv6 literals: the bracketed address IS the host — a plain split on
+        // ':' would truncate to '['.
+        let host = if after_scheme.starts_with('[') {
+            let end = after_scheme
+                .find(']')
+                .map(|i| i + 1)
+                .unwrap_or(after_scheme.len());
+            &after_scheme[..end]
+        } else {
+            after_scheme.split([':', '/']).next().unwrap_or_default()
+        };
+        let host = host.trim();
+        if host.is_empty() {
+            fallback.to_string()
+        } else {
+            host.to_string()
+        }
+    }
     let mut mount_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for row in rows.iter().filter(|r| r.is_remote && r.alias.contains('/')) {
@@ -691,10 +715,11 @@ fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
         if !headers_emitted.contains(&peer) {
             headers_emitted.push(peer.clone());
             let mut header = row.clone();
-            header.alias = peer;
+            header.alias = hostname_of(&row.path, &peer);
             // Header rows are remote-shaped with EMPTY cells: clearing only
             // status would render the first mount's live stats as the
             // server's own.
+            header.display_name = None;
             header.status = String::new();
             header.changes = 0;
             header.tool_call_count = 0;
@@ -705,6 +730,15 @@ fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
         }
         let mut child = row;
         child.indent = true;
+        // The header already names the server; the mount shows the bare repo
+        // name (display-only — `alias` remains `peer/repo` for actions/info).
+        child.display_name = Some(
+            child
+                .alias
+                .split_once('/')
+                .map(|(_, rest)| rest.to_string())
+                .unwrap_or_else(|| child.alias.clone()),
+        );
         grouped.push(child);
     }
     *rows = grouped;
@@ -835,6 +869,7 @@ fn build_remote_rows(
             let st = status_lookup.get(&(peer_name, remote_alias));
             RepoRow {
                 alias: local_name,
+                display_name: None,
                 // Reuse the peer's own status vocabulary (open/warm/…); default
                 // to "warm" for a cached-but-unreachable peer.
                 status: st
@@ -1575,8 +1610,9 @@ mod family_note_tests {
 
     #[test]
     fn group_peer_mounts_groups_multi_mount_peers_under_a_synthetic_header() {
-        let row = |alias: &str, is_remote: bool| RepoRow {
+        let row = |alias: &str, is_remote: bool, path: &str| RepoRow {
             alias: alias.to_string(),
+            display_name: None,
             status: "warm".to_string(),
             csharp_index: "none".to_string(),
             csharp_error: None,
@@ -1585,37 +1621,45 @@ mod family_note_tests {
             tool_call_count: 0,
             last_tool_call: None,
             lock_mode: String::new(),
-            path: String::new(),
+            path: path.to_string(),
             is_remote,
             activity_stale: false,
             family_note: None,
             indent: false,
         };
         let mut rows = vec![
-            row("local-repo", false),
+            row("local-repo", false, ""),
             {
                 // Live stat columns on the mount: the synthetic header must
                 // clear every borrowed field, so the fixture can tell.
-                let mut r = row("cloud/first", true);
+                let mut r = row("cloud/first", true, "https://codesearch.dlw.example:39725");
                 r.changes = 5;
                 r.tool_call_count = 7;
                 r.last_tool_call = Some("14:32".to_string());
                 r.lock_mode = "write".to_string();
                 r
             },
-            row("cloud/second", true),
-            row("peer2/only", true),
-            row("bare-name", true),
+            row("cloud/second", true, "https://codesearch.dlw.example:39725"),
+            row("peer3/a", true, ""),
+            row("peer3/b", true, ""),
+            row("ipv6/x", true, "http://[::1]:39725"),
+            row("ipv6/y", true, "http://[::1]:39725"),
+            row("bare-name", true, ""),
+            row("solo/only", true, "https://solo.example:39725"),
         ];
         group_peer_mounts(&mut rows);
-        assert_eq!(rows.len(), 6, "one synthetic header inserted for cloud");
+        assert_eq!(
+            rows.len(),
+            12,
+            "one synthetic header per multi-mount peer (cloud, peer3, ipv6); none for solo"
+        );
         assert!(
             !rows[0].indent && rows[0].alias == "local-repo",
             "locals are never touched"
         );
         assert_eq!(
-            rows[1].alias, "cloud",
-            "synthetic header carries the peer name"
+            rows[1].alias, "codesearch.dlw.example",
+            "synthetic header carries the peer HOSTNAME parsed from the URL"
         );
         assert!(
             !rows[1].indent && rows[1].status.is_empty(),
@@ -1629,18 +1673,43 @@ mod family_note_tests {
             "header clears every borrowed stat column of the first mount"
         );
         assert_eq!(rows[2].alias, "cloud/first");
+        assert_eq!(
+            rows[2].display_name.as_deref(),
+            Some("first"),
+            "mounts display the bare repo name; alias stays the query name"
+        );
         assert!(
             rows[2].indent,
             "every mount of the peer indents under the header"
         );
         assert_eq!(rows[3].alias, "cloud/second");
+        assert_eq!(rows[3].display_name.as_deref(), Some("second"));
         assert!(rows[3].indent, "no mount doubles as the anchor any more");
-        assert_eq!(rows[4].alias, "peer2/only");
-        assert!(
-            !rows[4].indent,
-            "single-mount peers stay unindented without a header"
+        assert_eq!(
+            rows[4].alias, "peer3",
+            "peer without a known URL falls back to the alias prefix"
         );
-        assert_eq!(rows[5].alias, "bare-name");
-        assert!(!rows[5].indent, "remotes without peer/alias shape stay put");
+        assert!(rows[5].indent && rows[6].indent, "peer3 mounts indent");
+        assert_eq!(rows[5].display_name.as_deref(), Some("a"));
+        assert_eq!(
+            rows[7].alias, "[::1]",
+            "IPv6-literal URLs parse to the bracketed address, not a truncated '['"
+        );
+        assert!(rows[7].status.is_empty(), "ipv6 header is blank");
+        assert!(rows[8].indent && rows[9].indent, "ipv6 mounts indent");
+        assert_eq!(rows[8].display_name.as_deref(), Some("x"));
+        assert_eq!(rows[10].alias, "bare-name");
+        assert!(
+            !rows[10].indent,
+            "remotes without peer/alias shape stay put, after the groups"
+        );
+        assert_eq!(
+            rows[11].alias, "solo/only",
+            "single-mount peers keep the full alias"
+        );
+        assert!(
+            !rows[11].indent && rows[11].display_name.is_none(),
+            "single-mount peers get neither a header nor a display-name strip"
+        );
     }
 }

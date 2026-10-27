@@ -4962,6 +4962,7 @@ fn render_table_caps_long_alias_and_keeps_columns_on_narrow_terminal() {
     let wt_alias = "wt-deploy-branch-20261023-suffix";
     let row = |alias: &str, note: Option<String>, indent: bool| crate::serve::tui_common::RepoRow {
         alias: alias.to_string(),
+        display_name: None,
         status: "warm".to_string(),
         csharp_index: "none".to_string(),
         csharp_error: None,

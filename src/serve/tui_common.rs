@@ -52,6 +52,11 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone)]
 pub struct RepoRow {
     pub alias: String,
+    /// Display-only alias override: when set, the table renders this instead
+    /// of `alias` (peer mounts show the bare repo name under their hostname
+    /// header, while `alias` stays the full `peer/repo` query name used by
+    /// actions and the info lookup). `None` everywhere else.
+    pub display_name: Option<String>,
     /// Human-readable status: "open", "warm", "readonly", "idle" (wire "idle"/"closed":
     /// index on disk, repo unloaded — resting, not indexing), "indexing", "error", "no_index"
     pub status: String,
@@ -670,7 +675,8 @@ pub fn render_table(
             let text_cap = alias_content_cap
                 .saturating_sub(prefix.len() + extra)
                 .max(4);
-            let alias_display = format!("{prefix}{}", middle_ellipsis_text(&repo.alias, text_cap));
+            let shown_alias = repo.display_name.as_deref().unwrap_or(&repo.alias);
+            let alias_display = format!("{prefix}{}", middle_ellipsis_text(shown_alias, text_cap));
             let mut alias_spans: Vec<Span> = vec![Span::styled(alias_display, base_alias_style)];
 
             if let Some((glyph, style)) =
