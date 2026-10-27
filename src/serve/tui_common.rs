@@ -509,20 +509,42 @@ pub fn ts_indicator(status: &str) -> Option<(&'static str, Style)> {
     }
 }
 
+/// The Worktree column's text: the note as-is, ellipsis-truncated at `cap`
+/// display columns, empty when the row has no note.
+fn note_cell_text(note: Option<&str>, cap: usize) -> String {
+    match note {
+        Some(n) if n.len() > cap => {
+            let cut: String = n.chars().take(cap - 1).collect();
+            format!("{cut}…")
+        }
+        Some(n) => n.to_string(),
+        None => String::new(),
+    }
+}
+
 pub fn render_table(
     f: &mut ratatui::Frame,
     area: Rect,
     repos: &[RepoRow],
     table_state: &mut TableState,
 ) {
-    let header_cells = [
-        "Alias",
-        "Status",
-        "Changes",
-        "Calls",
-        "Last Tool Call",
-        "Lock",
-    ];
+    // Family notes get their own dim column, capped so one very long main
+    // alias cannot re-create the overflow; hidden entirely when no row has
+    // a note (no worktrees registered).
+    const NOTE_COL_CAP: usize = 30;
+    let max_note_w = repos
+        .iter()
+        .filter_map(|r| r.family_note.as_deref().map(str::len))
+        .max()
+        .unwrap_or(0)
+        .min(NOTE_COL_CAP);
+    let show_notes = max_note_w > 0;
+
+    let mut header_cells = vec!["Alias"];
+    if show_notes {
+        header_cells.push("Worktree");
+    }
+    header_cells.extend(["Status", "Changes", "Calls", "Last Tool Call", "Lock"]);
     let header = Row::new(
         header_cells
             .iter()
@@ -536,15 +558,20 @@ pub fn render_table(
         .map(|r| {
             // Each indicator is a suffix like " C#·"; ⚠ (the partial glyph)
             // is double-width (unicode-width EAW=W) so its variant budgets
-            // 6 display cols instead of 4. The family note is a plain-ASCII
-            // dim suffix and budgets its own width.
+            // 6 display cols instead of 4. The family note renders in its
+            // own column so a long "worktree of …" note can no longer blow
+            // the alias budget past the terminal width (which made ratatui
+            // clip every column from the left).
             let extra = indicator_cols(&r.csharp_index) + indicator_cols(&r.typescript_index);
-            let note = r.family_note.as_deref().map(|n| n.len() + 1).unwrap_or(0);
-            r.alias.len() + extra + note
+            r.alias.len() + extra
         })
         .max()
         .unwrap_or(10)
         .max(10);
+
+    let note_cell = |note: Option<&str>| -> Cell<'static> {
+        Cell::from(note_cell_text(note, NOTE_COL_CAP)).style(Style::default().fg(Color::DarkGray))
+    };
 
     let rows: Vec<Row> = repos
         .iter()
@@ -589,15 +616,6 @@ pub fn render_table(
             let mut alias_spans: Vec<Span> =
                 vec![Span::styled(repo.alias.clone(), base_alias_style)];
 
-            // Family note: dim, after the alias, before the language
-            // indicators — grouped rendering only, never interactive.
-            if let Some(note) = repo.family_note.as_deref() {
-                alias_spans.push(Span::styled(
-                    format!(" {note}"),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-
             if let Some((glyph, style)) =
                 csharp_indicator(repo.csharp_index.as_str(), pulse_bright())
             {
@@ -609,40 +627,40 @@ pub fn render_table(
 
             let alias_cell = Cell::from(Text::from(Line::from(alias_spans)));
 
-            Row::new(vec![
-                alias_cell,
-                status_cell,
-                changes_cell,
-                calls_cell,
-                tool_cell,
-                lock_cell,
-            ])
+            let mut cells = vec![alias_cell];
+            if show_notes {
+                cells.push(note_cell(repo.family_note.as_deref()));
+            }
+            cells.extend([status_cell, changes_cell, calls_cell, tool_cell, lock_cell]);
+
+            Row::new(cells)
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(max_alias_w as u16 + 2),
-            Constraint::Length(14),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Min(24),
-            Constraint::Length(7),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::NONE)
-            .style(Style::default().bg(Color::Reset)),
-    )
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::Rgb(30, 30, 50))
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("▶ ");
+    let mut constraints = vec![Constraint::Length(max_alias_w as u16 + 2)];
+    if show_notes {
+        constraints.push(Constraint::Length(max_note_w as u16 + 2));
+    }
+    constraints.extend([
+        Constraint::Length(14),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Min(24),
+        Constraint::Length(7),
+    ]);
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::NONE)
+                .style(Style::default().bg(Color::Reset)),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(30, 30, 50))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
 
     f.render_stateful_widget(table, area, table_state);
 }
@@ -1651,6 +1669,17 @@ pub fn restore_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_cell_text_truncates_at_cap_and_empties_without_note() {
+        assert_eq!(note_cell_text(None, 30), "");
+        assert_eq!(note_cell_text(Some("+ 2 worktrees"), 30), "+ 2 worktrees");
+        let long = "worktree of wt-209169-deploy-20261023";
+        let got = note_cell_text(Some(long), 30);
+        assert_eq!(got.chars().count(), 30, "capped to the column width");
+        assert!(got.ends_with('…'));
+        assert!(long.starts_with(got.trim_end_matches('…')));
+    }
 
     #[test]
     fn status_cell_renders_idle_and_legacy_closed_as_idle() {
