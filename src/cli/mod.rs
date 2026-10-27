@@ -1554,7 +1554,7 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
 }
 
 /// Human-facing grouped rendering for `groups list`: a member that is a
-/// worktree of another member is annotated `"(worktree of <main>)"`, and a
+/// worktree of another member is annotated `"(<main>)"`, and a
 /// family's main tree in the list gets `"+ N worktrees"` (counted within the
 /// group). The alias list itself stays flat — display only.
 fn render_group_members(
@@ -2714,7 +2714,7 @@ mod tests {
     }
 
     /// `groups list` grouped rendering is display-only: worktree members get
-    /// the "(worktree of <main>)" annotation, the family's main tree gets
+    /// the "(<main>)" annotation, the family's main tree gets
     /// "+ N worktrees" counted within the group, others stay bare.
     #[test]
     fn groups_list_renders_family_annotations() {
@@ -2730,8 +2730,8 @@ mod tests {
             rendered,
             vec![
                 "main (+ 2 worktrees)".to_string(),
-                "wt1 (worktree of main)".to_string(),
-                "wt2 (worktree of main)".to_string(),
+                "wt1 (main)".to_string(),
+                "wt2 (main)".to_string(),
                 "solo".to_string(),
             ]
         );

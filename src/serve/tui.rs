@@ -461,18 +461,55 @@ fn map_repo_rows(
     state: &Arc<ServeState>,
 ) -> Vec<RepoRow> {
     let config = state.config_snapshot();
-    // Grouped rendering (human-facing only): each family's main-tree row gets
-    // a "+ N worktrees" note, each worktree row a "worktree of <main>" note.
-    // Counting scope: the whole fleet (the TUI lists every registered repo).
+    // Grouped rendering (human-facing only): each family renders as a tree —
+    // the main-tree row followed directly by its worktrees, each indented
+    // with `| `; the Worktree column carries only the main's "+ N worktrees"
+    // count (the tree shape carries the relationship). Counting scope: the
+    // whole fleet (the TUI lists every registered repo).
     let family_map = config.worktree_family_map();
     let mut family_sizes: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for main in family_map.values() {
         *family_sizes.entry(main.clone()).or_insert(0) += 1;
     }
-    repos
-        .iter()
-        .map(|(alias, info)| {
+    let mut by_main: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (wt, main) in &family_map {
+        by_main.entry(main.as_str()).or_default().push(wt.as_str());
+    }
+    let is_worktree: std::collections::HashSet<&str> =
+        family_map.keys().map(String::as_str).collect();
+
+    // Reorder: families anchor at the main's own position; a worktree met
+    // before its main is skipped there and emitted under the main instead.
+    // Worktrees whose main is missing from this snapshot (transient between
+    // config and status) keep their row, still indented.
+    let mut ordered: Vec<(&(String, super::RepoStatusInfo), bool)> = Vec::new();
+    let mut emitted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for entry in repos.iter() {
+        if is_worktree.contains(entry.0.as_str()) {
+            continue;
+        }
+        ordered.push((entry, false));
+        if let Some(wts) = by_main.get(entry.0.as_str()) {
+            let mut wts: Vec<&str> = wts.clone();
+            wts.sort_unstable();
+            for wt in wts {
+                if let Some(w_entry) = repos.iter().find(|(a, _)| a == wt) {
+                    ordered.push((w_entry, true));
+                }
+                emitted.insert(wt);
+            }
+        }
+    }
+    for entry in repos.iter() {
+        if is_worktree.contains(entry.0.as_str()) && !emitted.contains(entry.0.as_str()) {
+            ordered.push((entry, true));
+        }
+    }
+
+    ordered
+        .into_iter()
+        .map(|((alias, info), is_wt)| {
             let status_str = match info.status {
                 super::RepoStateLabel::Open => "open",
                 super::RepoStateLabel::Warm => "warm",
@@ -528,11 +565,14 @@ fn map_repo_rows(
                 is_remote: false,
                 // Local repos carry live serve state — never stale.
                 activity_stale: false,
-                family_note: crate::db_discovery::repos::family_note(
-                    &family_map,
-                    &family_sizes,
-                    alias,
-                ),
+                // Worktree rows show the relationship via the `| ` tree
+                // indent, so the note column stays count-only.
+                family_note: if is_wt {
+                    None
+                } else {
+                    crate::db_discovery::repos::family_note(&family_map, &family_sizes, alias)
+                },
+                worktree_indent: is_wt,
             }
         })
         .collect()
@@ -740,6 +780,7 @@ fn build_remote_rows(
                 activity_stale: false,
                 // Mounted remote projects carry no local family identity.
                 family_note: None,
+                worktree_indent: false,
             }
         })
         .collect()
@@ -1394,16 +1435,74 @@ mod family_note_tests {
             ),
         ];
         let rows = map_repo_rows(&repos, &state);
+        // Tree grouping: the main's row is followed directly by its
+        // worktree, indented; solo stays in place.
+        assert_eq!(rows[0].alias, main, "main anchors the family group");
+        assert_eq!(rows[1].alias, wt, "worktree renders under its main");
+        assert_eq!(rows[2].alias, "solo");
+        assert!(!rows[0].worktree_indent && !rows[2].worktree_indent);
+        assert!(rows[1].worktree_indent, "worktree rows carry the | indent");
         let by_alias: std::collections::HashMap<&str, &RepoRow> =
             rows.iter().map(|r| (r.alias.as_str(), r)).collect();
         assert_eq!(
-            by_alias[wt.as_str()].family_note.as_deref(),
-            Some("worktree of m")
+            by_alias[wt.as_str()].family_note,
+            None,
+            "the tree indent carries the relationship; note column stays count-only"
         );
         assert_eq!(
             by_alias[main.as_str()].family_note.as_deref(),
             Some("+ 1 worktree")
         );
         assert_eq!(by_alias["solo"].family_note, None);
+    }
+
+    #[test]
+    fn map_repo_rows_reorders_worktrees_met_before_their_main() {
+        let (_tmp, main, wt, state) = crate::serve::tests::family_state();
+
+        let info = || crate::serve::RepoStatusInfo {
+            status: crate::serve::RepoStateLabel::Warm,
+            changes: 0,
+            last_tool_call: None,
+            tool_call_count: 0,
+            csharp_index: crate::serve::CSharpIndexStatus::None,
+            csharp_error: None,
+            typescript_index: crate::serve::CSharpIndexStatus::None,
+        };
+        // Snapshot order puts the worktree BEFORE its main: the skip branch
+        // must hold it back and re-emit it under the main.
+        let repos = vec![
+            (wt.clone(), info()),
+            (main.clone(), info()),
+            ("solo".to_string(), info()),
+        ];
+        let rows = map_repo_rows(&repos, &state);
+        assert_eq!(rows[0].alias, main, "main anchors the family group");
+        assert_eq!(rows[1].alias, wt, "worktree re-emitted under its main");
+        assert_eq!(rows[2].alias, "solo", "non-family order preserved");
+        assert!(rows[1].worktree_indent);
+        assert!(!rows[0].worktree_indent && !rows[2].worktree_indent);
+    }
+
+    #[test]
+    fn map_repo_rows_keeps_orphan_worktrees_indented_at_the_tail() {
+        let (_tmp, _main, wt, state) = crate::serve::tests::family_state();
+
+        let info = || crate::serve::RepoStatusInfo {
+            status: crate::serve::RepoStateLabel::Warm,
+            changes: 0,
+            last_tool_call: None,
+            tool_call_count: 0,
+            csharp_index: crate::serve::CSharpIndexStatus::None,
+            csharp_error: None,
+            typescript_index: crate::serve::CSharpIndexStatus::None,
+        };
+        // The main is absent from the snapshot (e.g. evicted): the defensive
+        // tail still renders the worktree, indented, never dropped.
+        let repos = vec![("solo".to_string(), info()), (wt.clone(), info())];
+        let rows = map_repo_rows(&repos, &state);
+        assert_eq!(rows[0].alias, "solo");
+        assert_eq!(rows[1].alias, wt, "orphan worktree survives at the tail");
+        assert!(rows[1].worktree_indent, "orphan worktree stays indented");
     }
 }

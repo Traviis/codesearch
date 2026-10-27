@@ -1579,6 +1579,33 @@ fn worktree_family_map_prefers_exact_git_dir_main_over_shortest_path() {
 }
 
 #[test]
+fn worktree_family_map_elects_identity_less_main_via_git_dir() {
+    // A main tree registered before identity capture existed has no recorded
+    // git_common_dir — but its `<repo>/.git` still equals the family
+    // identity, so the exact-match election must consider it. Without this,
+    // the shortest-path fallback elects a worktree (possibly parked in a
+    // temp dir) as the family's "main".
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(
+        &mut cfg,
+        &tmp.path().join("main-tree"),
+        &tmp.path().join("wt"), // shorter path: would win the fallback
+    );
+    cfg.repos_meta
+        .entry(main.clone())
+        .or_default()
+        .git_common_dir = None;
+    let map = cfg.worktree_family_map();
+    assert_eq!(
+        map.get(wt.as_str()).map(String::as_str),
+        Some(main.as_str()),
+        "the identity-less main must be elected via its .git path"
+    );
+    assert!(!map.contains_key(main.as_str()));
+}
+
+#[test]
 fn worktree_family_map_tie_breaks_on_alias() {
     // Same-length paths, same identity: the lexicographically smallest alias
     // is the main tree.
@@ -1614,7 +1641,7 @@ fn family_note_covers_both_arms_and_pluralization() {
     counts.insert("zero".to_string(), 0);
     assert_eq!(
         family_note(&family_map, &counts, "wt1").as_deref(),
-        Some("worktree of main")
+        Some("main")
     );
     assert_eq!(
         family_note(&family_map, &counts, "main").as_deref(),

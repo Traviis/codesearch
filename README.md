@@ -414,10 +414,6 @@ codesearch index list
 codesearch index prune
 ```
 
-The repository **alias** (the key in `repos.json`, used for groups and the MCP
-`project` argument) is always derived automatically from the directory name —
-there is no `--alias` flag.
-
 Serve reads `~/.codesearch/repos.json` on startup and manages all registered repos.
 
 #### Moved or renamed repositories

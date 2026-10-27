@@ -4953,6 +4953,83 @@ fn modal_wraps_long_warning_lines_instead_of_clipping() {
     );
 }
 
+/// Narrow-terminal decay guard for the repo table: the alias column must CAP
+/// via middle-ellipsis (head+…+tail) instead of letting ratatui clip columns
+/// from the left — the status column and the `| ` worktree indent must stay
+/// visible next to a long alias.
+#[test]
+fn render_table_caps_long_alias_and_keeps_columns_on_narrow_terminal() {
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::TableState;
+    use ratatui::Terminal;
+
+    let long_alias = "very-long-alias-name-for-a-repository-x";
+    let wt_alias = "wt-deploy-branch-20261023-suffix";
+    let row = |alias: &str, note: Option<String>, indent: bool| crate::serve::tui_common::RepoRow {
+        alias: alias.to_string(),
+        status: "warm".to_string(),
+        csharp_index: "none".to_string(),
+        csharp_error: None,
+        typescript_index: "none".to_string(),
+        changes: 0,
+        tool_call_count: 0,
+        last_tool_call: None,
+        lock_mode: String::new(),
+        path: String::new(),
+        is_remote: false,
+        activity_stale: false,
+        family_note: note,
+        worktree_indent: indent,
+    };
+    let repos = vec![
+        row(long_alias, Some("+ 1 worktree".to_string()), false),
+        row(wt_alias, None, true),
+    ];
+
+    // Width 110: the fixed columns (note+status+changes+calls+tool+lock)
+    // fit with room to spare, so the alias cap — not ratatui's constraint
+    // squeeze — is what bounds the alias cell.
+    let mut terminal = Terminal::new(TestBackend::new(110, 10)).unwrap();
+    terminal
+        .draw(|f| {
+            let mut ts = TableState::default();
+            crate::serve::tui_common::render_table(f, f.area(), &repos, &mut ts);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let mut rendered = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            rendered.push_str(buffer[(x, y)].symbol());
+        }
+        rendered.push('\n');
+    }
+
+    // Middle-ellipsis, not a hard clip: the head region AND the tail of the
+    // long alias both survive with "..." between them (a right-clip would
+    // lose the tail, the original left-clip decay lost everything).
+    assert!(
+        rendered.contains("very-long") && rendered.contains("repository-x"),
+        "the long alias must render middle-ellipsised (head and tail kept), got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("..."),
+        "the ellipsis marker must be present, got:\n{rendered}"
+    );
+    // The worktree row keeps its tree indent.
+    assert!(
+        rendered.contains("| "),
+        "worktree rows must carry the | indent, got:\n{rendered}"
+    );
+    // The status column must still render — the original decay clipped
+    // every column from the left.
+    assert!(
+        rendered.contains("warm"),
+        "the status column must survive next to a long alias, got:\n{rendered}"
+    );
+}
+
 /// The serve-mode find_impact self-heal spawn must reach
 /// `trigger_symbol_rebuild` for a registered, applicable repo: after the
 /// warned empty answer, the C# status eventually flips to Error (dummy
