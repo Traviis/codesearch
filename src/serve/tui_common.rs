@@ -85,11 +85,16 @@ pub struct RepoRow {
     /// "Xh ago". Always `false` for local repos (which carry live serve state)
     /// and for the standalone remote dashboard.
     pub activity_stale: bool,
-    /// Worktree-family annotation rendered as a dim suffix on the alias:
-    /// `"+ N worktrees"` on a family's main-tree row, `"worktree of <main>"`
-    /// on a worktree row. Display-only — actions and identity use `alias`.
-    /// `None` on remote rows and familyless repos.
+    /// Worktree-family annotation rendered in the dim Worktree column:
+    /// `"+ N worktrees"` on a family's main-tree row. Worktree rows carry
+    /// `None` — their relationship renders as the `| `-indented tree shape
+    /// under the main (see `worktree_indent`). Display-only — actions and
+    /// identity use `alias`. `None` on remote rows and familyless repos.
     pub family_note: Option<String>,
+    /// True when this row is a worktree grouped under its family's main:
+    /// the alias renders as `| <alias>` directly below the main's row.
+    /// Display-only. Always `false` on remote rows.
+    pub worktree_indent: bool,
 }
 
 /// Actions returned by key handling.
@@ -522,6 +527,28 @@ fn note_cell_text(note: Option<&str>, cap: usize) -> String {
     }
 }
 
+/// Middle-ellipsis: when `s` exceeds `cap` display columns, keep its head and
+/// tail and put "..." in the middle — a clipped-from-the-right alias hides the
+/// distinguishing suffix (deploy tags, worktree names), a middle cut keeps
+/// both ends recognizable. Char-count based, same convention as the rest of
+/// the table budgets.
+fn middle_ellipsis_text(s: &str, cap: usize) -> String {
+    let count = s.chars().count();
+    if count <= cap {
+        return s.to_string();
+    }
+    if cap < 5 {
+        // Too narrow for a sensible "..." cut; hard-truncate.
+        return s.chars().take(cap).collect();
+    }
+    let keep = cap - 3;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let head_text: String = s.chars().take(head).collect();
+    let tail_text: String = s.chars().skip(count - tail).collect();
+    format!("{head_text}...{tail_text}")
+}
+
 pub fn render_table(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -561,13 +588,36 @@ pub fn render_table(
             // 6 display cols instead of 4. The family note renders in its
             // own column so a long "worktree of …" note can no longer blow
             // the alias budget past the terminal width (which made ratatui
-            // clip every column from the left).
+            // clip every column from the left). Worktree rows budget the
+            // `| ` tree indent too.
             let extra = indicator_cols(&r.csharp_index) + indicator_cols(&r.typescript_index);
-            r.alias.len() + extra
+            r.alias.len() + if r.worktree_indent { 2 } else { 0 } + extra
         })
         .max()
         .unwrap_or(10)
         .max(10);
+
+    // On a narrow terminal the fixed columns after the alias can overflow the
+    // width and ratatui hard-clips cell content from the right — the exact
+    // decay the worktree-column fix chased. Cap the alias column to what the
+    // terminal can afford (status keeps its Min(24) floor) and middle-ellipsis
+    // the aliases that no longer fit, instead of letting ratatui clip them.
+    // Ratatui inserts one space between columns (default column_spacing);
+    // the alias cap must budget those gaps too, or the constraint total
+    // exceeds the width and the solver squeezes the alias column anyway
+    // (clipping the ellipsised tail from the right).
+    let gaps_after_alias: usize = if show_notes { 6 } else { 5 };
+    let fixed_after_alias: usize = if show_notes { max_note_w + 2 } else { 0 }
+        + 14 // status
+        + 7 // changes
+        + 7 // calls
+        + 7 // lock
+        + gaps_after_alias;
+    let alias_avail = (area.width as usize)
+        .saturating_sub(fixed_after_alias)
+        .saturating_sub(24) // the Min(24) tool column floor
+        .max(14); // never squeeze the alias column below a usable floor
+    let alias_content_cap = alias_avail.saturating_sub(2); // cell padding
 
     let note_cell = |note: Option<&str>| -> Cell<'static> {
         Cell::from(note_cell_text(note, NOTE_COL_CAP)).style(Style::default().fg(Color::DarkGray))
@@ -606,6 +656,7 @@ pub fn render_table(
             // indicators: yellow ⚠ for a degraded (warnings) index, fully red
             // ! for a general error. A table with red aliases reads as half
             // the fleet being down, which a warnings-degraded index is not.
+            // Worktree rows indent as a tree under their family's main.
             let base_alias_style = if repo.is_remote {
                 Style::default()
                     .fg(Color::Cyan)
@@ -613,8 +664,13 @@ pub fn render_table(
             } else {
                 Style::default().fg(Color::White)
             };
-            let mut alias_spans: Vec<Span> =
-                vec![Span::styled(repo.alias.clone(), base_alias_style)];
+            let prefix = if repo.worktree_indent { "| " } else { "" };
+            let extra = indicator_cols(&repo.csharp_index) + indicator_cols(&repo.typescript_index);
+            let text_cap = alias_content_cap
+                .saturating_sub(prefix.len() + extra)
+                .max(4);
+            let alias_display = format!("{prefix}{}", middle_ellipsis_text(&repo.alias, text_cap));
+            let mut alias_spans: Vec<Span> = vec![Span::styled(alias_display, base_alias_style)];
 
             if let Some((glyph, style)) =
                 csharp_indicator(repo.csharp_index.as_str(), pulse_bright())
@@ -637,7 +693,9 @@ pub fn render_table(
         })
         .collect();
 
-    let mut constraints = vec![Constraint::Length(max_alias_w as u16 + 2)];
+    let mut constraints = vec![Constraint::Length(
+        (max_alias_w as u16 + 2).min(alias_avail as u16),
+    )];
     if show_notes {
         constraints.push(Constraint::Length(max_note_w as u16 + 2));
     }
@@ -1679,6 +1737,19 @@ mod tests {
         assert_eq!(got.chars().count(), 30, "capped to the column width");
         assert!(got.ends_with('…'));
         assert!(long.starts_with(got.trim_end_matches('…')));
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_head_and_tail() {
+        assert_eq!(middle_ellipsis_text("short", 10), "short");
+        let long = "storefront-209169-deploy-2";
+        let got = middle_ellipsis_text(long, 15);
+        assert_eq!(got.chars().count(), 15, "capped to the column width");
+        assert!(got.contains("..."), "ellipsis sits in the middle");
+        assert!(long.starts_with(got.split("...").next().unwrap()));
+        assert!(long.ends_with(got.rsplit("...").next().unwrap()));
+        // Too narrow for a sensible cut: hard-truncate.
+        assert_eq!(middle_ellipsis_text("abcdef", 3), "abc");
     }
 
     #[test]
