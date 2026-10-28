@@ -658,12 +658,13 @@ async fn poll_peer_status(
 /// Group remote peer mounts visually under their peer prefix: the first
 /// mount per peer stays unindented as the anchor, the rest get the `| `
 /// indent. Local rows and remotes without a `peer/alias` shape are skipped.
-/// Group peer mounts under a synthetic header row carrying the peer's
-/// HOSTNAME (parsed from the mount's peer URL, falling back to the alias
-/// prefix when no URL is known): `cloud/akeneo` and `cloud/erp` render as
-/// `| akeneo` / `| erp` under a `host.example` header — the remote name
-/// ("cloud") is a local mount label, not part of the repo name. Header rows
-/// are remote-shaped (empty cells, unindented); every mount of the peer is
+/// Group peer mounts under a synthetic header row carrying the federated
+/// peer's name and its server hostname (`<remote-name>/<hostname>`, parsed
+/// from the mount's peer URL; a URL without a host falls back to the remote
+/// name alone): `cloud/akeneo` and `cloud/erp` render as
+/// `| akeneo` / `| erp` under a `cloud/host.example` header — the remote
+/// name ("cloud") is a local mount label, not part of the repo name. Header
+/// rows are remote-shaped (empty cells, unindented); every mount of the peer is
 /// indented and displays its bare repo name (`display_name`; `alias` stays
 /// the full query name). Single-mount peers and bare remotes (no `/`) stay
 /// as-is — the misleading-parentage problem only exists with two or more
@@ -714,8 +715,17 @@ fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
         }
         if !headers_emitted.contains(&peer) {
             headers_emitted.push(peer.clone());
+            let host = hostname_of(&row.path, &peer);
             let mut header = row.clone();
-            header.alias = hostname_of(&row.path, &peer);
+            // The header names the federated peer AND its server: the remote
+            // name is configuration, not a hostname, so show both —
+            // `<remote-name>/<hostname>` (hostname-only fallback keeps one
+            // name when the URL carries none).
+            header.alias = if host == peer {
+                host
+            } else {
+                format!("{peer}/{host}")
+            };
             // Header rows are remote-shaped with EMPTY cells: clearing only
             // status would render the first mount's live stats as the
             // server's own.
@@ -1658,8 +1668,8 @@ mod family_note_tests {
             "locals are never touched"
         );
         assert_eq!(
-            rows[1].alias, "codesearch.dlw.example",
-            "synthetic header carries the peer HOSTNAME parsed from the URL"
+            rows[1].alias, "cloud/codesearch.dlw.example",
+            "synthetic header names the federated peer AND its server hostname"
         );
         assert!(
             !rows[1].indent && rows[1].status.is_empty(),
@@ -1687,14 +1697,14 @@ mod family_note_tests {
         assert!(rows[3].indent, "no mount doubles as the anchor any more");
         assert_eq!(
             rows[4].alias, "peer3",
-            "peer without a known URL falls back to the alias prefix"
+            "peer whose URL carries no host falls back to the remote name alone"
+        );
+        assert_eq!(
+            rows[7].alias, "ipv6/[::1]",
+            "IPv6-literal URLs parse to the bracketed address, not a truncated '['"
         );
         assert!(rows[5].indent && rows[6].indent, "peer3 mounts indent");
         assert_eq!(rows[5].display_name.as_deref(), Some("a"));
-        assert_eq!(
-            rows[7].alias, "[::1]",
-            "IPv6-literal URLs parse to the bracketed address, not a truncated '['"
-        );
         assert!(rows[7].status.is_empty(), "ipv6 header is blank");
         assert!(rows[8].indent && rows[9].indent, "ipv6 mounts indent");
         assert_eq!(rows[8].display_name.as_deref(), Some("x"));
