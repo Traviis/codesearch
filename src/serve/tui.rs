@@ -129,6 +129,11 @@ async fn run_tui_loop(
     let (doctor_tx, mut doctor_rx) = tokio::sync::mpsc::channel::<(u64, OverlayState)>(1);
     // Monotonic id of the most recent doctor request; bumped on every spawn.
     let mut doctor_gen: u64 = 0;
+    // Generation of the in-flight deferred info request, if any. The local
+    // info overlay is built off the UI loop (its file/meta reads blocked
+    // every arrow-key press); the result applies only when its generation
+    // still matches, so a superseded request can never clobber a newer one.
+    let mut pending_info_gen: Option<u64> = None;
 
     // Mounted remote projects (peer-hosted indexes, shown italic). The background
     // task rebuilds these rows from config alone and NEVER polls a peer on a
@@ -288,21 +293,25 @@ async fn run_tui_loop(
             }
         })?;
 
-        // Check if doctor result arrived from background task. Only apply it if
-        // the user is still waiting on the current request (spinner showing and
-        // generation matches); otherwise the result is stale — drain and drop it.
+        // Check if a background result arrived (deferred info OR doctor OR
+        // remote-mount index stats — they share one channel + counter). Only
+        // apply it if the generation still matches the current request;
+        // otherwise the result is stale — drain and drop it.
         if let Ok((gen, result)) = doctor_rx.try_recv() {
-            // Apply async results (doctor diagnostics OR remote-mount index stats)
-            // only if the user is still viewing the matching overlay and the
-            // generation matches; otherwise the result is stale — drop it.
-            if gen == doctor_gen
-                && matches!(
+            if gen == doctor_gen {
+                if pending_info_gen == Some(gen) {
+                    // Deferred local info: there is no placeholder overlay to
+                    // guard — the overlay simply appears when the build is
+                    // done (the issue allows "pas na korte delay").
+                    pending_info_gen = None;
+                    overlay = Some(result);
+                } else if matches!(
                     overlay,
                     Some(OverlayState::DoctorRunning { .. })
                         | Some(OverlayState::RemoteInfo { .. })
-                )
-            {
-                overlay = Some(result);
+                ) {
+                    overlay = Some(result);
+                }
             }
         }
 
@@ -363,11 +372,19 @@ async fn run_tui_loop(
                         // snapshot's order diverges once worktree families are
                         // grouped (selection-index mismatch → wrong repo).
                         match rows.get(idx) {
-                            // Local repo — gather live on-disk index stats.
+                            // Local repo — build the info overlay in the
+                            // background (its file/meta reads are the
+                            // arrow-key lag this deferral removes); the
+                            // overlay appears when the result arrives.
                             Some(row) if !row.is_remote => {
-                                if let Some(ov) = build_info_overlay(&row.alias, &state) {
-                                    overlay = Some(ov);
-                                }
+                                doctor_gen += 1;
+                                pending_info_gen = Some(doctor_gen);
+                                spawn_info_overlay(
+                                    row.alias.clone(),
+                                    state.clone(),
+                                    doctor_tx.clone(),
+                                    doctor_gen,
+                                );
                             }
                             // Mounted remote project (appended after local rows).
                             // Show federation coordinates immediately, then fetch
@@ -1235,6 +1252,23 @@ fn walkdir_size(path: &std::path::Path) -> u64 {
 // ---------------------------------------------------------------------------
 // Doctor (non-blocking spawn)
 // ---------------------------------------------------------------------------
+
+/// Spawn a background task to build the local info overlay off the UI loop
+/// and send it back via `tx` tagged with `gen`. An unresolvable alias sends
+/// nothing: generations are monotonic, so the pending generation can never
+/// match a later result and no stale overlay can apply.
+fn spawn_info_overlay(
+    alias: String,
+    state: Arc<ServeState>,
+    tx: tokio::sync::mpsc::Sender<(u64, OverlayState)>,
+    gen: u64,
+) {
+    tokio::spawn(async move {
+        if let Some(ov) = build_info_overlay(&alias, &state) {
+            let _ = tx.send((gen, ov)).await;
+        }
+    });
+}
 
 /// Spawn a background task to run doctor diagnostics for the given repo alias.
 /// Sends the result overlay back via `tx` when done, tagged with `gen` so the
