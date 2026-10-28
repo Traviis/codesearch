@@ -4061,13 +4061,17 @@ impl ServeState {
     /// read endpoints answer from the stored result and must never call
     /// this on the request path.
     pub(crate) fn compute_status_snapshot(&self) -> status_snapshot::StatusSnapshot {
-        // Periodic registry heal: this pass is the only recurring
-        // reconciliation in a long-lived serve (boot warmup runs once), and
-        // it already runs on the blocking pool. Cheap when nothing moved —
-        // one exists() probe per registered alias.
-        self.reconcile_all_paths();
         let repos = self.repo_statuses_lightweight();
         let active_sessions = self.active_session_count();
+
+        // Periodic registry heal: this pass is the only recurring
+        // reconciliation in a long-lived serve (boot warmup runs once), and
+        // it already runs on the blocking pool. It runs AFTER the status
+        // pass on purpose: reconcile's aliases() may trigger a config
+        // reload, and the statuses above must measure the config as-was —
+        // the order the read endpoints implicitly rely on. Cheap when
+        // nothing moved: one exists() probe per registered alias.
+        self.reconcile_all_paths();
 
         // CPU usage — serve process PLUS all its descendants. The SCIP
         // helpers and their dotnet children do the heavy lifting during a
