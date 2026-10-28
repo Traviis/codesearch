@@ -4976,6 +4976,7 @@ fn render_table_caps_long_alias_and_keeps_columns_on_narrow_terminal() {
         activity_stale: false,
         family_note: note,
         indent,
+        group_header: false,
     };
     let repos = vec![
         row(long_alias, Some("+ 1 worktree".to_string()), false),

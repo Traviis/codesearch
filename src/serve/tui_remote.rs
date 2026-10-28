@@ -81,6 +81,7 @@ impl RepoInfo {
             // peer's config, so no family annotation here.
             family_note: None,
             indent: false,
+            group_header: false,
         }
     }
 }

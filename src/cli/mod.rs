@@ -1555,7 +1555,7 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
 
 /// Human-facing grouped rendering for `groups list`: a member that is a
 /// worktree of another member is annotated `"(<main>)"`, and a
-/// family's main tree in the list gets `"+ N worktrees"` (counted within the
+/// family's main tree in the list gets `"+ N"` (counted within the
 /// group). The alias list itself stays flat — display only.
 fn render_group_members(
     family_map: &std::collections::HashMap<String, String>,
@@ -2715,7 +2715,7 @@ mod tests {
 
     /// `groups list` grouped rendering is display-only: worktree members get
     /// the "(<main>)" annotation, the family's main tree gets
-    /// "+ N worktrees" counted within the group, others stay bare.
+    /// "+ N" counted within the group, others stay bare.
     #[test]
     fn groups_list_renders_family_annotations() {
         let mut family_map = std::collections::HashMap::new();
@@ -2729,7 +2729,7 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "main (+ 2 worktrees)".to_string(),
+                "main (+ 2)".to_string(),
                 "wt1 (main)".to_string(),
                 "wt2 (main)".to_string(),
                 "solo".to_string(),

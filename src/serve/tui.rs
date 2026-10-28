@@ -593,6 +593,7 @@ fn map_repo_rows(
                     crate::db_discovery::repos::family_note(&family_map, &family_sizes, alias)
                 },
                 indent: is_wt,
+                group_header: false,
             }
         })
         .collect()
@@ -726,16 +727,15 @@ fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
             } else {
                 format!("{peer}/{host}")
             };
-            // Header rows are remote-shaped with EMPTY cells: clearing only
-            // status would render the first mount's live stats as the
-            // server's own.
+            // Header rows are remote-shaped with EMPTY cells: the borrowed
+            // stat columns of the first mount must not render as the
+            // server's own — `stat_cell_texts` blanks them for
+            // `group_header` rows (the status field itself is cleared here,
+            // the status cell has no group_header gate).
             header.display_name = None;
             header.status = String::new();
-            header.changes = 0;
-            header.tool_call_count = 0;
-            header.last_tool_call = None;
-            header.lock_mode = String::new();
             header.indent = false;
+            header.group_header = true;
             grouped.push(header);
         }
         let mut child = row;
@@ -901,6 +901,7 @@ fn build_remote_rows(
                 // Mounted remote projects carry no local family identity.
                 family_note: None,
                 indent: false,
+                group_header: false,
             }
         })
         .collect()
@@ -1561,10 +1562,7 @@ mod family_note_tests {
             None,
             "the tree indent carries the relationship; note column stays count-only"
         );
-        assert_eq!(
-            by_alias[main.as_str()].family_note.as_deref(),
-            Some("+ 1 worktree")
-        );
+        assert_eq!(by_alias[main.as_str()].family_note.as_deref(), Some("+ 1"));
         assert_eq!(by_alias["solo"].family_note, None);
     }
 
@@ -1636,6 +1634,7 @@ mod family_note_tests {
             activity_stale: false,
             family_note: None,
             indent: false,
+            group_header: false,
         };
         let mut rows = vec![
             row("local-repo", false, ""),
@@ -1675,12 +1674,11 @@ mod family_note_tests {
             !rows[1].indent && rows[1].status.is_empty(),
             "header is an unindented blank row"
         );
+        let [changes, calls, last, lock] = tui_common::stat_cell_texts(&rows[1]);
         assert!(
-            rows[1].changes == 0
-                && rows[1].tool_call_count == 0
-                && rows[1].last_tool_call.is_none()
-                && rows[1].lock_mode.is_empty(),
-            "header clears every borrowed stat column of the first mount"
+            changes.is_empty() && calls.is_empty() && last.is_empty() && lock.is_empty(),
+            "header renders every borrowed stat cell EMPTY, got \
+             [{changes}] [{calls}] [{last}] [{lock}]"
         );
         assert_eq!(rows[2].alias, "cloud/first");
         assert_eq!(
