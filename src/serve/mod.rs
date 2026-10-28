@@ -1745,14 +1745,16 @@ impl ServeState {
         );
     }
 
-    /// Reconcile registered repo paths against the filesystem before warmup.
+    /// Reconcile registered repo paths against the filesystem.
     ///
-    /// For each alias whose stored path no longer exists (folder renamed/moved),
-    /// attempt a best-effort git-identity relocation and rewrite `repos.json`.
-    /// When relocation fails the entry is left in place and merely logged — it is
-    /// skipped safely at warmup and never crashes serve. Explicit cleanup of
-    /// unrecoverable entries is available via `codesearch index prune`.
-    pub(crate) fn reconcile_all_paths(self: &Arc<Self>) {
+    /// For each alias whose stored path no longer exists (folder renamed/moved,
+    /// or a worktree deleted while the hub keeps running), attempt a best-effort
+    /// git-identity relocation. What cannot be relocated is unregistered, its
+    /// in-memory state evicted, and `repos.json` rewritten. Boot warmup has its
+    /// own prune, but a long-lived serve never reboots — without this pass a
+    /// deleted worktree ghosted `status kind=projects` forever. Explicit manual
+    /// cleanup remains available via `codesearch index prune`.
+    pub(crate) fn reconcile_all_paths(&self) {
         let aliases = self.aliases();
         if aliases.is_empty() {
             return;
@@ -1766,27 +1768,30 @@ impl ServeState {
             }
         };
 
-        let (relocated, unresolved) = config.relocate_missing();
+        let (relocated, removed) = config.prune_stale();
 
         for (alias, new_path) in &relocated {
             info!("reconcile: relocated '{}' → {}", alias, new_path.display());
         }
-        for alias in &unresolved {
-            let missing = config
-                .repos
-                .get(alias)
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            warn!(
-                "reconcile: '{}' path missing ({}); skipping — \
-                 run `codesearch index prune` to remove it",
-                alias, missing
+        for alias in &removed {
+            info!(
+                "reconcile: unregistered stale '{}' (path no longer exists)",
+                alias
             );
+            // Same eviction shape as reload_if_changed: fire the Write task's
+            // cancel token while removing its RepoState, then detach the FSW
+            // handle so a draining task never races the config swap. The DB
+            // dir lived inside the vanished tree — nothing left to delete.
+            if let Some((_, RepoState::Write { cancel_token, .. })) = self.repos.remove(alias) {
+                cancel_token.cancel();
+            }
+            self.last_access.remove(alias);
+            self.fsw_tasks.remove(alias);
         }
 
-        if !relocated.is_empty() {
+        if !relocated.is_empty() || !removed.is_empty() {
             if let Err(e) = self.persist_config(&config) {
-                warn!("reconcile: failed to persist relocated paths: {}", e);
+                warn!("reconcile: failed to persist reconciled registry: {}", e);
             }
         }
     }
@@ -4056,6 +4061,11 @@ impl ServeState {
     /// read endpoints answer from the stored result and must never call
     /// this on the request path.
     pub(crate) fn compute_status_snapshot(&self) -> status_snapshot::StatusSnapshot {
+        // Periodic registry heal: this pass is the only recurring
+        // reconciliation in a long-lived serve (boot warmup runs once), and
+        // it already runs on the blocking pool. Cheap when nothing moved —
+        // one exists() probe per registered alias.
+        self.reconcile_all_paths();
         let repos = self.repo_statuses_lightweight();
         let active_sessions = self.active_session_count();
 
