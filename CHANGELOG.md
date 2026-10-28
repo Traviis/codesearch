@@ -14,13 +14,23 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.7.3]
+## [1.7.4] - 2026-10-28
+
+### Added
+
+- **Space toggles collapse/expand of worktree families and peer groups in the serve TUI.** The family tree made big fleets longer than one screen, and there was no way to hide what you were not working on. Space resolves the selected row's group (a family main, a peer header, or a child walking back to its anchor) and toggles it; collapsed groups hide their children from the rendered rows while the anchor row stays selectable so space expands again. The footer gains a space hint; the remote dashboard has no grouping, so space is a no-op there.
+
+- **PageUp/PageDown page through the repo table.** The selection moves by one page — the frame's body height minus the table header chrome, captured during draw — clamped to the row range; a page at or above the row count degenerates to Home/End. Wired into both the embedded and the remote dashboard loops.
+
+### Changed
+
+- **The local repo Info overlay (`i`) builds off the UI loop.** Its file/meta reads ran synchronously in the event loop and blocked every redraw, making arrow-key navigation feel slow whenever an overlay was requested. The build now runs in a background task and arrives over the existing doctor channel, tagged with a generation so a superseded request can never apply; the overlay appears when ready.
 
 ### Fixed
 
 - **Dependency bumps: fastembed 7.3→7.5 (Qwen3 reranker: f32 scores without padding, long-text kept-prefix tokenization, shared prompt head per score call) and uuid minor/patch — no API changes on our call sites.**
 
-- **The serve TUI could delete the wrong repository.** The render shows tree-ordered rows (worktrees grouped under their main, peers grouped), but the ShowInfo/RunDoctor/ForceReindex/Remove actions resolved the selected row's index against the unordered registry snapshot — so on a grouped view the confirmation dialog could name (and, once confirmed, remove) a different repo than the row under the cursor. All four action arms now resolve through the rendered rows; remote rows flash a "not supported" hint instead. Peer mounts group in the same tree style: multi-mount peers get a synthetic header row naming the federated peer and its server **hostname** (`<remote-name>/<hostname>`, parsed from the peer URL; no host in the URL falls back to the remote name alone), and each of its mounts is `|`-indented beneath it showing the bare repository name — no mount reads as another's parent and the remote name no longer masquerades as part of a repo name.
+- **The serve TUI could delete the wrong repository.** The render shows tree-ordered rows (worktrees grouped under their main, peers grouped), but the ShowInfo/RunDoctor/ForceReindex/Remove actions resolved the selected row's index against the unordered registry snapshot — so on a grouped view the confirmation dialog could name (and, once confirmed, remove) a different repo than the row under the cursor. All four action arms now resolve through the rendered rows; remote rows flash a "not supported" hint instead. Peer mounts group in the same tree style: multi-mount peers get a synthetic header row naming the federated peer and its server **hostname** (`<remote-name>/<hostname>`, parsed from the peer URL; no host in the URL falls back to the remote name alone — a group label, so its stat cells render empty), and each of its mounts is `|`-indented beneath it showing the bare repository name — no mount reads as another's parent and the remote name no longer masquerades as part of a repo name.
 
 - **Repos registered before identity capture now join their worktree family after a serve restart.** Startup backfills the missing git common-dir identities for every registered repo (previously only group members were backfilled during group resolution), so the TUI family tree groups all worktrees under their real main even when the main predates identity capture.
 
