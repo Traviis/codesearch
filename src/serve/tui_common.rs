@@ -219,7 +219,12 @@ pub fn is_quit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('q'))
 }
 
-pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) -> KeyAction {
+pub fn handle_key(
+    key: KeyEvent,
+    table_state: &mut TableState,
+    row_count: usize,
+    page_size: usize,
+) -> KeyAction {
     if row_count == 0 {
         return KeyAction::None;
     }
@@ -236,6 +241,16 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
             if i < row_count - 1 {
                 table_state.select(Some(i + 1));
             }
+            KeyAction::None
+        }
+        KeyCode::PageUp => {
+            let i = table_state.selected().unwrap_or(0);
+            table_state.select(Some(page_target(i, page_size, row_count, false)));
+            KeyAction::None
+        }
+        KeyCode::PageDown => {
+            let i = table_state.selected().unwrap_or(0);
+            table_state.select(Some(page_target(i, page_size, row_count, true)));
             KeyAction::None
         }
         KeyCode::Home => {
@@ -268,6 +283,17 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
             KeyAction::ToggleCollapse(idx)
         }
         _ => KeyAction::None,
+    }
+}
+
+/// Selection after a page move: `current` shifted by one page, clamped to
+/// the row range. A page at or above the row count degenerates to Home/End.
+fn page_target(current: usize, page_size: usize, row_count: usize, down: bool) -> usize {
+    let step = page_size.max(1);
+    if down {
+        (current + step).min(row_count - 1)
+    } else {
+        current.saturating_sub(step)
     }
 }
 
@@ -566,6 +592,10 @@ fn middle_ellipsis_text(s: &str, cap: usize) -> String {
     let tail_text: String = s.chars().skip(count - tail).collect();
     format!("{head_text}...{tail_text}")
 }
+
+/// Table chrome above the data rows: the header row plus its
+/// `bottom_margin(1)`. Page stepping subtracts it from the body height.
+pub const TABLE_HEADER_ROWS: u16 = 2;
 
 pub fn render_table(
     f: &mut ratatui::Frame,
@@ -1898,11 +1928,62 @@ mod tests {
         let mut ts = TableState::default();
         ts.select(Some(3));
         assert!(matches!(
-            handle_key(key, &mut ts, 10),
+            handle_key(key, &mut ts, 10, 5),
             KeyAction::ToggleCollapse(3)
         ));
         // Empty table: no selection to toggle.
         let mut ts = TableState::default();
-        assert!(matches!(handle_key(key, &mut ts, 0), KeyAction::None));
+        assert!(matches!(handle_key(key, &mut ts, 0, 5), KeyAction::None));
+    }
+
+    #[test]
+    fn page_target_moves_by_page_and_clamps_to_the_row_range() {
+        assert_eq!(page_target(5, 3, 10, true), 8);
+        assert_eq!(page_target(5, 3, 10, false), 2);
+        // Clamp at both ends.
+        assert_eq!(page_target(9, 3, 10, true), 9);
+        assert_eq!(page_target(0, 3, 10, false), 0);
+        // Page at or above the row count degenerates to Home/End.
+        assert_eq!(page_target(5, 10, 10, true), 9);
+        assert_eq!(page_target(5, 10, 10, false), 0);
+        // Zero page size floors at one row, never stalls.
+        assert_eq!(page_target(5, 0, 10, true), 6);
+        assert_eq!(page_target(5, 0, 10, false), 4);
+    }
+
+    #[test]
+    fn handle_key_page_up_down_move_the_selection_by_page() {
+        use crossterm::event::KeyModifiers;
+        let mut ts = TableState::default();
+        ts.select(Some(7));
+        handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            5,
+        );
+        assert_eq!(ts.selected(), Some(2));
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            5,
+        );
+        assert_eq!(ts.selected(), Some(7));
+        // Oversized page behaves as Home/End.
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            50,
+        );
+        assert_eq!(ts.selected(), Some(19));
+        handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            50,
+        );
+        assert_eq!(ts.selected(), Some(0));
     }
 }

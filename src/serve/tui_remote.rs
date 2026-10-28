@@ -199,6 +199,9 @@ async fn run_remote_tui_loop(
             .map(|d| tui_common::format_uptime_secs(d.uptime_secs))
             .unwrap_or_else(|| "Up  0s".to_string());
 
+        // Body height of the frame about to be drawn — the page step for
+        // PageUp/PageDown (data rows = body minus the table header chrome).
+        let mut body_height: u16 = 0;
         terminal.draw(|f| {
             let size = f.area();
             let chunks = Layout::vertical([
@@ -208,6 +211,7 @@ async fn run_remote_tui_loop(
                 Constraint::Length(1), // footer
             ])
             .split(size);
+            body_height = chunks[1].height;
 
             if data.is_some() {
                 tui_common::render_header(f, chunks[0], serve_url, version, true, &uptime_str);
@@ -256,6 +260,10 @@ async fn run_remote_tui_loop(
                 tui_common::render_overlay(f, size, ov);
             }
         })?;
+
+        // Page step for this frame's body height (0 when the body is all
+        // chrome — page_target floors it at one row).
+        let page_size = body_height.saturating_sub(tui_common::TABLE_HEADER_ROWS) as usize;
 
         // Poll for key events
         let mut should_quit = false;
@@ -326,7 +334,7 @@ async fn run_remote_tui_loop(
                     break;
                 }
 
-                let action = tui_common::handle_key(key, &mut table_state, rows.len());
+                let action = tui_common::handle_key(key, &mut table_state, rows.len(), page_size);
                 match action {
                     KeyAction::Reload => {
                         let reload_url = format!("{}/reload", serve_url.trim_end_matches('/'));

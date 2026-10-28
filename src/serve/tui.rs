@@ -262,6 +262,9 @@ async fn run_tui_loop(
         }
         let flash_msg = flash.as_ref().map(|(msg, _)| msg.as_str());
 
+        // Body height of the frame about to be drawn — the page step for
+        // PageUp/PageDown (data rows = body minus the table header chrome).
+        let mut body_height: u16 = 0;
         terminal.draw(|f| {
             let size = f.area();
             let chunks = Layout::vertical([
@@ -271,6 +274,7 @@ async fn run_tui_loop(
                 Constraint::Length(1), // footer
             ])
             .split(size);
+            body_height = chunks[1].height;
 
             tui_common::render_header(f, chunks[0], serve_url, version, false, &uptime);
             tui_common::render_table(f, chunks[1], &rows, &mut table_state);
@@ -292,6 +296,10 @@ async fn run_tui_loop(
                 tui_common::render_overlay(f, size, ov);
             }
         })?;
+
+        // Page step for this frame's body height (0 when the body is all
+        // chrome — page_target floors it at one row).
+        let page_size = body_height.saturating_sub(tui_common::TABLE_HEADER_ROWS) as usize;
 
         // Check if a background result arrived (deferred info OR doctor OR
         // remote-mount index stats — they share one channel + counter). Only
@@ -357,7 +365,7 @@ async fn run_tui_loop(
                     should_quit = true;
                     break;
                 }
-                match tui_common::handle_key(key, &mut table_state, rows.len()) {
+                match tui_common::handle_key(key, &mut table_state, rows.len(), page_size) {
                     KeyAction::Reload => {
                         // 'l' pressed — force reload of repos config
                         // Clear mtime so reload_if_changed actually reloads
