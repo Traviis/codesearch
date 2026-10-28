@@ -483,6 +483,8 @@ async fn run_remote_tui_loop(
                             overlay = Some(OverlayState::ConfirmRemove { alias });
                         }
                     }
+                    // The remote dashboard has no family/peer grouping — space is a no-op.
+                    KeyAction::ToggleCollapse(_) => {}
                     KeyAction::None => {}
                 }
             }

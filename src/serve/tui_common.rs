@@ -123,6 +123,9 @@ pub enum KeyAction {
     ForceReindex(usize),
     /// User pressed `r` — request removal of repo at given index (shows confirmation).
     RequestRemove(usize),
+    /// User pressed space — toggle collapse/expand of the group (worktree
+    /// family or peer-mount group) the row at given index belongs to.
+    ToggleCollapse(usize),
 }
 
 /// Modal overlay shown on top of the normal TUI content.
@@ -259,6 +262,10 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
         KeyCode::Char('r') => {
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::RequestRemove(idx)
+        }
+        KeyCode::Char(' ') => {
+            let idx = table_state.selected().unwrap_or(0);
+            KeyAction::ToggleCollapse(idx)
         }
         _ => KeyAction::None,
     }
@@ -996,6 +1003,7 @@ pub fn render_footer(
         spans.extend(hint("rei", "n", "dex  ", local_only));
         spans.extend(hint("", "r", "emove  ", local_only));
         spans.extend(hint("re", "l", "oad  ", true));
+        spans.extend(hint("", "␣", " collapse  ", true));
         spans.extend(hint("", "q", "uit  ", true));
         spans.push(Span::styled(
             "↑↓",
@@ -1881,5 +1889,20 @@ mod tests {
             detail_status_style("future_state", ""),
             ("future_state".to_string(), Color::White)
         );
+    }
+
+    #[test]
+    fn handle_key_space_maps_to_toggle_collapse_of_the_selection() {
+        use crossterm::event::KeyModifiers;
+        let key = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty());
+        let mut ts = TableState::default();
+        ts.select(Some(3));
+        assert!(matches!(
+            handle_key(key, &mut ts, 10),
+            KeyAction::ToggleCollapse(3)
+        ));
+        // Empty table: no selection to toggle.
+        let mut ts = TableState::default();
+        assert!(matches!(handle_key(key, &mut ts, 0), KeyAction::None));
     }
 }

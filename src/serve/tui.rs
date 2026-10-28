@@ -118,6 +118,11 @@ async fn run_tui_loop(
     let mut flash: Option<(String, std::time::Instant)> = None;
     const FLASH_TTL: Duration = Duration::from_secs(4);
 
+    // Collapsed group keys (family main alias / peer name), toggled with
+    // space. Stale keys after a config reload are harmless: they match no
+    // anchor and hide nothing.
+    let mut collapsed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // Channel to receive doctor results from background task. The payload is
     // tagged with a request generation so a late result from a request the
     // user already dismissed (or superseded with a newer one) is ignored.
@@ -215,6 +220,8 @@ async fn run_tui_loop(
         // (e.g. `cloud` above `cloud/akeneo`): every mount of the peer gets
         // the `| ` group indent so no repo reads as another's parent.
         group_peer_mounts(&mut rows);
+        // Space-collapsed groups hide their child rows; anchors stay visible.
+        let rows = visible_rows(&rows, &collapsed);
 
         // Clamp selection
         if !rows.is_empty() {
@@ -448,6 +455,14 @@ async fn run_tui_loop(
                             flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
                     },
+                    KeyAction::ToggleCollapse(idx) => {
+                        if let Some(key) = toggle_group_key(&rows, idx) {
+                            // Toggle: present → expand (remove), absent → collapse.
+                            if !collapsed.remove(&key) {
+                                collapsed.insert(key);
+                            }
+                        }
+                    }
                     KeyAction::None => {}
                 }
             }
@@ -752,6 +767,69 @@ fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
         grouped.push(child);
     }
     *rows = grouped;
+}
+
+/// The collapse key of a row that ANCHORS a collapsible group: a local
+/// worktree-family main (its alias — unindented, so a worktree child's own
+/// `Some(main)` note never makes it an anchor of itself) or a peer-mount
+/// header (the peer part of its alias). Child rows and ungrouped rows return
+/// None.
+fn group_anchor_key(row: &RepoRow) -> Option<String> {
+    if row.is_remote {
+        if row.group_header {
+            Some(
+                row.alias
+                    .split('/')
+                    .next()
+                    .unwrap_or(&row.alias)
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    } else if !row.indent && row.family_note.is_some() {
+        Some(row.alias.clone())
+    } else {
+        None
+    }
+}
+
+/// Drop the child rows of collapsed groups. A group anchor (family main /
+/// peer header) always stays visible so space can expand it again; an
+/// indented child hides when its group scope — the nearest preceding anchor
+/// — is collapsed; any unindented non-anchor row ends the current scope.
+fn visible_rows(rows: &[RepoRow], collapsed: &std::collections::HashSet<String>) -> Vec<RepoRow> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut scope: Option<String> = None;
+    for row in rows {
+        if let Some(key) = group_anchor_key(row) {
+            scope = Some(key);
+        } else if !row.indent {
+            scope = None;
+        }
+        let hidden = row.indent && scope.as_ref().is_some_and(|k| collapsed.contains(k));
+        if !hidden {
+            out.push(row.clone());
+        }
+    }
+    out
+}
+
+/// The collapse key the row at `idx` toggles: its own anchor key, or — for an
+/// indented child — the anchor key of the nearest preceding unindented row of
+/// its own kind (local family main / remote peer header). None when the row
+/// is ungrouped, so space is a no-op there.
+fn toggle_group_key(rows: &[RepoRow], idx: usize) -> Option<String> {
+    let row = rows.get(idx)?;
+    if row.indent {
+        rows[..idx]
+            .iter()
+            .rev()
+            .find(|r| r.is_remote == row.is_remote && !r.indent)
+            .and_then(group_anchor_key)
+    } else {
+        group_anchor_key(row)
+    }
 }
 
 fn spawn_remote_discovery(
@@ -1718,6 +1796,125 @@ mod family_note_tests {
         assert!(
             !rows[11].indent && rows[11].display_name.is_none(),
             "single-mount peers get neither a header nor a display-name strip"
+        );
+    }
+}
+
+#[cfg(test)]
+mod collapse_tests {
+    use super::*;
+
+    fn row(
+        alias: &str,
+        is_remote: bool,
+        family_note: Option<&str>,
+        indent: bool,
+        group_header: bool,
+    ) -> RepoRow {
+        RepoRow {
+            alias: alias.to_string(),
+            display_name: None,
+            status: "warm".to_string(),
+            csharp_index: "none".to_string(),
+            csharp_error: None,
+            typescript_index: "none".to_string(),
+            changes: 0,
+            tool_call_count: 0,
+            last_tool_call: None,
+            lock_mode: String::new(),
+            path: String::new(),
+            is_remote,
+            activity_stale: false,
+            family_note: family_note.map(str::to_string),
+            indent,
+            group_header,
+        }
+    }
+
+    fn collapsed_set(keys: &[&str]) -> std::collections::HashSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    fn aliases(rows: &[RepoRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.alias.as_str()).collect()
+    }
+
+    #[test]
+    fn visible_rows_hides_collapsed_family_worktrees_and_expands_again() {
+        let rows = vec![
+            row("main", false, Some("+ 2"), false, false),
+            // Production shape: a worktree child carries `Some(<main>)` as its
+            // own family_note (repos.rs family_note) — it must still hide
+            // under its collapsed main instead of anchoring itself.
+            row("wt-a", false, Some("main"), true, false),
+            row("wt-b", false, Some("main"), true, false),
+            row("solo", false, None, false, false),
+        ];
+        let got = visible_rows(&rows, &collapsed_set(&["main"]));
+        assert_eq!(
+            aliases(&got),
+            vec!["main", "solo"],
+            "collapsed family hides its worktrees; the main stays so space can expand it"
+        );
+        assert_eq!(
+            aliases(&visible_rows(&rows, &collapsed_set(&[]))),
+            vec!["main", "wt-a", "wt-b", "solo"],
+            "expanding restores every row"
+        );
+    }
+
+    #[test]
+    fn visible_rows_hides_collapsed_peer_mounts_under_their_header() {
+        let rows = vec![
+            row("local", false, None, false, false),
+            row("cloud/host.example", true, None, false, true),
+            row("cloud/akeneo", true, None, true, false),
+            row("cloud/erp", true, None, true, false),
+            row("bare-name", true, None, false, false),
+        ];
+        let got = visible_rows(&rows, &collapsed_set(&["cloud"]));
+        assert_eq!(
+            aliases(&got),
+            vec!["local", "cloud/host.example", "bare-name"],
+            "collapsed peer hides its mounts; the header stays so space can expand it"
+        );
+    }
+
+    #[test]
+    fn toggle_group_key_resolves_anchors_children_and_ungrouped() {
+        let rows = vec![
+            row("main", false, Some("+ 1"), false, false),
+            row("wt-a", false, Some("main"), true, false),
+            row("solo", false, None, false, false),
+            row("cloud/host", true, None, false, true),
+            row("cloud/akeneo", true, None, true, false),
+            row("bare-name", true, None, false, false),
+        ];
+        assert_eq!(
+            toggle_group_key(&rows, 0).as_deref(),
+            Some("main"),
+            "a family main toggles its own group"
+        );
+        assert_eq!(
+            toggle_group_key(&rows, 1).as_deref(),
+            Some("main"),
+            "a worktree walks back to its family main"
+        );
+        assert_eq!(toggle_group_key(&rows, 2), None, "a solo repo has no group");
+        assert_eq!(
+            toggle_group_key(&rows, 3).as_deref(),
+            Some("cloud"),
+            "a peer header toggles its peer group"
+        );
+        assert_eq!(
+            toggle_group_key(&rows, 4).as_deref(),
+            Some("cloud"),
+            "a mount walks back to its peer header"
+        );
+        assert_eq!(
+            toggle_group_key(&rows, 5),
+            None,
+            "an ungrouped remote has no group"
         );
     }
 }
