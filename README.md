@@ -410,13 +410,14 @@ codesearch index rm /path/to/my-project
 # List registered repos
 codesearch index list
 
-# Clean up stale entries (relocates moved repos, drops the rest)
+# Clean up stale entries (relocates moved repos, drops the rest;
+# serve also does this itself at startup and on every status refresh)
 codesearch index prune
 ```
 
 Serve reads `~/.codesearch/repos.json` on startup and manages all registered repos.
 
-#### Moved or renamed repositories
+#### Moved, renamed or deleted repositories
 
 If you rename or move a registered folder, serve does **not** crash. On startup
 it tries to **relocate** each missing repo automatically: it captures every
@@ -424,8 +425,14 @@ repo's git remote (`remote.origin.url`) at registration, and on a missing path
 it scans nearby folders (bounded depth, override with
 `CODESEARCH_RELOCATE_MAX_DEPTH`, default `3`) for a git checkout with the same
 remote. A single unambiguous match is rewritten into `repos.json`; otherwise the
-entry is logged and skipped (never indexed against a dead path). Run
-`codesearch index prune` to relocate what can be relocated and drop the rest.
+entry is logged and skipped (never indexed against a dead path).
+
+When a path is unrecoverable, serve now **unregisters it by itself** — at
+startup, and again on every background status refresh — so a deleted repo or
+worktree stops showing up as a `not indexed` ghost on its own (worktree deletion
+fires no git hook, and `rm -rf` bypasses every observer, so serve reconciles
+its own registry instead). `codesearch index prune` stays available as the
+manual trigger for the same sweep, e.g. while serve is not running.
 
 A hand-edited `repos.json` is also tolerated: empty entries, orphaned metadata,
 and group references to unknown repos are cleaned up on load rather than

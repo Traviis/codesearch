@@ -1581,6 +1581,69 @@ fn persist_config_honors_override_path() {
     );
 }
 
+/// A worktree deleted while serve runs must vanish from the registry on the
+/// next reconcile pass. Boot warmup prunes once, so in a long-lived hub the
+/// dead alias used to ghost `status kind=projects` forever (the old reconcile
+/// kept the entry and only logged "run index prune").
+#[test]
+fn reconcile_all_paths_unregisters_vanished_repos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let gone = tmp.path().join("gone-repo");
+    let alive = tmp.path().join("alive-repo");
+    std::fs::create_dir(&gone).unwrap();
+    std::fs::create_dir(&alive).unwrap();
+
+    let state = std::sync::Arc::new(ServeState::new(
+        ReposConfig::default(),
+        Some(config_file.clone()),
+    ));
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.register_with_alias(gone.clone(), Some("gone-repo".to_string()))
+            .unwrap();
+        cfg.register_with_alias(alive.clone(), Some("alive-repo".to_string()))
+            .unwrap();
+        state.persist_config(&cfg).unwrap();
+    }
+    std::fs::remove_dir(&gone).unwrap();
+
+    // Seed in-memory Write state for the vanished alias so the eviction
+    // branch (token cancel + map removal + FSW handle detach) is executed,
+    // not just the config unregister.
+    let gone_db = tmp.path().join("gone-db");
+    let stores = std::sync::Arc::new(SharedStores::new(&gone_db, 2).expect("fixture stores"));
+    let token = CancellationToken::new();
+    state.repos.insert(
+        "gone-repo".to_string(),
+        RepoState::Write {
+            stores,
+            index_manager: None,
+            cancel_token: token.clone(),
+        },
+    );
+
+    state.reconcile_all_paths();
+
+    let on_disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        !on_disk.repos.contains_key("gone-repo"),
+        "vanished repo must be unregistered and persisted"
+    );
+    assert!(
+        on_disk.repos.contains_key("alive-repo"),
+        "live repo must survive the reconcile pass"
+    );
+    assert!(
+        state.repos.get("gone-repo").is_none(),
+        "vanished alias must be evicted from memory"
+    );
+    assert!(
+        token.is_cancelled(),
+        "the Write task's cancel token must be cancelled"
+    );
+}
+
 #[test]
 fn config_reload_picks_up_new_alias() {
     let tmp = tempfile::tempdir().unwrap();
