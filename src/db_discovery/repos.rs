@@ -1347,10 +1347,10 @@ impl ReposConfig {
 /// CLI `groups list`: a worktree alias annotates as `<main>` (the tree
 /// grouping in the TUI carries the relationship; the bare alias in
 /// parentheses reads cleaner than a "worktree of" prefix), a
-/// family's main alias as `+ N worktrees` (singular for one), anything else
-/// gets no note. The counting scope is the caller's choice — the CLI counts
-/// within a group, the TUI across the whole fleet — which is why `counts`
-/// is a parameter.
+/// family's main alias as `+ N` (the TUI's Worktree column header already
+/// carries the word), anything else gets no note. The counting scope is the
+/// caller's choice — the CLI counts within a group, the TUI across the whole
+/// fleet — which is why `counts` is a parameter.
 pub fn family_note(
     family_map: &std::collections::HashMap<String, String>,
     counts: &std::collections::HashMap<String, usize>,
@@ -1360,7 +1360,7 @@ pub fn family_note(
         return Some(main.clone());
     }
     match counts.get(alias) {
-        Some(&n) if n > 0 => Some(format!("+ {n} worktree{}", if n == 1 { "" } else { "s" })),
+        Some(&n) if n > 0 => Some(format!("+ {n}")),
         _ => None,
     }
 }

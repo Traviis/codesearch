@@ -101,6 +101,11 @@ pub struct RepoRow {
     /// peer prefix (first mount of a peer is the unindented anchor row).
     /// Display-only.
     pub indent: bool,
+    /// True when this row is a synthetic group header (a peer-mount header
+    /// row): it names the group but owns none of the stat columns, so the
+    /// table renders its changes/calls/last-call/lock cells EMPTY instead of
+    /// the borrowed `-`/`0`/`—` placeholders.
+    pub group_header: bool,
 }
 
 /// Actions returned by key handling.
@@ -118,6 +123,9 @@ pub enum KeyAction {
     ForceReindex(usize),
     /// User pressed `r` — request removal of repo at given index (shows confirmation).
     RequestRemove(usize),
+    /// User pressed space — toggle collapse/expand of the group (worktree
+    /// family or peer-mount group) the row at given index belongs to.
+    ToggleCollapse(usize),
 }
 
 /// Modal overlay shown on top of the normal TUI content.
@@ -211,7 +219,12 @@ pub fn is_quit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('q'))
 }
 
-pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) -> KeyAction {
+pub fn handle_key(
+    key: KeyEvent,
+    table_state: &mut TableState,
+    row_count: usize,
+    page_size: usize,
+) -> KeyAction {
     if row_count == 0 {
         return KeyAction::None;
     }
@@ -228,6 +241,16 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
             if i < row_count - 1 {
                 table_state.select(Some(i + 1));
             }
+            KeyAction::None
+        }
+        KeyCode::PageUp => {
+            let i = table_state.selected().unwrap_or(0);
+            table_state.select(Some(page_target(i, page_size, row_count, false)));
+            KeyAction::None
+        }
+        KeyCode::PageDown => {
+            let i = table_state.selected().unwrap_or(0);
+            table_state.select(Some(page_target(i, page_size, row_count, true)));
             KeyAction::None
         }
         KeyCode::Home => {
@@ -255,7 +278,22 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::RequestRemove(idx)
         }
+        KeyCode::Char(' ') => {
+            let idx = table_state.selected().unwrap_or(0);
+            KeyAction::ToggleCollapse(idx)
+        }
         _ => KeyAction::None,
+    }
+}
+
+/// Selection after a page move: `current` shifted by one page, clamped to
+/// the row range. A page at or above the row count degenerates to Home/End.
+fn page_target(current: usize, page_size: usize, row_count: usize, down: bool) -> usize {
+    let step = page_size.max(1);
+    if down {
+        (current + step).min(row_count - 1)
+    } else {
+        current.saturating_sub(step)
     }
 }
 
@@ -555,6 +593,10 @@ fn middle_ellipsis_text(s: &str, cap: usize) -> String {
     format!("{head_text}...{tail_text}")
 }
 
+/// Table chrome above the data rows: the header row plus its
+/// `bottom_margin(1)`. Page stepping subtracts it from the body height.
+pub const TABLE_HEADER_ROWS: u16 = 2;
+
 pub fn render_table(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -633,30 +675,24 @@ pub fn render_table(
         .iter()
         .map(|repo| {
             let status_cell = status_cell(&repo.status, &repo.csharp_index);
-            let changes_str = if repo.changes > 99999 {
-                " 99k+".to_string()
+            let [changes_text, calls_text, last_text, lock_text] = stat_cell_texts(repo);
+            let changes_cell = Cell::from(changes_text).style(Style::default().fg(Color::White));
+            let calls_cell = Cell::from(calls_text).style(if repo.tool_call_count > 0 {
+                Style::default().fg(Color::Cyan)
             } else {
-                format!("{:>5}", repo.changes)
-            };
-            let changes_cell = Cell::from(changes_str).style(Style::default().fg(Color::White));
-            let calls_cell = if repo.tool_call_count > 0 {
-                Cell::from(format!("{:>5}", repo.tool_call_count))
-                    .style(Style::default().fg(Color::Cyan))
-            } else {
-                Cell::from("    -".to_string()).style(Style::default().fg(Color::DarkGray))
-            };
+                Style::default().fg(Color::DarkGray)
+            });
             // Federated peers are polled on the slow idle-suspend cadence (no
             // longer every 30s) so they can scale to zero; between refreshes the
             // cached activity is stale and rendered as `-` rather than a
             // misleading "Xh ago". Local repos are always live
             // (`activity_stale == false`).
-            let tool_cell = if repo.activity_stale {
-                Cell::from("-".to_string()).style(Style::default().fg(Color::DarkGray))
-            } else {
-                Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
-                    .style(Style::default().fg(Color::DarkGray))
-            };
-            let lock_cell = lock_cell(&repo.lock_mode);
+            let tool_cell = Cell::from(last_text).style(Style::default().fg(Color::DarkGray));
+            let lock_cell = Cell::from(lock_text).style(match repo.lock_mode.as_str() {
+                "write" => Style::default().fg(Color::Cyan),
+                "read" => Style::default().fg(Color::White),
+                _ => Style::default().fg(Color::Gray),
+            });
 
             // Alias text stays NEUTRAL — color lives only on the language
             // indicators: yellow ⚠ for a degraded (warnings) index, fully red
@@ -997,6 +1033,7 @@ pub fn render_footer(
         spans.extend(hint("rei", "n", "dex  ", local_only));
         spans.extend(hint("", "r", "emove  ", local_only));
         spans.extend(hint("re", "l", "oad  ", true));
+        spans.extend(hint("", "␣", " collapse  ", true));
         spans.extend(hint("", "q", "uit  ", true));
         spans.push(Span::styled(
             "↑↓",
@@ -1638,12 +1675,36 @@ fn status_cell_spec(status: &str, csharp: &str) -> (String, Style) {
     }
 }
 
-fn lock_cell(lock_mode: &str) -> Cell<'static> {
-    match lock_mode {
-        "write" => Cell::from("write".to_string()).style(Style::default().fg(Color::Cyan)),
-        "read" => Cell::from("read".to_string()).style(Style::default().fg(Color::White)),
-        _ => Cell::from("—".to_string()).style(Style::default().fg(Color::Gray)),
+/// The four stat-column texts (changes, calls, last tool call, lock) for one
+/// row, styled by the caller. A group-header row names the group but owns no
+/// stats — every text comes back empty so the header renders blank cells
+/// instead of the first mount's borrowed `0`/`-`/`—` placeholders.
+pub(crate) fn stat_cell_texts(repo: &RepoRow) -> [String; 4] {
+    if repo.group_header {
+        return [const { String::new() }; 4];
     }
+    [
+        if repo.changes > 99999 {
+            " 99k+".to_string()
+        } else {
+            format!("{:>5}", repo.changes)
+        },
+        if repo.tool_call_count > 0 {
+            format!("{:>5}", repo.tool_call_count)
+        } else {
+            "    -".to_string()
+        },
+        if repo.activity_stale {
+            "-".to_string()
+        } else {
+            repo.last_tool_call.as_deref().unwrap_or("—").to_string()
+        },
+        match repo.lock_mode.as_str() {
+            "write" => "write".to_string(),
+            "read" => "read".to_string(),
+            _ => "—".to_string(),
+        },
+    ]
 }
 
 /// Derive status label and color for the detail panel.
@@ -1858,5 +1919,71 @@ mod tests {
             detail_status_style("future_state", ""),
             ("future_state".to_string(), Color::White)
         );
+    }
+
+    #[test]
+    fn handle_key_space_maps_to_toggle_collapse_of_the_selection() {
+        use crossterm::event::KeyModifiers;
+        let key = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty());
+        let mut ts = TableState::default();
+        ts.select(Some(3));
+        assert!(matches!(
+            handle_key(key, &mut ts, 10, 5),
+            KeyAction::ToggleCollapse(3)
+        ));
+        // Empty table: no selection to toggle.
+        let mut ts = TableState::default();
+        assert!(matches!(handle_key(key, &mut ts, 0, 5), KeyAction::None));
+    }
+
+    #[test]
+    fn page_target_moves_by_page_and_clamps_to_the_row_range() {
+        assert_eq!(page_target(5, 3, 10, true), 8);
+        assert_eq!(page_target(5, 3, 10, false), 2);
+        // Clamp at both ends.
+        assert_eq!(page_target(9, 3, 10, true), 9);
+        assert_eq!(page_target(0, 3, 10, false), 0);
+        // Page at or above the row count degenerates to Home/End.
+        assert_eq!(page_target(5, 10, 10, true), 9);
+        assert_eq!(page_target(5, 10, 10, false), 0);
+        // Zero page size floors at one row, never stalls.
+        assert_eq!(page_target(5, 0, 10, true), 6);
+        assert_eq!(page_target(5, 0, 10, false), 4);
+    }
+
+    #[test]
+    fn handle_key_page_up_down_move_the_selection_by_page() {
+        use crossterm::event::KeyModifiers;
+        let mut ts = TableState::default();
+        ts.select(Some(7));
+        handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            5,
+        );
+        assert_eq!(ts.selected(), Some(2));
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            5,
+        );
+        assert_eq!(ts.selected(), Some(7));
+        // Oversized page behaves as Home/End.
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            50,
+        );
+        assert_eq!(ts.selected(), Some(19));
+        handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            50,
+        );
+        assert_eq!(ts.selected(), Some(0));
     }
 }

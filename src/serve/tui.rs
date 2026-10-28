@@ -118,12 +118,22 @@ async fn run_tui_loop(
     let mut flash: Option<(String, std::time::Instant)> = None;
     const FLASH_TTL: Duration = Duration::from_secs(4);
 
+    // Collapsed group keys (family main alias / peer name), toggled with
+    // space. Stale keys after a config reload are harmless: they match no
+    // anchor and hide nothing.
+    let mut collapsed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // Channel to receive doctor results from background task. The payload is
     // tagged with a request generation so a late result from a request the
     // user already dismissed (or superseded with a newer one) is ignored.
     let (doctor_tx, mut doctor_rx) = tokio::sync::mpsc::channel::<(u64, OverlayState)>(1);
     // Monotonic id of the most recent doctor request; bumped on every spawn.
     let mut doctor_gen: u64 = 0;
+    // Generation of the in-flight deferred info request, if any. The local
+    // info overlay is built off the UI loop (its file/meta reads blocked
+    // every arrow-key press); the result applies only when its generation
+    // still matches, so a superseded request can never clobber a newer one.
+    let mut pending_info_gen: Option<u64> = None;
 
     // Mounted remote projects (peer-hosted indexes, shown italic). The background
     // task rebuilds these rows from config alone and NEVER polls a peer on a
@@ -215,6 +225,8 @@ async fn run_tui_loop(
         // (e.g. `cloud` above `cloud/akeneo`): every mount of the peer gets
         // the `| ` group indent so no repo reads as another's parent.
         group_peer_mounts(&mut rows);
+        // Space-collapsed groups hide their child rows; anchors stay visible.
+        let rows = visible_rows(&rows, &collapsed);
 
         // Clamp selection
         if !rows.is_empty() {
@@ -250,6 +262,9 @@ async fn run_tui_loop(
         }
         let flash_msg = flash.as_ref().map(|(msg, _)| msg.as_str());
 
+        // Body height of the frame about to be drawn — the page step for
+        // PageUp/PageDown (data rows = body minus the table header chrome).
+        let mut body_height: u16 = 0;
         terminal.draw(|f| {
             let size = f.area();
             let chunks = Layout::vertical([
@@ -259,6 +274,7 @@ async fn run_tui_loop(
                 Constraint::Length(1), // footer
             ])
             .split(size);
+            body_height = chunks[1].height;
 
             tui_common::render_header(f, chunks[0], serve_url, version, false, &uptime);
             tui_common::render_table(f, chunks[1], &rows, &mut table_state);
@@ -281,21 +297,29 @@ async fn run_tui_loop(
             }
         })?;
 
-        // Check if doctor result arrived from background task. Only apply it if
-        // the user is still waiting on the current request (spinner showing and
-        // generation matches); otherwise the result is stale — drain and drop it.
+        // Page step for this frame's body height (0 when the body is all
+        // chrome — page_target floors it at one row).
+        let page_size = body_height.saturating_sub(tui_common::TABLE_HEADER_ROWS) as usize;
+
+        // Check if a background result arrived (deferred info OR doctor OR
+        // remote-mount index stats — they share one channel + counter). Only
+        // apply it if the generation still matches the current request;
+        // otherwise the result is stale — drain and drop it.
         if let Ok((gen, result)) = doctor_rx.try_recv() {
-            // Apply async results (doctor diagnostics OR remote-mount index stats)
-            // only if the user is still viewing the matching overlay and the
-            // generation matches; otherwise the result is stale — drop it.
-            if gen == doctor_gen
-                && matches!(
+            if gen == doctor_gen {
+                if pending_info_gen == Some(gen) {
+                    // Deferred local info: there is no placeholder overlay to
+                    // guard — the overlay simply appears when the build is
+                    // done (the issue allows "pas na korte delay").
+                    pending_info_gen = None;
+                    overlay = Some(result);
+                } else if matches!(
                     overlay,
                     Some(OverlayState::DoctorRunning { .. })
                         | Some(OverlayState::RemoteInfo { .. })
-                )
-            {
-                overlay = Some(result);
+                ) {
+                    overlay = Some(result);
+                }
             }
         }
 
@@ -341,7 +365,7 @@ async fn run_tui_loop(
                     should_quit = true;
                     break;
                 }
-                match tui_common::handle_key(key, &mut table_state, rows.len()) {
+                match tui_common::handle_key(key, &mut table_state, rows.len(), page_size) {
                     KeyAction::Reload => {
                         // 'l' pressed — force reload of repos config
                         // Clear mtime so reload_if_changed actually reloads
@@ -356,11 +380,19 @@ async fn run_tui_loop(
                         // snapshot's order diverges once worktree families are
                         // grouped (selection-index mismatch → wrong repo).
                         match rows.get(idx) {
-                            // Local repo — gather live on-disk index stats.
+                            // Local repo — build the info overlay in the
+                            // background (its file/meta reads are the
+                            // arrow-key lag this deferral removes); the
+                            // overlay appears when the result arrives.
                             Some(row) if !row.is_remote => {
-                                if let Some(ov) = build_info_overlay(&row.alias, &state) {
-                                    overlay = Some(ov);
-                                }
+                                doctor_gen += 1;
+                                pending_info_gen = Some(doctor_gen);
+                                spawn_info_overlay(
+                                    row.alias.clone(),
+                                    state.clone(),
+                                    doctor_tx.clone(),
+                                    doctor_gen,
+                                );
                             }
                             // Mounted remote project (appended after local rows).
                             // Show federation coordinates immediately, then fetch
@@ -448,6 +480,14 @@ async fn run_tui_loop(
                             flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
                     },
+                    KeyAction::ToggleCollapse(idx) => {
+                        if let Some(key) = toggle_group_key(&rows, idx) {
+                            // Toggle: present → expand (remove), absent → collapse.
+                            if !collapsed.remove(&key) {
+                                collapsed.insert(key);
+                            }
+                        }
+                    }
                     KeyAction::None => {}
                 }
             }
@@ -593,6 +633,7 @@ fn map_repo_rows(
                     crate::db_discovery::repos::family_note(&family_map, &family_sizes, alias)
                 },
                 indent: is_wt,
+                group_header: false,
             }
         })
         .collect()
@@ -726,16 +767,15 @@ fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
             } else {
                 format!("{peer}/{host}")
             };
-            // Header rows are remote-shaped with EMPTY cells: clearing only
-            // status would render the first mount's live stats as the
-            // server's own.
+            // Header rows are remote-shaped with EMPTY cells: the borrowed
+            // stat columns of the first mount must not render as the
+            // server's own — `stat_cell_texts` blanks them for
+            // `group_header` rows (the status field itself is cleared here,
+            // the status cell has no group_header gate).
             header.display_name = None;
             header.status = String::new();
-            header.changes = 0;
-            header.tool_call_count = 0;
-            header.last_tool_call = None;
-            header.lock_mode = String::new();
             header.indent = false;
+            header.group_header = true;
             grouped.push(header);
         }
         let mut child = row;
@@ -752,6 +792,69 @@ fn group_peer_mounts(rows: &mut Vec<RepoRow>) {
         grouped.push(child);
     }
     *rows = grouped;
+}
+
+/// The collapse key of a row that ANCHORS a collapsible group: a local
+/// worktree-family main (its alias — unindented, so a worktree child's own
+/// `Some(main)` note never makes it an anchor of itself) or a peer-mount
+/// header (the peer part of its alias). Child rows and ungrouped rows return
+/// None.
+fn group_anchor_key(row: &RepoRow) -> Option<String> {
+    if row.is_remote {
+        if row.group_header {
+            Some(
+                row.alias
+                    .split('/')
+                    .next()
+                    .unwrap_or(&row.alias)
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    } else if !row.indent && row.family_note.is_some() {
+        Some(row.alias.clone())
+    } else {
+        None
+    }
+}
+
+/// Drop the child rows of collapsed groups. A group anchor (family main /
+/// peer header) always stays visible so space can expand it again; an
+/// indented child hides when its group scope — the nearest preceding anchor
+/// — is collapsed; any unindented non-anchor row ends the current scope.
+fn visible_rows(rows: &[RepoRow], collapsed: &std::collections::HashSet<String>) -> Vec<RepoRow> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut scope: Option<String> = None;
+    for row in rows {
+        if let Some(key) = group_anchor_key(row) {
+            scope = Some(key);
+        } else if !row.indent {
+            scope = None;
+        }
+        let hidden = row.indent && scope.as_ref().is_some_and(|k| collapsed.contains(k));
+        if !hidden {
+            out.push(row.clone());
+        }
+    }
+    out
+}
+
+/// The collapse key the row at `idx` toggles: its own anchor key, or — for an
+/// indented child — the anchor key of the nearest preceding unindented row of
+/// its own kind (local family main / remote peer header). None when the row
+/// is ungrouped, so space is a no-op there.
+fn toggle_group_key(rows: &[RepoRow], idx: usize) -> Option<String> {
+    let row = rows.get(idx)?;
+    if row.indent {
+        rows[..idx]
+            .iter()
+            .rev()
+            .find(|r| r.is_remote == row.is_remote && !r.indent)
+            .and_then(group_anchor_key)
+    } else {
+        group_anchor_key(row)
+    }
 }
 
 fn spawn_remote_discovery(
@@ -901,6 +1004,7 @@ fn build_remote_rows(
                 // Mounted remote projects carry no local family identity.
                 family_note: None,
                 indent: false,
+                group_header: false,
             }
         })
         .collect()
@@ -1156,6 +1260,23 @@ fn walkdir_size(path: &std::path::Path) -> u64 {
 // ---------------------------------------------------------------------------
 // Doctor (non-blocking spawn)
 // ---------------------------------------------------------------------------
+
+/// Spawn a background task to build the local info overlay off the UI loop
+/// and send it back via `tx` tagged with `gen`. An unresolvable alias sends
+/// nothing: generations are monotonic, so the pending generation can never
+/// match a later result and no stale overlay can apply.
+fn spawn_info_overlay(
+    alias: String,
+    state: Arc<ServeState>,
+    tx: tokio::sync::mpsc::Sender<(u64, OverlayState)>,
+    gen: u64,
+) {
+    tokio::spawn(async move {
+        if let Some(ov) = build_info_overlay(&alias, &state) {
+            let _ = tx.send((gen, ov)).await;
+        }
+    });
+}
 
 /// Spawn a background task to run doctor diagnostics for the given repo alias.
 /// Sends the result overlay back via `tx` when done, tagged with `gen` so the
@@ -1561,10 +1682,7 @@ mod family_note_tests {
             None,
             "the tree indent carries the relationship; note column stays count-only"
         );
-        assert_eq!(
-            by_alias[main.as_str()].family_note.as_deref(),
-            Some("+ 1 worktree")
-        );
+        assert_eq!(by_alias[main.as_str()].family_note.as_deref(), Some("+ 1"));
         assert_eq!(by_alias["solo"].family_note, None);
     }
 
@@ -1636,6 +1754,7 @@ mod family_note_tests {
             activity_stale: false,
             family_note: None,
             indent: false,
+            group_header: false,
         };
         let mut rows = vec![
             row("local-repo", false, ""),
@@ -1675,12 +1794,11 @@ mod family_note_tests {
             !rows[1].indent && rows[1].status.is_empty(),
             "header is an unindented blank row"
         );
+        let [changes, calls, last, lock] = tui_common::stat_cell_texts(&rows[1]);
         assert!(
-            rows[1].changes == 0
-                && rows[1].tool_call_count == 0
-                && rows[1].last_tool_call.is_none()
-                && rows[1].lock_mode.is_empty(),
-            "header clears every borrowed stat column of the first mount"
+            changes.is_empty() && calls.is_empty() && last.is_empty() && lock.is_empty(),
+            "header renders every borrowed stat cell EMPTY, got \
+             [{changes}] [{calls}] [{last}] [{lock}]"
         );
         assert_eq!(rows[2].alias, "cloud/first");
         assert_eq!(
@@ -1720,6 +1838,125 @@ mod family_note_tests {
         assert!(
             !rows[11].indent && rows[11].display_name.is_none(),
             "single-mount peers get neither a header nor a display-name strip"
+        );
+    }
+}
+
+#[cfg(test)]
+mod collapse_tests {
+    use super::*;
+
+    fn row(
+        alias: &str,
+        is_remote: bool,
+        family_note: Option<&str>,
+        indent: bool,
+        group_header: bool,
+    ) -> RepoRow {
+        RepoRow {
+            alias: alias.to_string(),
+            display_name: None,
+            status: "warm".to_string(),
+            csharp_index: "none".to_string(),
+            csharp_error: None,
+            typescript_index: "none".to_string(),
+            changes: 0,
+            tool_call_count: 0,
+            last_tool_call: None,
+            lock_mode: String::new(),
+            path: String::new(),
+            is_remote,
+            activity_stale: false,
+            family_note: family_note.map(str::to_string),
+            indent,
+            group_header,
+        }
+    }
+
+    fn collapsed_set(keys: &[&str]) -> std::collections::HashSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    fn aliases(rows: &[RepoRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.alias.as_str()).collect()
+    }
+
+    #[test]
+    fn visible_rows_hides_collapsed_family_worktrees_and_expands_again() {
+        let rows = vec![
+            row("main", false, Some("+ 2"), false, false),
+            // Production shape: a worktree child carries `Some(<main>)` as its
+            // own family_note (repos.rs family_note) — it must still hide
+            // under its collapsed main instead of anchoring itself.
+            row("wt-a", false, Some("main"), true, false),
+            row("wt-b", false, Some("main"), true, false),
+            row("solo", false, None, false, false),
+        ];
+        let got = visible_rows(&rows, &collapsed_set(&["main"]));
+        assert_eq!(
+            aliases(&got),
+            vec!["main", "solo"],
+            "collapsed family hides its worktrees; the main stays so space can expand it"
+        );
+        assert_eq!(
+            aliases(&visible_rows(&rows, &collapsed_set(&[]))),
+            vec!["main", "wt-a", "wt-b", "solo"],
+            "expanding restores every row"
+        );
+    }
+
+    #[test]
+    fn visible_rows_hides_collapsed_peer_mounts_under_their_header() {
+        let rows = vec![
+            row("local", false, None, false, false),
+            row("cloud/host.example", true, None, false, true),
+            row("cloud/akeneo", true, None, true, false),
+            row("cloud/erp", true, None, true, false),
+            row("bare-name", true, None, false, false),
+        ];
+        let got = visible_rows(&rows, &collapsed_set(&["cloud"]));
+        assert_eq!(
+            aliases(&got),
+            vec!["local", "cloud/host.example", "bare-name"],
+            "collapsed peer hides its mounts; the header stays so space can expand it"
+        );
+    }
+
+    #[test]
+    fn toggle_group_key_resolves_anchors_children_and_ungrouped() {
+        let rows = vec![
+            row("main", false, Some("+ 1"), false, false),
+            row("wt-a", false, Some("main"), true, false),
+            row("solo", false, None, false, false),
+            row("cloud/host", true, None, false, true),
+            row("cloud/akeneo", true, None, true, false),
+            row("bare-name", true, None, false, false),
+        ];
+        assert_eq!(
+            toggle_group_key(&rows, 0).as_deref(),
+            Some("main"),
+            "a family main toggles its own group"
+        );
+        assert_eq!(
+            toggle_group_key(&rows, 1).as_deref(),
+            Some("main"),
+            "a worktree walks back to its family main"
+        );
+        assert_eq!(toggle_group_key(&rows, 2), None, "a solo repo has no group");
+        assert_eq!(
+            toggle_group_key(&rows, 3).as_deref(),
+            Some("cloud"),
+            "a peer header toggles its peer group"
+        );
+        assert_eq!(
+            toggle_group_key(&rows, 4).as_deref(),
+            Some("cloud"),
+            "a mount walks back to its peer header"
+        );
+        assert_eq!(
+            toggle_group_key(&rows, 5),
+            None,
+            "an ungrouped remote has no group"
         );
     }
 }

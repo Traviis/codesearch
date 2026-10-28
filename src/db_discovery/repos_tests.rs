@@ -1631,7 +1631,7 @@ fn worktree_family_map_tie_breaks_on_alias() {
 }
 
 #[test]
-fn family_note_covers_both_arms_and_pluralization() {
+fn family_note_covers_both_arms() {
     use super::family_note;
     let mut family_map = std::collections::HashMap::new();
     family_map.insert("wt1".to_string(), "main".to_string());
@@ -1645,11 +1645,12 @@ fn family_note_covers_both_arms_and_pluralization() {
     );
     assert_eq!(
         family_note(&family_map, &counts, "main").as_deref(),
-        Some("+ 2 worktrees")
+        Some("+ 2"),
+        "count-only note: the Worktree column header carries the word"
     );
     assert_eq!(
         family_note(&family_map, &counts, "lonely").as_deref(),
-        Some("+ 1 worktree")
+        Some("+ 1")
     );
     assert_eq!(
         family_note(&family_map, &counts, "zero").as_deref(),
