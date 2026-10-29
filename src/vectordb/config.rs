@@ -24,7 +24,14 @@ pub fn storage_backend(db_path: &Path) -> Result<String> {
             .get("storage_backend")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            None
+        }
         Err(e) => return Err(e.into()),
     };
     let recorded = recorded.or_else(|| {

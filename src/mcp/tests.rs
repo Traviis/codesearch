@@ -3746,21 +3746,55 @@ async fn vector_fan_out_skips_write_locked_store_instead_of_waiting() {
     )
     .expect("service");
 
+    {
+        let mut store = stores_b.vector_store.write().await;
+        store
+            .insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
+                crate::chunker::Chunk::new(
+                    "gadget".into(),
+                    1,
+                    1,
+                    crate::chunker::ChunkKind::Function,
+                    "lib.rs".into(),
+                ),
+                vec![1.0, 0.0],
+            )])
+            .await
+            .unwrap();
+        store.build_index().await.unwrap();
+    }
     let _alpha_write = stores_a.vector_store.write().await;
+    let embeddings = ["alpha", "beta"]
+        .into_iter()
+        .map(|alias| (alias.to_string(), vec![1.0, 0.0]))
+        .collect();
 
     let outcome = service
-        .with_vector_store_read_multi(
-            |_alias, _store| Ok::<_, anyhow::Error>(Vec::<crate::vectordb::SearchResult>::new()),
-            vec![stores_a.clone(), stores_b.clone()],
+        .search_vector_stores(
+            &[stores_a.clone(), stores_b.clone()],
             &["alpha".to_string(), "beta".to_string()],
+            &embeddings,
+            None,
+            5,
         )
         .await
         .expect("fan-out itself must not error");
 
-    assert!(
-        outcome.results.is_empty(),
-        "the locked store must be skipped, not answered from"
-    );
+    assert_eq!(outcome.results.len(), 1);
+    assert_eq!(outcome.results[0].alias, "beta");
+    assert_eq!(outcome.results[0].result.content, "gadget");
+    let local_outcome = service
+        .with_vector_store_read_multi(
+            |_alias, store| store.search(&[1.0, 0.0], 5),
+            vec![stores_a.clone(), stores_b.clone()],
+            &["alpha".into(), "beta".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(local_outcome.results.len(), outcome.results.len());
+    assert_eq!(local_outcome.failures.len(), 1);
+    assert_eq!(local_outcome.failures[0].0, "alpha");
+    assert!(local_outcome.failures[0].1.contains("store busy"));
     assert_eq!(
         outcome.failures.len(),
         1,
