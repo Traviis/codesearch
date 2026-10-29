@@ -156,7 +156,7 @@ impl ChunkStore {
     }
 
     pub async fn get_chunk_as_result(&self, id: u32) -> Result<Option<SearchResult>> {
-        if let Self::Local(store) = self {
+        if let Some(store) = self.local() {
             return store.get_chunk_as_result(id);
         }
         Ok(self
@@ -229,7 +229,7 @@ impl ChunkStore {
     }
 
     pub async fn chunks_for_file(&self, path: &str) -> Result<Vec<super::store::ChunkMeta>> {
-        if let Self::Local(store) = self {
+        if let Some(store) = self.local() {
             return store.chunks_for_file(path);
         }
         let normalized = crate::cache::normalize_path_str(path);
@@ -280,7 +280,7 @@ impl ChunkStore {
     }
 
     pub async fn insert_chunks_with_ids(&mut self, chunks: Vec<EmbeddedChunk>) -> Result<Vec<u32>> {
-        if let Self::Local(store) = self {
+        if let Some(store) = self.local_mut() {
             return store.insert_chunks_with_ids(chunks);
         }
         let mut grouped = std::collections::BTreeMap::<String, Vec<(usize, EmbeddedChunk)>>::new();

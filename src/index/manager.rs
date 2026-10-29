@@ -2795,7 +2795,7 @@ impl IndexManager {
             }
 
             // Find files that were deleted (tracked in metadata but not on disk)
-            let deleted_files = file_meta_store.find_deleted_files(codebase_path);
+            let mut deleted_files = file_meta_store.find_deleted_files(codebase_path);
 
             // Phase 3.6: heal mixed generations on LIVE files. A failed FTS
             // commit used to leave the failed attempt's vector chunks
@@ -2815,6 +2815,9 @@ impl IndexManager {
             let mut untracked_ids: Vec<u32> = Vec::new();
             for (vs_path, chunk_ids) in &vs_file_chunks {
                 if !codebase_path.join(vs_path).exists() {
+                    if !is_local && !deleted_files.iter().any(|(path, _)| path == vs_path) {
+                        deleted_files.push((vs_path.clone(), chunk_ids.clone()));
+                    }
                     continue; // ghost files: Phase 3.5 owns them
                 }
                 if is_local {
@@ -4791,6 +4794,82 @@ mod tests {
             remaining.is_empty(),
             "rolled-back ids must be gone from the vector store, got: {remaining:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn file_publication_retry_replaces_fts_documents_before_tracking_ids() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        let stores = create_test_stores(&db_path, 2).await;
+        let file = temp.path().join("lib.rs");
+        let chunks = vec![crate::embed::EmbeddedChunk::new(
+            crate::chunker::Chunk::new(
+                "gadget".into(),
+                1,
+                1,
+                crate::chunker::ChunkKind::Function,
+                "lib.rs".into(),
+            ),
+            vec![1.0, 0.0],
+        )];
+        let ids = stores
+            .vector_store
+            .write()
+            .await
+            .insert_chunks_with_ids(chunks.clone())
+            .await
+            .unwrap();
+        let result = IndexManager::publish_file_chunks(
+            &db_path,
+            &file,
+            &stores,
+            "lib.rs",
+            &chunks,
+            &ids,
+            "test-model",
+            2,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "source disappeared before metadata publication"
+        );
+        assert_eq!(
+            stores
+                .fts_store
+                .read()
+                .await
+                .search("gadget", 10, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        std::fs::write(&file, "gadget").unwrap();
+        IndexManager::publish_file_chunks(
+            &db_path,
+            &file,
+            &stores,
+            "lib.rs",
+            &chunks,
+            &ids,
+            "test-model",
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stores
+                .fts_store
+                .read()
+                .await
+                .search("gadget", 10, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        let metadata = FileMetaStore::load_or_create(&db_path, "test-model", 2).unwrap();
+        assert_eq!(metadata.file_chunk_ids("lib.rs"), Some(ids));
     }
 
     /// Phase 3.6: vector chunks not tracked by file_meta are deleted on the

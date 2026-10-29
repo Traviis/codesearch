@@ -903,7 +903,16 @@ async fn index_with_options(
         }
 
         // Find deleted files (in metadata but not on disk)
-        let deleted_files = file_meta_store.find_deleted_files(&project_path);
+        let mut deleted_files = file_meta_store.find_deleted_files(&project_path);
+        if let Some(remote_files) = &remote_files {
+            for (path, ids) in remote_files {
+                if !project_path.join(path).exists()
+                    && !deleted_files.iter().any(|(key, _)| key == path)
+                {
+                    deleted_files.push((path.clone(), ids.clone()));
+                }
+            }
+        }
 
         for (file_path, _chunk_ids) in &deleted_files {
             debug!("🗑️  File deleted from disk: {}", file_path);
