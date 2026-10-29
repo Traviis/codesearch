@@ -781,6 +781,32 @@ async fn index_with_options(
     log_print!("   Total size: {:.2} MB", stats.total_size_mb());
 
     if files.is_empty() {
+        if !dry_run && postgres && db_path.join("metadata.json").exists() {
+            let stores = SharedStores::open(
+                &db_path,
+                &project_path,
+                model_type,
+                model_type.dimensions(),
+                false,
+            )
+            .await?;
+            if force {
+                stores.vector_store.write().await.clear().await?;
+                stores.fts_store.write().await.clear()?;
+                FileMetaStore::new(model_type.short_name().into(), model_type.dimensions())
+                    .save(&db_path)?;
+            } else {
+                IndexManager::perform_incremental_refresh_with_stores(
+                    &project_path,
+                    &db_path,
+                    &stores,
+                    &cancel_token,
+                    None,
+                    None,
+                )
+                .await?;
+            }
+        }
         log_print!("\n{}", "No files to index!".yellow());
         return Ok(());
     }

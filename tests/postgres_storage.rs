@@ -4,6 +4,15 @@ use codesearch::vectordb::PostgresStore;
 use codesearch::{Chunk, ChunkKind, EmbeddedChunk};
 use std::process::Command;
 
+struct Server(std::process::Child);
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 struct Database(String);
 
 impl Drop for Database {
@@ -446,4 +455,231 @@ async fn postgres_file_lifecycle_and_filtered_search() {
     .await
     .unwrap();
     assert!(cli_store.get_chunk("cli", ids[0]).await.unwrap().is_none());
+
+    let mut config = codesearch::db_discovery::repos::ReposConfig::default();
+    for (alias, namespace) in [("alpha", "group-a"), ("beta", "group-b")] {
+        let root = recovery.path().join(alias);
+        let db = root.join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(
+            db.join("metadata.json"),
+            serde_json::json!({
+                "schema_version":1,"storage_backend":"postgres","storage_repo":namespace,
+                "model_short_name":"minilm-l6-q","dimensions":384,"partial":false,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        cli_store
+            .replace_file(
+                namespace,
+                "lib.rs",
+                &[EmbeddedChunk::new(
+                    Chunk::new(
+                        format!("gadget {alias}"),
+                        1,
+                        1,
+                        ChunkKind::Function,
+                        "lib.rs".into(),
+                    ),
+                    vec![0.5; 384],
+                )],
+            )
+            .await
+            .unwrap();
+        let fts = codesearch::fts::FtsStore::new(&db).unwrap();
+        drop(fts);
+        config.repos.insert(alias.into(), root);
+        config.repo_read_only.insert(alias.into(), true);
+    }
+    let local_root = recovery.path().join("local");
+    let local_db = local_root.join(".codesearch.db");
+    let mut local = codesearch::vectordb::VectorStore::new(&local_db, 384).unwrap();
+    local
+        .insert_chunks_with_ids(vec![EmbeddedChunk::new(
+            Chunk::new(
+                "local gadget".into(),
+                1,
+                1,
+                ChunkKind::Function,
+                "local.rs".into(),
+            ),
+            vec![0.5; 384],
+        )])
+        .unwrap();
+    local.build_index().unwrap();
+    drop(local);
+    std::fs::write(
+        local_db.join("metadata.json"),
+        r#"{"schema_version":1,"model_short_name":"minilm-l6-q","dimensions":384,"partial":false}"#,
+    )
+    .unwrap();
+    drop(codesearch::fts::FtsStore::new(&local_db).unwrap());
+    config.repos.insert("local".into(), local_root);
+    config.repo_read_only.insert("local".into(), true);
+    // Only alpha holds source id 1; beta's id 0 must remain a neighbour.
+    cli_store
+        .replace_file(
+            "group-a",
+            "source.rs",
+            &[EmbeddedChunk::new(
+                Chunk::new(
+                    "source".into(),
+                    1,
+                    1,
+                    ChunkKind::Function,
+                    "source.rs".into(),
+                ),
+                vec![0.5; 384],
+            )],
+        )
+        .await
+        .unwrap();
+    config.groups.insert(
+        "all".into(),
+        vec!["alpha".into(), "beta".into(), "local".into()],
+    );
+    let config_path = recovery.path().join("repos.json");
+    config.save_to(&config_path).unwrap();
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    let server_log = tempfile::tempfile().unwrap();
+    let mut server = Server(
+        Command::new(env!("CARGO_BIN_EXE_codesearch"))
+            .args([
+                "serve",
+                "--no-tui",
+                "--create-index=false",
+                "--port",
+                &port.to_string(),
+            ])
+            .env("CODESEARCH_DATABASE_URL", &cli_url)
+            .env("CODESEARCH_REPOS_CONFIG", &config_path)
+            .env_remove("CODESEARCH_STORAGE")
+            .current_dir(recovery.path())
+            .stdout(server_log.try_clone().unwrap())
+            .stderr(server_log.try_clone().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut ready = false;
+    for _ in 0..100 {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "test server exited during startup"
+        );
+        if http.get(format!("{base}/health")).send().await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "test server readiness timeout");
+    let response: serde_json::Value = http
+        .post(format!("{base}/explore"))
+        .json(&serde_json::json!({"target":"1","kind":"similar","group":"all","limit":5}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let text = response.to_string();
+    assert!(text.contains("alpha/lib.rs"), "{text}");
+    assert!(text.contains("beta/lib.rs"), "{text}");
+    assert!(text.contains("local/local.rs"), "{text}");
+    assert!(
+        !text.contains("alpha/source.rs"),
+        "source must be excluded: {text}"
+    );
+    let info: serde_json::Value = http
+        .get(format!("{base}/repos/alpha/info"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["backend"], "postgres");
+    assert_eq!(info["chunks"], 2);
+    assert!(info["storage_error"].is_null());
+    server.0.kill().unwrap();
+    server.0.wait().unwrap();
+    let empty_project = recovery.path().join("empty");
+    let empty_db = empty_project.join(".codesearch.db");
+    std::fs::create_dir_all(&empty_db).unwrap();
+    std::fs::write(empty_db.join("metadata.json"), r#"{"schema_version":1,"storage_backend":"postgres","storage_repo":"empty","model_short_name":"minilm-l6-q","dimensions":384,"partial":false}"#).unwrap();
+    drop(codesearch::fts::FtsStore::new(&empty_db).unwrap());
+    cli_store
+        .replace_file(
+            "empty",
+            "removed.rs",
+            &[EmbeddedChunk::new(
+                Chunk::new(
+                    "deleted".into(),
+                    1,
+                    1,
+                    ChunkKind::Function,
+                    "removed.rs".into(),
+                ),
+                vec![0.5; 384],
+            )],
+        )
+        .await
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codesearch"))
+        .arg("index")
+        .arg(&empty_project)
+        .env("CODESEARCH_DATABASE_URL", &cli_url)
+        .env("CODESEARCH_STORAGE", "postgres")
+        .env("CODESEARCH_REPOS_CONFIG", &config_path)
+        .env("CODESEARCH_SERVE_PORT", port.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "empty repo cleanup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(cli_store.stats("empty").await.unwrap().total_chunks, 0);
+    let output = Command::new(env!("CARGO_BIN_EXE_codesearch"))
+        .args(["index", "rm"])
+        .arg(&empty_project)
+        .arg("--keep-config")
+        .env("CODESEARCH_DATABASE_URL", &cli_url)
+        .env("CODESEARCH_STORAGE", "postgres")
+        .env("CODESEARCH_REPOS_CONFIG", &config_path)
+        .env("CODESEARCH_SERVE_PORT", port.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index rm failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!empty_db.exists());
+    use std::io::{Read, Seek};
+    let mut log = server_log;
+    log.rewind().unwrap();
+    let mut output = String::new();
+    log.read_to_string(&mut output).unwrap();
+    for line in output.lines() {
+        if line.contains('⚠') {
+            assert!(
+                line.contains("Default embedding model 'minilm-l6-q' is not in the models cache"),
+                "unexpected warning: {line}"
+            );
+        }
+        assert!(
+            !line.contains("ERROR") && !line.contains("panicked"),
+            "unexpected server error: {line}"
+        );
+    }
 }
