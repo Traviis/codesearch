@@ -4796,6 +4796,7 @@ fn overlay_copy_key_only_fires_on_info_overlays() {
 
     let info = crate::serve::tui_common::OverlayState::Info {
         alias: "demo.app".to_string(),
+        storage: "local".into(),
         path: String::new(),
         chunks: 0,
         files: 0,
@@ -4848,6 +4849,7 @@ fn symbol_warnings_copy_text_heads_with_alias_and_carries_every_line() {
 fn apply_copy_warnings_reports_when_nothing_is_recorded() {
     let mut info = crate::serve::tui_common::OverlayState::Info {
         alias: "acme-web".to_string(),
+        storage: "local".into(),
         path: String::new(),
         chunks: 0,
         files: 0,
@@ -4881,6 +4883,7 @@ fn apply_copy_warnings_feedback_covers_success_and_failure() {
     fn info() -> crate::serve::tui_common::OverlayState {
         crate::serve::tui_common::OverlayState::Info {
             alias: "acme-web".to_string(),
+            storage: "local".into(),
             path: String::new(),
             chunks: 0,
             files: 0,
@@ -4988,6 +4991,39 @@ fn estimate_wrapped_height_counts_multi_row_lines() {
 /// Long warning lines must WRAP inside the modal, not clip at the border:
 /// the tail of the failure text (the feed URL) stays readable, and the
 /// key-hint footer survives on the border's bottom title.
+#[test]
+fn info_overlay_renders_storage_health_separately_from_symbol_warnings() {
+    let overlay = crate::serve::tui_common::OverlayState::Info {
+        alias: "storage".into(),
+        path: "/index".into(),
+        chunks: 2,
+        files: 1,
+        max_chunk_id: 1,
+        storage: "postgres (connected)".into(),
+        db_size_human: "1 MB".into(),
+        model: "minilm-l6-q".into(),
+        dims: 384,
+        lock: "read".into(),
+        index_age: "1m".into(),
+        symbol_warnings: vec![],
+        symbol_index: vec![],
+        copy_feedback: None,
+    };
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+    terminal
+        .draw(|frame| crate::serve::tui_common::render_overlay(frame, frame.area(), &overlay))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rendered = buffer
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("postgres (connected)"));
+    assert!(rendered.contains("Local size:"));
+    assert!(!rendered.contains("Storage: postgres"));
+}
+
 #[test]
 fn modal_wraps_long_warning_lines_instead_of_clipping() {
     use ratatui::backend::TestBackend;

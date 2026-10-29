@@ -1238,13 +1238,16 @@ async fn index_with_options(
         fts_store.delete_by_path(&rel_path.to_string_lossy())?;
 
         // Phase 2e: Insert into FTS with real chunk IDs from vector store.
-        // FTS failures are non-fatal: vector search is the primary search method,
-        // FTS (BM25) is supplementary for hybrid search. If tantivy encounters
-        // I/O errors (common on Windows due to antivirus interference), we log
-        // a warning and continue rather than aborting the entire indexing run.
+        // PostgreSQL publication errors leave file metadata uncommitted for retry.
+        // Local vector search remains available when supplementary FTS fails.
         for ((content, path, signature, kind), &chunk_id) in fts_data.iter().zip(chunk_ids.iter()) {
             if let Err(e) = fts_store.add_chunk(chunk_id, content, path, signature.as_deref(), kind)
             {
+                if store.backend() == "postgres" {
+                    return Err(e.context(
+                        "Postgres file committed; local FTS publication failed, retry indexing",
+                    ));
+                }
                 tracing::warn!(
                     "FTS add_chunk failed in {}: {} (continuing without FTS for this chunk)",
                     file.path.display(),
@@ -1260,11 +1263,15 @@ async fn index_with_options(
         total_chunks += chunk_count;
         pb.inc(1);
 
-        // Periodic FTS commit to flush the in-memory segment to disk in a controlled
-        // way. Non-fatal: if commit fails, we log and continue. Some FTS data may
-        // be lost but vector search (primary) is unaffected.
+        // Periodic FTS commit bounds pending documents. PostgreSQL publication
+        // must succeed before file metadata records the committed generation.
         if total_chunks % 1000 == 0 && total_chunks > 0 {
             if let Err(e) = fts_store.commit() {
+                if store.backend() == "postgres" {
+                    return Err(e.context(
+                        "Postgres files committed; local FTS publication failed, retry indexing",
+                    ));
+                }
                 tracing::warn!(
                     "Periodic FTS commit failed at {} chunks: {} (continuing, some FTS data may be lost)",
                     total_chunks,
@@ -1294,6 +1301,11 @@ async fn index_with_options(
         // Commit FTS
         if total_chunks > 0 {
             if let Err(e) = fts_store.commit() {
+                if store.backend() == "postgres" {
+                    return Err(e.context(
+                        "Postgres files committed; local FTS publication failed, retry indexing",
+                    ));
+                }
                 log_print!("{}   FTS commit warning: {}", "⚠️ ".yellow(), e);
             }
         }
@@ -1394,8 +1406,13 @@ async fn index_with_options(
     drop(embedding_service);
     drop(chunker);
 
-    // Commit FTS store (non-fatal: vector search works without FTS)
+    // Commit FTS before publishing file metadata.
     if let Err(e) = fts_store.commit() {
+        if store.backend() == "postgres" {
+            return Err(e.context(
+                "Postgres files committed; local FTS publication failed, retry indexing",
+            ));
+        }
         tracing::warn!(
             "Final FTS commit failed: {} (vector search will work, but hybrid/BM25 search may have gaps)",
             e

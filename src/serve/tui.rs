@@ -1151,6 +1151,8 @@ pub(crate) fn build_info_overlay(alias: &str, state: &Arc<ServeState>) -> Option
         chunks,
         files,
         max_chunk_id,
+        storage: crate::vectordb::storage_backend(&db_path)
+            .unwrap_or_else(|error| format!("unavailable: {error:#}")),
         db_size_human,
         model,
         dims,
@@ -1282,7 +1284,7 @@ fn spawn_info_overlay(
                         files,
                         max_chunk_id,
                         dims,
-                        symbol_warnings,
+                        storage,
                         ..
                     } = &mut ov
                     {
@@ -1292,10 +1294,9 @@ fn spawn_info_overlay(
                                 *files = stats.total_files;
                                 *max_chunk_id = stats.max_chunk_id;
                                 *dims = stats.dimensions;
-                                symbol_warnings.push("Storage: postgres (connected)".into());
+                                *storage = "postgres (connected)".into();
                             }
-                            Err(error) => symbol_warnings
-                                .push(format!("Postgres storage unavailable: {error:#}")),
+                            Err(error) => *storage = format!("postgres unavailable: {error:#}"),
                         }
                     }
                 }
