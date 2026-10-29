@@ -10,7 +10,7 @@ use tracing::{debug, info};
 use crate::cache::{normalize_path, safe_canonicalize, storage_key, FileMetaStore};
 use crate::chunker::SemanticChunker;
 use crate::db_discovery::find_best_database;
-use crate::embed::{EmbeddingService, ModelType};
+use crate::embed::{EmbeddingModel, EmbeddingService};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
 use crate::vectordb::{merge_metadata_atomic, VectorStore};
@@ -66,7 +66,7 @@ fn recorded_dimensions(db_path: &Path) -> usize {
         .and_then(|j| j.get("dimensions").and_then(|v| v.as_u64()))
         .map(|d| d as usize);
     from_metadata
-        .or_else(|| ModelType::from_index_metadata(db_path).map(|m| m.dimensions()))
+        .or_else(|| EmbeddingModel::from_index_metadata(db_path).map(|m| m.dimensions()))
         .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS)
 }
 
@@ -84,8 +84,8 @@ fn recorded_dimensions(db_path: &Path) -> usize {
 fn resolve_index_model(
     db_path: &Path,
     force: bool,
-    requested: Option<ModelType>,
-) -> Result<ModelType> {
+    requested: Option<EmbeddingModel>,
+) -> Result<EmbeddingModel> {
     // `--force` deletes the database (see `get_db_path_smart`), so there is no
     // recorded model to honour; a non-existent/legacy index has none either.
     if force || !db_path.join("metadata.json").exists() {
@@ -587,7 +587,7 @@ pub async fn index(
     dry_run: bool,
     force: bool,
     global: bool,
-    model: Option<ModelType>,
+    model: Option<EmbeddingModel>,
     local: bool,
     log_file: Option<PathBuf>,
     cancel_token: CancellationToken,
@@ -686,7 +686,7 @@ pub async fn index_quiet_with_model(
     path: Option<PathBuf>,
     force: bool,
     global: bool,
-    model: Option<ModelType>,
+    model: Option<EmbeddingModel>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     index_with_options(path, false, force, global, model, true, None, cancel_token).await
@@ -699,7 +699,7 @@ async fn index_with_options(
     dry_run: bool,
     force: bool,
     global: bool,
-    model: Option<ModelType>,
+    model: Option<EmbeddingModel>,
     quiet: bool,
     log_file: Option<PathBuf>,
     cancel_token: CancellationToken,
@@ -1632,7 +1632,7 @@ pub async fn add_to_index(
     global: bool,
     local: bool,
     log_file: Option<PathBuf>,
-    model: Option<ModelType>,
+    model: Option<EmbeddingModel>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
@@ -2555,7 +2555,7 @@ pub(crate) async fn try_delegate_add_to_serve(
     path: &Option<PathBuf>,
     alias: &Option<String>,
     global: bool,
-    model: &Option<ModelType>,
+    model: &Option<EmbeddingModel>,
 ) -> std::result::Result<(String, PathBuf), DelegateError> {
     use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
@@ -3656,7 +3656,7 @@ mod index_model_resolution_tests {
     use super::*;
 
     /// Write an index metadata.json recording `model` (as the indexer does).
-    fn write_metadata(db_path: &Path, model: ModelType) {
+    fn write_metadata(db_path: &Path, model: EmbeddingModel) {
         std::fs::create_dir_all(db_path).unwrap();
         let mut obj = serde_json::Map::new();
         model.write_metadata_fields(&mut obj);
@@ -3671,7 +3671,7 @@ mod index_model_resolution_tests {
     fn recorded_dimensions_reads_metadata_dimensions() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".codesearch.db");
-        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+        write_metadata(&db, EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4));
         assert_eq!(recorded_dimensions(&db), 768);
     }
 
@@ -3702,17 +3702,17 @@ mod index_model_resolution_tests {
         // default (384-dim MiniLM). The recorded model must win.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".codesearch.db");
-        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+        write_metadata(&db, EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4));
 
         assert_eq!(
             resolve_index_model(&db, false, None).unwrap(),
-            ModelType::EmbeddingGemma300MQ4,
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
             "an existing index's recorded model must be used, not the default"
         );
         // An explicit --model that agrees is accepted.
         assert_eq!(
-            resolve_index_model(&db, false, Some(ModelType::EmbeddingGemma300MQ4)).unwrap(),
-            ModelType::EmbeddingGemma300MQ4
+            resolve_index_model(&db, false, Some(EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))).unwrap(),
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4)
         );
     }
 
@@ -3720,9 +3720,9 @@ mod index_model_resolution_tests {
     fn resolve_index_model_rejects_disagreeing_override_without_force() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".codesearch.db");
-        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+        write_metadata(&db, EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4));
 
-        let err = resolve_index_model(&db, false, Some(ModelType::AllMiniLML6V2Q))
+        let err = resolve_index_model(&db, false, Some(EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q)))
             .expect_err("a --model that disagrees with the index must be rejected");
         let msg = format!("{err:#}");
         assert!(
@@ -3732,8 +3732,8 @@ mod index_model_resolution_tests {
 
         // --force deletes the DB, so the requested model is honoured.
         assert_eq!(
-            resolve_index_model(&db, true, Some(ModelType::AllMiniLML6V2Q)).unwrap(),
-            ModelType::AllMiniLML6V2Q
+            resolve_index_model(&db, true, Some(EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q))).unwrap(),
+            EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q)
         );
     }
 
@@ -3743,12 +3743,12 @@ mod index_model_resolution_tests {
         let db = dir.path().join(".codesearch.db"); // does not exist
 
         assert_eq!(
-            resolve_index_model(&db, false, Some(ModelType::EmbeddingGemma300MQ4)).unwrap(),
-            ModelType::EmbeddingGemma300MQ4
+            resolve_index_model(&db, false, Some(EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))).unwrap(),
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4)
         );
         assert_eq!(
             resolve_index_model(&db, false, None).unwrap(),
-            ModelType::default()
+            EmbeddingModel::default()
         );
     }
 }

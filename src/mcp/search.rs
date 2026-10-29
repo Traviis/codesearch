@@ -664,16 +664,16 @@ impl CodesearchService {
         // Distinct models that actually answered (embedding resolved): a
         // group mixing them produces scores from different vector spaces,
         // which the merge presents as one ranking.
-        let mut answering_models: std::collections::HashSet<crate::embed::ModelType> =
+        let mut answering_models: std::collections::HashSet<crate::embed::EmbeddingModel> =
             std::collections::HashSet::new();
         {
-            let mut by_model: std::collections::HashMap<crate::embed::ModelType, Vec<f32>> =
+            let mut by_model: std::collections::HashMap<crate::embed::EmbeddingModel, Vec<f32>> =
                 std::collections::HashMap::new();
             // One warning per distinct missing model, not per repo: a group
             // often shares a single model, and N copies of the same warning is
             // noise an agent has to read past.
             let mut missing_by_model: std::collections::HashMap<
-                crate::embed::ModelType,
+                crate::embed::EmbeddingModel,
                 Vec<String>,
             > = std::collections::HashMap::new();
             for alias in aliases {

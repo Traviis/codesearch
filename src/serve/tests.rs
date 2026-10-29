@@ -1175,7 +1175,7 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
 
     let state = Arc::new(
         state_with_config(ReposConfig::default())
-            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+            .with_default_model(Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))),
     );
 
     let (status, body) = add_repo_handler(
@@ -1236,7 +1236,7 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
 
     let state = Arc::new(
         state_with_config(ReposConfig::default())
-            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+            .with_default_model(Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))),
     );
 
     let (status, body) = add_repo_handler(
@@ -1398,8 +1398,8 @@ async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
 #[test]
 fn resolve_add_repo_model_precedence() {
     use crate::embed::ModelType;
-    let gemma = ModelType::EmbeddingGemma300MQ4;
-    let mini = ModelType::AllMiniLML6V2Q;
+    let gemma = crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4);
+    let mini = crate::embed::EmbeddingModel::Local(ModelType::AllMiniLML6V2Q);
 
     // Explicit model always wins, even over a recorded model and a default.
     assert_eq!(
@@ -1422,8 +1422,8 @@ fn resolve_add_repo_model_precedence() {
 #[test]
 fn should_adopt_existing_index_precedence() {
     use crate::embed::ModelType;
-    let gemma = ModelType::EmbeddingGemma300MQ4;
-    let mini = ModelType::AllMiniLML6V2Q;
+    let gemma = crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4);
+    let mini = crate::embed::EmbeddingModel::Local(ModelType::AllMiniLML6V2Q);
 
     // No index on disk → nothing to adopt, force-build.
     assert!(!should_adopt_existing_index(None, None));
@@ -1447,9 +1447,9 @@ fn serve_default_model_is_service_fallback() {
     use crate::embed::ModelType;
     let state = std::sync::Arc::new(
         ServeState::new(ReposConfig::default(), None)
-            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+            .with_default_model(Some(crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4))),
     );
-    assert_eq!(state.default_model(), Some(ModelType::EmbeddingGemma300MQ4));
+    assert_eq!(state.default_model(), Some(crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4)));
 
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
     assert_eq!(
@@ -1468,7 +1468,7 @@ fn no_serve_default_keeps_builtin_fallback() {
     assert_eq!(state.default_model(), None);
 
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
-    assert_eq!(svc.query_model(None), ModelType::default());
+    assert_eq!(svc.query_model(None), crate::embed::EmbeddingModel::Local(ModelType::default()));
 }
 
 /// A repo whose `metadata.json` records no model is queried with the BUILT-IN
@@ -1496,7 +1496,7 @@ fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
 
     let state = std::sync::Arc::new(
         ServeState::new(config, Some(config_file))
-            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+            .with_default_model(Some(crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4))),
     );
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
 
@@ -1504,7 +1504,7 @@ fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
     let resolution = svc.resolve_query_model(Some("legacy"));
     assert_eq!(
         resolution.model,
-        ModelType::default(),
+        crate::embed::EmbeddingModel::Local(ModelType::default()),
         "a repo that records no model must be queried with the built-in default, \
          not the '{}' serve default",
         ModelType::EmbeddingGemma300MQ4.short_name()
@@ -1534,7 +1534,7 @@ fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
     )
     .unwrap();
     let resolution = svc.resolve_query_model(Some("legacy"));
-    assert_eq!(resolution.model, ModelType::EmbeddingGemma300MQ4);
+    assert_eq!(resolution.model, crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4));
     assert!(
         resolution.assumed_warning.is_none(),
         "a recorded model must not warn"
@@ -3307,10 +3307,10 @@ fn model_for_alias_reads_the_index_metadata_model() {
     let cases = [
         (
             "embeddinggemma-q4",
-            Some(crate::embed::ModelType::EmbeddingGemma300MQ4),
+            Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4)),
         ),
-        ("minilm-l6-q", Some(crate::embed::ModelType::AllMiniLML6V2Q)),
-        ("bge-base", Some(crate::embed::ModelType::BGEBaseENV15)),
+        ("minilm-l6-q", Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q))),
+        ("bge-base", Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::BGEBaseENV15))),
         // An unknown recorded name must not be silently coerced to the default:
         // callers fall back explicitly, and the resolver reports "no answer".
         ("not-a-real-model", None),
@@ -3371,11 +3371,11 @@ fn model_for_alias_is_per_repo_not_hub_wide() {
 
     assert_eq!(
         state.model_for_alias("legacy"),
-        Some(crate::embed::ModelType::AllMiniLML6V2Q)
+        Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q))
     );
     assert_eq!(
         state.model_for_alias("rebuilt"),
-        Some(crate::embed::ModelType::EmbeddingGemma300MQ4)
+        Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))
     );
 }
 
@@ -3397,11 +3397,11 @@ fn serve_service_uses_repo_model_not_default() {
 
     assert_eq!(
         svc.query_model(Some("gemma-repo")),
-        crate::embed::ModelType::EmbeddingGemma300MQ4,
+        crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
         "serve must embed a repo's queries with the model that repo was indexed with"
     );
     // No alias (unscoped) or an unknown alias falls back to the service default.
-    assert_eq!(svc.query_model(None), crate::embed::ModelType::default());
+    assert_eq!(svc.query_model(None), crate::embed::EmbeddingModel::Local(crate::embed::ModelType::default()));
     assert_eq!(
         svc.query_model(Some("not-registered")),
         crate::embed::ModelType::default()
