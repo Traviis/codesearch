@@ -17,6 +17,13 @@ pub struct PostgresStore {
 }
 
 impl PostgresStore {
+    pub fn validate_embedding_space(&self, model: &str, dimensions: usize) -> Result<()> {
+        if self.model != model || self.dimensions != dimensions {
+            bail!("Postgres model/dimension mismatch: changing models requires resetting and reindexing every repository in this database");
+        }
+        Ok(())
+    }
+
     pub async fn connect(url: &str, model: &str, dimensions: usize) -> Result<Self> {
         if !(1..=2000).contains(&dimensions) {
             bail!("Postgres cosine HNSW requires an embedding dimension between 1 and 2000; got {dimensions}");

@@ -974,8 +974,17 @@ impl IndexManager {
             }
         }
 
-        // Find deleted files
-        let deleted_files = file_meta_store.find_deleted_files(codebase_path);
+        // Include SQL files absent from local publication metadata.
+        let mut deleted_files = file_meta_store.find_deleted_files(codebase_path);
+        if let Some(remote_files) = &remote_files {
+            for (path, ids) in remote_files {
+                if !codebase_path.join(path).exists()
+                    && !deleted_files.iter().any(|(key, _)| key == path)
+                {
+                    deleted_files.push((path.clone(), ids.clone()));
+                }
+            }
+        }
 
         info!(
             "   Unchanged: {}, Changed: {}, Deleted: {}",
@@ -1020,6 +1029,7 @@ impl IndexManager {
                 // Delete from FTS
                 {
                     let mut fts_store = stores.fts_store.write().await;
+                    fts_store.delete_by_path(file_path)?;
                     for chunk_id in chunk_ids {
                         fts_store.delete_chunk(*chunk_id)?;
                     }
@@ -1558,6 +1568,7 @@ impl IndexManager {
         // ── Step 1: Clear vector store (LMDB databases) ──
         {
             let mut vstore = stores.vector_store.write().await;
+            vstore.validate_embedding_space(&model_name, dimensions)?;
             vstore.clear().await?;
         }
 
@@ -3377,6 +3388,7 @@ impl IndexManager {
         let meta = file_meta_store.remove_file(&key);
         let chunk_ids = match meta {
             Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
+            Some(_) if !remote_ids.is_empty() => remote_ids,
             Some(_) => {
                 debug!("No chunks to remove for file: {}", file_path.display());
                 file_meta_store.save(db_path)?;
@@ -3406,6 +3418,7 @@ impl IndexManager {
         // Delete from FTS with write lock
         {
             let mut fts_store = stores.fts_store.write().await;
+            fts_store.delete_by_path(&key)?;
             for chunk_id in &chunk_ids {
                 fts_store.delete_chunk(*chunk_id)?;
             }

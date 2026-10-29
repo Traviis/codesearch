@@ -706,7 +706,12 @@ async fn index_with_options(
 ) -> Result<()> {
     let requested_project = path.as_deref().unwrap_or(Path::new("."));
     let candidate = requested_project.join(crate::constants::DB_DIR_NAME);
-    let postgres = crate::vectordb::storage_backend(&candidate)? == "postgres";
+    let existing = find_best_database(path.as_deref())?;
+    let backend_path = existing
+        .as_ref()
+        .map(|info| info.db_path.as_path())
+        .unwrap_or(&candidate);
+    let postgres = crate::vectordb::storage_backend(backend_path)? == "postgres";
     let (db_path, project_path) = get_db_path_smart(path, global, force && !postgres)?;
     // Resolve the embedding model BEFORE touching the index: on an existing
     // index the model recorded in metadata.json wins, and an explicit `--model`

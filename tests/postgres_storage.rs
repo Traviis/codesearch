@@ -356,4 +356,94 @@ async fn postgres_file_lifecycle_and_filtered_search() {
         assert_eq!(response["results"][0]["path"], "src/rule.xml");
     }
     assert!(!db.join("data.mdb").exists());
+
+    use rmcp::ServiceExt;
+    let shared =
+        codesearch::index::SharedStores::new(&recovery.path().join("protocol-state"), 384).unwrap();
+    *shared.vector_store.write().await = codesearch::vectordb::ChunkStore::Postgres {
+        store: cli_store.clone(),
+        repo: "cli".into(),
+    };
+    *shared.fts_store.write().await = codesearch::fts::FtsStore::new_readonly(&db).unwrap();
+    let service = codesearch::mcp::CodesearchService::new_with_stores(
+        Some(project.path().to_path_buf()),
+        Some(std::sync::Arc::new(shared)),
+    )
+    .unwrap();
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    let server = tokio::spawn(async move {
+        service
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap();
+    });
+    let client = ().serve(client_transport).await.unwrap();
+    for (name, arguments) in [
+        (
+            "search",
+            serde_json::json!({"query":"gadget","mode":"literal"}),
+        ),
+        ("get_chunk", serde_json::json!({"chunk_id":ids[0]})),
+        (
+            "explore",
+            serde_json::json!({"target":"src/rule.xml","kind":"outline"}),
+        ),
+    ] {
+        let response = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new(name)
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.is_error, Some(true), "{response:?}");
+        let text = response
+            .content
+            .iter()
+            .filter_map(|content| content.as_text())
+            .map(|content| content.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if name == "explore" {
+            let items: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(items[0]["chunk_id"], ids[0]);
+            assert_eq!(items[0]["kind"], "Block");
+        } else {
+            assert!(text.contains("src/rule.xml"), "{name}: {text}");
+        }
+    }
+    client.cancel().await.unwrap();
+    server.await.unwrap();
+
+    let force_stores =
+        codesearch::index::SharedStores::new(&recovery.path().join("force-state"), 384).unwrap();
+    *force_stores.vector_store.write().await = codesearch::vectordb::ChunkStore::Postgres {
+        store: cli_store.clone(),
+        repo: "cli".into(),
+    };
+    let result = codesearch::index::IndexManager::force_reindex_with_stores(
+        project.path(),
+        &db,
+        &force_stores,
+        Some(codesearch::embed::ModelType::EmbeddingGemma300MQ4),
+        &tokio_util::sync::CancellationToken::new(),
+        None,
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("mismatch"));
+    assert!(cli_store.get_chunk("cli", ids[0]).await.unwrap().is_some());
+    codesearch::index::IndexManager::perform_incremental_refresh_with_stores(
+        project.path(),
+        &db,
+        &force_stores,
+        &tokio_util::sync::CancellationToken::new(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(cli_store.get_chunk("cli", ids[0]).await.unwrap().is_none());
 }

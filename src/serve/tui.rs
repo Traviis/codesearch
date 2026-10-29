@@ -1272,7 +1272,34 @@ fn spawn_info_overlay(
     gen: u64,
 ) {
     tokio::spawn(async move {
-        if let Some(ov) = build_info_overlay(&alias, &state) {
+        if let Some(mut ov) = build_info_overlay(&alias, &state) {
+            if let Some(stores) = state.get_opened_stores(&alias) {
+                let store = stores.vector_store.read().await;
+                if store.backend() == "postgres" {
+                    let result = store.stats().await;
+                    if let OverlayState::Info {
+                        chunks,
+                        files,
+                        max_chunk_id,
+                        dims,
+                        symbol_warnings,
+                        ..
+                    } = &mut ov
+                    {
+                        match result {
+                            Ok(stats) => {
+                                *chunks = stats.total_chunks;
+                                *files = stats.total_files;
+                                *max_chunk_id = stats.max_chunk_id;
+                                *dims = stats.dimensions;
+                                symbol_warnings.push("Storage: postgres (connected)".into());
+                            }
+                            Err(error) => symbol_warnings
+                                .push(format!("Postgres storage unavailable: {error:#}")),
+                        }
+                    }
+                }
+            }
             let _ = tx.send((gen, ov)).await;
         }
     });

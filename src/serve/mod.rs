@@ -4961,18 +4961,23 @@ async fn info_handler(
     // open (nothing live to ask), so a consumer can tell "no graph" apart from
     // "unknown" instead of reading a defaulted `false` as a hard failure.
     let mut indexed: Option<bool> = None;
+    let backend = crate::vectordb::storage_backend(&db_path).unwrap_or_else(|_| "unknown".into());
+    let mut storage_error: Option<String> = None;
 
     // If stores are open, live stats override metadata.
     if let Some(stores) = state.get_opened_stores(&alias) {
         if let Ok(vs) = stores.vector_store.try_read() {
-            if let Some(Ok(live_stats)) = vs.local().map(|local| local.stats()) {
-                chunks = live_stats.total_chunks;
-                files = live_stats.total_files;
-                max_chunk_id = live_stats.max_chunk_id;
-                indexed = Some(live_stats.indexed);
-                if dims == 0 {
-                    dims = live_stats.dimensions;
+            match vs.stats().await {
+                Ok(live_stats) => {
+                    chunks = live_stats.total_chunks;
+                    files = live_stats.total_files;
+                    max_chunk_id = live_stats.max_chunk_id;
+                    indexed = Some(live_stats.indexed);
+                    if dims == 0 {
+                        dims = live_stats.dimensions;
+                    }
                 }
+                Err(error) => storage_error = Some(format!("{error:#}")),
             }
         }
         lock = if stores.readonly {
@@ -4997,6 +5002,8 @@ async fn info_handler(
         "chunks": chunks,
         "files": files,
         "max_chunk_id": max_chunk_id,
+        "backend": backend,
+        "storage_error": storage_error,
         "db_size_human": db_size_human,
         "model": model,
         "dims": dims,

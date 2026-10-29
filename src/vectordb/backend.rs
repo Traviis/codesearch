@@ -193,6 +193,17 @@ impl ChunkStore {
         }
     }
 
+    pub fn validate_embedding_space(&self, model: &str, dimensions: usize) -> Result<()> {
+        match self {
+            Self::Local(_) => {
+                let _ = (model, dimensions);
+                Ok(())
+            }
+            #[cfg(feature = "pgvector")]
+            Self::Postgres { store, .. } => store.validate_embedding_space(model, dimensions),
+        }
+    }
+
     pub async fn clear(&mut self) -> Result<()> {
         match self {
             Self::Local(store) => store.clear(),
