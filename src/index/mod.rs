@@ -1496,8 +1496,13 @@ pub async fn stats(path: Option<PathBuf>) -> Result<()> {
     println!("💾 Database: {}", db_path.display());
     println!("📂 Project: {}", project_path.display());
 
-    let store = VectorStore::new(&db_path, recorded_dimensions(&db_path))?;
-    let stats = store.stats()?;
+    let (model, dimensions) = IndexManager::resolve_embed_model(&db_path)?;
+    let store = crate::vectordb::ChunkStore::open_for_path(
+        &db_path, &project_path, model.short_name(), dimensions, true,
+    ).await?;
+    let stats = store.stats().await?;
+    println!("   Backend: {}", store.backend());
+    println!("   Connection: healthy");
 
     println!("\n{}", "Vector Store:".bright_green());
     println!("   Total chunks: {}", stats.total_chunks);

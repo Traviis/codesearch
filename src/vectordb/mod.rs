@@ -1,4 +1,10 @@
+mod backend;
 mod store;
+pub use backend::ChunkStore;
+#[cfg(feature = "pgvector")]
+mod postgres;
+#[cfg(feature = "pgvector")]
+pub use postgres::PostgresStore;
 
 pub use store::{
     merge_metadata_atomic, ChunkMetadata, SearchResult, StoreStats, VectorStore, PATH_REWRITE_BATCH,
