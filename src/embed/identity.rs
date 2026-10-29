@@ -24,7 +24,6 @@ impl Default for EmbeddingModel {
     }
 }
 impl EmbeddingModel {
-
     pub fn parse(name: &str) -> Option<Self> {
         if active_config().remote() {
             (name == active_config().model).then_some(Self::ActiveRemote)
@@ -58,9 +57,13 @@ impl EmbeddingModel {
         }
     }
     pub fn dimensions(&self) -> usize {
-        // Display-only callers use the configured/probed value; execution paths
-        // must call try_dimensions before opening a store or writing metadata.
-        self.try_dimensions().unwrap_or(0)
+        match self {
+            Self::Local(model) => model.dimensions(),
+            // configure() resolves this once and fails before executing commands.
+            Self::ActiveRemote => {
+                super::openai::known_dimensions().expect("active remote strategy initialized")
+            }
+        }
     }
     pub fn is_heavier_than_default(&self) -> bool {
         match self {
@@ -108,6 +111,22 @@ impl EmbeddingModel {
         }
         ModelType::parse(data.get("model_short_name")?.as_str()?).map(Self::Local)
     }
+    pub fn validate_strategy(path: &Path) -> Result<()> {
+        if !path.join("metadata.json").exists() && !active_config().remote() {
+            return Ok(());
+        }
+        let data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("metadata.json"))?)?;
+        let provider = data
+            .get("embedding_provider")
+            .and_then(|value| value.as_str())
+            .unwrap_or("fastembed");
+        if provider == "fastembed" && !active_config().remote() {
+            return Ok(());
+        }
+        Self::resolve_index(path).map(|_| ())
+    }
+
     pub fn resolve_index(path: &Path) -> Result<Self> {
         let data: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path.join("metadata.json"))?)?;
@@ -144,7 +163,7 @@ impl EmbeddingModel {
                     .unwrap_or("minilm-l6-q");
                 let model = ModelType::parse(name).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Unknown embedding model in index metadata; rebuild with --force"
+                        "Unknown embedding model '{name}' in index metadata; rebuild with --force"
                     )
                 })?;
                 let dims = data

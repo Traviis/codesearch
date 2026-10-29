@@ -675,7 +675,10 @@ impl ServeState {
     ///
     /// Set once at startup, before the state is shared. `None` leaves the
     /// built-in default in place.
-    pub(crate) fn with_default_model(mut self, model: Option<crate::embed::EmbeddingModel>) -> Self {
+    pub(crate) fn with_default_model(
+        mut self,
+        model: Option<crate::embed::EmbeddingModel>,
+    ) -> Self {
         self.default_model = model;
         self
     }
@@ -3247,6 +3250,15 @@ impl ServeState {
         touch: bool,
     ) -> std::result::Result<Arc<SharedStores>, String> {
         let _ = self.reload_if_changed();
+        // Validate even the cached-store path: changing the active strategy
+        // never authorizes queries against another vector space.
+        if let Some(path) = self.config_snapshot().resolve(alias) {
+            let db = path.join(DB_DIR_NAME);
+            if db.join("metadata.json").exists() {
+                crate::embed::EmbeddingModel::validate_strategy(&db)
+                    .map_err(|e| format!("{e:#}"))?;
+            }
+        }
 
         // A cached `Conflicted` is a STALE FAILURE, not a terminal state: drop it
         // and fall through to a fresh open attempt below.
@@ -5899,6 +5911,16 @@ async fn add_repo_handler(
     // creating a brand-new index: an existing index keeps the model recorded in
     // its `metadata.json`, exactly as if the flag had not been set. An explicit
     // `model` still wins and rebuilds at that model's dimension.
+    if db_path.join("metadata.json").exists() {
+        if let Err(error) = crate::embed::EmbeddingModel::resolve_index(&db_path) {
+            return (
+                StatusCode::CONFLICT,
+                axum::response::Json(json!({
+                    "error": format!("{error:#}"), "status": "embedding_strategy_mismatch"
+                })),
+            );
+        }
+    }
     let recorded_model = crate::embed::EmbeddingModel::from_index_metadata(&db_path);
     let model_override =
         resolve_add_repo_model(explicit_model, recorded_model, state.default_model());

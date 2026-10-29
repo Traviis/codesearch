@@ -815,7 +815,7 @@ impl IndexManager {
             return Err(anyhow::anyhow!("No metadata.json found in database"));
         };
 
-        let _ = Self::resolve_embed_model(db_path)?;
+        EmbeddingModel::validate_strategy(db_path)?;
 
         // Load FileMetaStore
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, &model_name, dimensions)?;
@@ -1402,6 +1402,19 @@ impl IndexManager {
             })
         };
 
+        let recorded_provider = preserved_metadata
+            .get("embedding_provider")
+            .and_then(|value| value.as_str())
+            .unwrap_or("fastembed");
+        let strategy_changed =
+            (recorded_provider == "openai") != crate::embed::active_config().remote();
+        let model_override = model_override.or_else(|| {
+            (strategy_changed || crate::embed::active_config().remote())
+                .then(EmbeddingModel::default)
+        });
+        if let Some(model) = model_override {
+            model.try_dimensions()?;
+        }
         // Apply model override if provided (e.g. from `index add --model`)
         if let Some(ref mt) = model_override {
             if let Some(obj) = preserved_metadata.as_object_mut() {

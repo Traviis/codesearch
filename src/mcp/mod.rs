@@ -153,7 +153,7 @@ pub(crate) fn intern_group_chunk_id(
 }
 
 use crate::db_discovery::{find_best_database, load_repos_config};
-use crate::embed::{EmbeddingServicePool, EmbeddingModel};
+use crate::embed::{EmbeddingModel, EmbeddingServicePool};
 use crate::file::Language;
 use crate::fts::FtsStore;
 use crate::index::SharedStores;
@@ -992,8 +992,31 @@ impl CodesearchService {
         let project_path = db_info.project_path;
 
         // Read model metadata from database
-        let model_type = EmbeddingModel::resolve_index(&db_path)?;
-        let dimensions = model_type.try_dimensions()?;
+        EmbeddingModel::validate_strategy(&db_path)?;
+        let metadata_path = db_path.join("metadata.json");
+        let (model_type, dimensions) = if crate::embed::active_config().remote() {
+            let model = EmbeddingModel::resolve_index(&db_path)?;
+            (model, model.try_dimensions()?)
+        } else if metadata_path.exists() {
+            let content = std::fs::read_to_string(&metadata_path)?;
+            let json: serde_json::Value = serde_json::from_str(&content)?;
+            let model_name = json
+                .get("model_short_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("minilm-l6");
+            let dimensions = json
+                .get("dimensions")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS as u64)
+                as usize;
+            let model = crate::embed::ModelType::parse(model_name).unwrap_or_default();
+            (EmbeddingModel::Local(model), dimensions)
+        } else {
+            (
+                EmbeddingModel::default(),
+                crate::constants::DEFAULT_EMBEDDING_DIMENSIONS,
+            )
+        };
 
         Ok(Self {
             tool_router: Self::merged_tool_router(),
@@ -1028,7 +1051,7 @@ impl CodesearchService {
             db_path: PathBuf::from("serve://multi-repo"),
             project_path: PathBuf::from("serve://multi-repo"),
             model_type,
-            dimensions: model_type.dimensions(),
+            dimensions: model_type.try_dimensions()?,
             embedding_pool: serve_state.embedding_pool(),
             shared_stores: None,
             serve_state: Some(serve_state),

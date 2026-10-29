@@ -7,6 +7,10 @@ use std::time::{Duration, SystemTime};
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static DIMENSIONS: OnceLock<usize> = OnceLock::new();
+static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub fn known_dimensions() -> Option<usize> {
+    DIMENSIONS.get().copied()
+}
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
@@ -22,9 +26,15 @@ pub fn active_dimensions() -> Result<usize> {
     if let Some(dims) = DIMENSIONS.get() {
         return Ok(*dims);
     }
+    let _probe = PROBE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Embedding probe mutex poisoned"))?;
+    if let Some(dims) = DIMENSIONS.get() {
+        return Ok(*dims);
+    }
     let embedder = OpenAiEmbedder::new(super::active_config().clone())?;
     let _ = DIMENSIONS.set(embedder.dimensions);
-    Ok(*DIMENSIONS.get().expect("initialized dimensions"))
+    Ok(embedder.dimensions)
 }
 
 pub struct OpenAiEmbedder {
@@ -64,6 +74,14 @@ impl OpenAiEmbedder {
         Ok(embedder)
     }
 
+    pub fn with_known_dimensions(config: EmbedConfig, dimensions: usize) -> Result<Self> {
+        let mut initial = config.clone();
+        initial.embed_dimensions = Some(dimensions);
+        let mut embedder = Self::new(initial)?;
+        embedder.config = config;
+        Ok(embedder)
+    }
+
     fn run(&self, texts: Vec<String>, query: bool) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -83,12 +101,13 @@ impl OpenAiEmbedder {
                     let inputs = inputs.iter().map(|s| config.transform(s, query)).collect();
                     let config = config.clone();
                     let client = client.clone();
-                    let semaphore = semaphore.clone();
+                    let permit = semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Embedding queue closed"))?;
                     tasks.spawn(async move {
-                        let _permit = semaphore
-                            .acquire()
-                            .await
-                            .map_err(|_| anyhow::anyhow!("Embedding queue closed"))?;
+                        let _permit = permit;
                         request(&client, &config, inputs, dimensions)
                             .await
                             .map(|vectors| (batch, vectors))
@@ -156,7 +175,15 @@ async fn request(
             return validate_response(response, inputs.len(), dimensions);
         }
         if !(status.as_u16() == 429 || status.is_server_error()) || attempt == 3 {
-            bail!("Remote embedding request failed (HTTP {})", status.as_u16());
+            let hint = match status.as_u16() {
+                401 | 403 => "check CODESEARCH_EMBED_API_KEY and endpoint permissions",
+                400 | 404 | 422 => "check embedding base URL, model and dimensions",
+                _ => "endpoint unavailable or retry budget exhausted",
+            };
+            bail!(
+                "Remote embedding request failed (HTTP {}): {hint}",
+                status.as_u16()
+            );
         }
         let retry_after = response
             .headers()
@@ -231,7 +258,9 @@ impl Embedder for OpenAiEmbedder {
     fn dimensions(&self) -> usize {
         self.dimensions
     }
-    fn model_name(&self) -> &str { &self.config.model }
+    fn model_name(&self) -> &str {
+        &self.config.model
+    }
     fn local_model(&self) -> Option<super::ModelType> {
         None
     }

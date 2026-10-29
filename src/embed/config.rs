@@ -8,25 +8,51 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbedConfig {
-    #[arg(long, env = "CODESEARCH_EMBED_PROVIDER", value_parser = ["fastembed", "openai"])]
+    #[arg(long, global = true, env = "CODESEARCH_EMBED_PROVIDER", value_parser = ["fastembed", "openai"])]
     pub embed_provider: Option<String>,
-    #[arg(long, env = "CODESEARCH_EMBED_BASE_URL")]
+    #[arg(long, global = true, env = "CODESEARCH_EMBED_BASE_URL")]
     pub embed_base_url: Option<String>,
-    #[arg(long, env = "CODESEARCH_EMBED_DIMENSIONS")]
+    #[arg(long, global = true, env = "CODESEARCH_EMBED_DIMENSIONS")]
     pub embed_dimensions: Option<usize>,
-    #[arg(long, env = "CODESEARCH_EMBED_BATCH_SIZE", default_value_t = 32)]
+    #[arg(
+        long,
+        global = true,
+        env = "CODESEARCH_EMBED_BATCH_SIZE",
+        default_value_t = 32
+    )]
     pub embed_batch_size: usize,
-    #[arg(long, env = "CODESEARCH_EMBED_TIMEOUT_SECS", default_value_t = 30)]
+    #[arg(
+        long,
+        global = true,
+        env = "CODESEARCH_EMBED_TIMEOUT_SECS",
+        default_value_t = 30
+    )]
     pub embed_timeout_secs: u64,
-    #[arg(long, env = "CODESEARCH_EMBED_CONCURRENCY", default_value_t = 2)]
+    #[arg(
+        long,
+        global = true,
+        env = "CODESEARCH_EMBED_CONCURRENCY",
+        default_value_t = 2
+    )]
     pub embed_concurrency: usize,
-    #[arg(long, env = "CODESEARCH_EMBED_QUERY_PREFIX", default_value = "")]
+    #[arg(
+        long,
+        global = true,
+        env = "CODESEARCH_EMBED_QUERY_PREFIX",
+        default_value = ""
+    )]
     pub embed_query_prefix: String,
-    #[arg(long, env = "CODESEARCH_EMBED_DOCUMENT_PREFIX", default_value = "")]
+    #[arg(
+        long,
+        global = true,
+        env = "CODESEARCH_EMBED_DOCUMENT_PREFIX",
+        default_value = ""
+    )]
     pub embed_document_prefix: String,
     /// Maximum UTF-8 input bytes, including prefix (remote only).
     #[arg(
         long,
+        global = true,
         env = "CODESEARCH_EMBED_MAX_INPUT_BYTES",
         default_value_t = 24000
     )]
@@ -118,8 +144,10 @@ impl EmbedConfig {
             self.embed_document_prefix,
             self.embed_max_input_bytes
         ]);
-        let hex = Sha256::digest(identity.to_string().as_bytes()).iter()
-            .map(|byte| format!("{byte:02x}")).collect::<String>();
+        let hex = Sha256::digest(identity.to_string().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         format!("openai-{hex}")
     }
 
@@ -139,21 +167,28 @@ impl EmbedConfig {
     }
 }
 
-pub fn configure(mut config: EmbedConfig, model: Option<&str>) -> Result<()> {
-    if config.embed_provider.is_none() {
-        if let Ok(path) = crate::constants::codesearch_home() {
-            if let Ok(data) = std::fs::read(path.join("embedding-defaults.json")) {
-                config = serde_json::from_slice(&data)
-                    .context("Invalid embedding defaults; rerun setup")?;
+pub fn configure(config: EmbedConfig, model: Option<&str>, explicit: &[String]) -> Result<()> {
+    let mut merged = config.clone();
+    if let Ok(path) = crate::constants::codesearch_home() {
+        if let Ok(data) = std::fs::read(path.join("embedding-defaults.json")) {
+            let saved: EmbedConfig =
+                serde_json::from_slice(&data).context("Invalid embedding defaults; rerun setup")?;
+            let mut saved = serde_json::to_value(saved)?;
+            let supplied = serde_json::to_value(&config)?;
+            for key in explicit {
+                if let Some(value) = supplied.get(key) {
+                    saved[key] = value.clone();
+                }
             }
+            merged = serde_json::from_value(saved)?;
         }
     }
     if let Some(model) = model {
-        config.model = model.to_owned();
+        merged.model = model.to_owned();
     }
-    config.validate()?;
+    merged.validate()?;
     ACTIVE
-        .set(config)
+        .set(merged)
         .map_err(|_| anyhow::anyhow!("Embedding strategy already configured"))
 }
 

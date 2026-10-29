@@ -70,12 +70,11 @@ impl EmbeddingService {
                 Box::new(FastEmbedder::with_cache_dir(model, cache_dir)?)
             }
             EmbeddingModel::ActiveRemote => {
-                let mut config = active_config().clone();
-                // Probe is process-wide, never repeated per batch/service.
                 let dimensions = model_type.try_dimensions()?;
-                config.embed_dimensions = Some(dimensions);
-                let embedder = openai::OpenAiEmbedder::new(config)?;
-                Box::new(embedder)
+                Box::new(openai::OpenAiEmbedder::with_known_dimensions(
+                    active_config().clone(),
+                    dimensions,
+                )?)
             }
         };
         let arc_embedder = Arc::new(Mutex::new(embedder));
@@ -277,6 +276,7 @@ impl EmbeddingService {
     }
 
     /// Get model short name (for storage)
+    #[allow(dead_code)] // Public diagnostic accessor
     pub fn model_short_name(&self) -> &str {
         self.model_type.short_name()
     }
@@ -335,6 +335,36 @@ impl EmbeddingService {
 impl Default for EmbeddingService {
     fn default() -> Self {
         Self::new().expect("Failed to create default embedding service")
+    }
+}
+
+pub fn embed_query_bounded(service: Arc<Mutex<EmbeddingService>>, query: &str) -> Result<Vec<f32>> {
+    if !active_config().remote() {
+        return service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .embed_query(query);
+    }
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(active_config().embed_timeout_secs);
+    loop {
+        match service.try_lock() {
+            Ok(mut guard) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("Remote embedding query deadline exceeded while queued");
+                }
+                return guard.embed_query(query);
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return error.into_inner().embed_query(query)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("Remote embedding query deadline exceeded while queued");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
     }
 }
 

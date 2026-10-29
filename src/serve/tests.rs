@@ -1174,8 +1174,9 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
     std::fs::create_dir(&repo_path).unwrap();
 
     let state = Arc::new(
-        state_with_config(ReposConfig::default())
-            .with_default_model(Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))),
+        state_with_config(ReposConfig::default()).with_default_model(Some(
+            crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        )),
     );
 
     let (status, body) = add_repo_handler(
@@ -1235,8 +1236,9 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
     .unwrap();
 
     let state = Arc::new(
-        state_with_config(ReposConfig::default())
-            .with_default_model(Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))),
+        state_with_config(ReposConfig::default()).with_default_model(Some(
+            crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        )),
     );
 
     let (status, body) = add_repo_handler(
@@ -1446,15 +1448,21 @@ fn should_adopt_existing_index_precedence() {
 fn serve_default_model_is_service_fallback() {
     use crate::embed::ModelType;
     let state = std::sync::Arc::new(
-        ServeState::new(ReposConfig::default(), None)
-            .with_default_model(Some(crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4))),
+        ServeState::new(ReposConfig::default(), None).with_default_model(Some(
+            crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4),
+        )),
     );
-    assert_eq!(state.default_model(), Some(crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4)));
+    assert_eq!(
+        state.default_model(),
+        Some(crate::embed::EmbeddingModel::Local(
+            ModelType::EmbeddingGemma300MQ4
+        ))
+    );
 
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
     assert_eq!(
         svc.query_model(None),
-        ModelType::EmbeddingGemma300MQ4,
+        crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4),
         "serve must fall back to its default model, not the built-in default"
     );
 }
@@ -1468,7 +1476,10 @@ fn no_serve_default_keeps_builtin_fallback() {
     assert_eq!(state.default_model(), None);
 
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
-    assert_eq!(svc.query_model(None), crate::embed::EmbeddingModel::Local(ModelType::default()));
+    assert_eq!(
+        svc.query_model(None),
+        crate::embed::EmbeddingModel::Local(ModelType::default())
+    );
 }
 
 /// A repo whose `metadata.json` records no model is queried with the BUILT-IN
@@ -1495,8 +1506,9 @@ fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
     config.save_to(&config_file).unwrap();
 
     let state = std::sync::Arc::new(
-        ServeState::new(config, Some(config_file))
-            .with_default_model(Some(crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4))),
+        ServeState::new(config, Some(config_file)).with_default_model(Some(
+            crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4),
+        )),
     );
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
 
@@ -1534,7 +1546,10 @@ fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
     )
     .unwrap();
     let resolution = svc.resolve_query_model(Some("legacy"));
-    assert_eq!(resolution.model, crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4));
+    assert_eq!(
+        resolution.model,
+        crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4)
+    );
     assert!(
         resolution.assumed_warning.is_none(),
         "a recorded model must not warn"
@@ -3307,10 +3322,22 @@ fn model_for_alias_reads_the_index_metadata_model() {
     let cases = [
         (
             "embeddinggemma-q4",
-            Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+            Some(crate::embed::EmbeddingModel::Local(
+                crate::embed::ModelType::EmbeddingGemma300MQ4,
+            )),
         ),
-        ("minilm-l6-q", Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q))),
-        ("bge-base", Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::BGEBaseENV15))),
+        (
+            "minilm-l6-q",
+            Some(crate::embed::EmbeddingModel::Local(
+                crate::embed::ModelType::AllMiniLML6V2Q,
+            )),
+        ),
+        (
+            "bge-base",
+            Some(crate::embed::EmbeddingModel::Local(
+                crate::embed::ModelType::BGEBaseENV15,
+            )),
+        ),
         // An unknown recorded name must not be silently coerced to the default:
         // callers fall back explicitly, and the resolver reports "no answer".
         ("not-a-real-model", None),
@@ -3371,11 +3398,15 @@ fn model_for_alias_is_per_repo_not_hub_wide() {
 
     assert_eq!(
         state.model_for_alias("legacy"),
-        Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q))
+        Some(crate::embed::EmbeddingModel::Local(
+            crate::embed::ModelType::AllMiniLML6V2Q
+        ))
     );
     assert_eq!(
         state.model_for_alias("rebuilt"),
-        Some(crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))
+        Some(crate::embed::EmbeddingModel::Local(
+            crate::embed::ModelType::EmbeddingGemma300MQ4
+        ))
     );
 }
 
@@ -3401,10 +3432,13 @@ fn serve_service_uses_repo_model_not_default() {
         "serve must embed a repo's queries with the model that repo was indexed with"
     );
     // No alias (unscoped) or an unknown alias falls back to the service default.
-    assert_eq!(svc.query_model(None), crate::embed::EmbeddingModel::Local(crate::embed::ModelType::default()));
+    assert_eq!(
+        svc.query_model(None),
+        crate::embed::EmbeddingModel::Local(crate::embed::ModelType::default())
+    );
     assert_eq!(
         svc.query_model(Some("not-registered")),
-        crate::embed::ModelType::default()
+        crate::embed::EmbeddingModel::Local(crate::embed::ModelType::default())
     );
 }
 

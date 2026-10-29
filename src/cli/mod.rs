@@ -1,5 +1,7 @@
 use anyhow::Result;
-use clap::{builder::BoolishValueParser, ArgAction, Parser, Subcommand};
+use clap::{
+    builder::BoolishValueParser, ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand,
+};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -1044,8 +1046,22 @@ pub(crate) fn parse_model_arg(model: Option<&str>) -> Result<Option<EmbeddingMod
 }
 
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
-    let cli = Cli::parse();
-    crate::embed::configure(cli.embedding.clone(), cli.model.as_deref())?;
+    let matches = Cli::command().get_matches();
+    let explicit: Vec<String> = matches
+        .ids()
+        .filter(|id| {
+            id.as_str().starts_with("embed_")
+                && matches.value_source(id.as_str())
+                    != Some(clap::parser::ValueSource::DefaultValue)
+        })
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    let cli = Cli::from_arg_matches(&matches)?;
+    let active_model = match &cli.command {
+        Commands::Setup { model } => model.as_deref().or(cli.model.as_deref()),
+        _ => cli.model.as_deref(),
+    };
+    crate::embed::configure(cli.embedding.clone(), active_model, &explicit)?;
 
     // Parse model from CLI flag
     let model_type = parse_model_arg(cli.model.as_deref())?;
@@ -1292,6 +1308,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     crate::serve::run_tui_standalone(url, api_key).await
                 }
                 crate::cli::ServeAction::Start => {
+                    if crate::embed::active_config().remote() {
+                        EmbeddingModel::ActiveRemote.try_dimensions()?;
+                    }
                     // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
                     // regardless of whether a database exists in the current directory.
                     // This is a central log for the multi-repo serve process, separate from

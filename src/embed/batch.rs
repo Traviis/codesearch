@@ -246,8 +246,8 @@ fn clean_docstring(doc: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embed::FastEmbedder;
     use crate::chunker::ChunkKind;
+    use crate::embed::FastEmbedder;
 
     #[test]
     fn test_embedding_stats() {

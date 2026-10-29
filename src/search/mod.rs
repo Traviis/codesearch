@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::cache::FileMetaStore;
 use crate::chunker::SemanticChunker;
-use crate::embed::{EmbeddingService, EmbeddingModel};
+use crate::embed::{EmbeddingModel, EmbeddingService};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
 use crate::rerank::{rrf_fusion, vector_only, FusedResult, NeuralReranker, DEFAULT_RRF_K};
@@ -464,9 +464,18 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     }
 
     // Read model metadata from database FIRST (needed for sync)
-    let model_type = EmbeddingModel::resolve_index(&db_path)?;
+    let model_type = EmbeddingModel::resolve_index(&db_path).map_err(|error| {
+        let requested = requested_model
+            .map(|model| model.short_name().to_owned())
+            .unwrap_or_else(|| "active strategy".into());
+        anyhow::anyhow!("Cannot use requested embedding model '{requested}': {error:#}")
+    })?;
     if requested_model.is_some_and(|requested| requested != model_type) {
-        anyhow::bail!("Embedding model mismatch; rebuild the index with --force");
+        anyhow::bail!(
+            "Index uses embedding model '{}', but '{}' was requested; rebuild with --force",
+            model_type.short_name(),
+            requested_model.unwrap().short_name()
+        );
     }
     let dimensions = model_type.try_dimensions()?;
     let primary_language = read_metadata(&db_path).and_then(|(_, _, lang)| lang);

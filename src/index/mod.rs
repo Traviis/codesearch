@@ -89,7 +89,9 @@ fn resolve_index_model(
     // `--force` deletes the database (see `get_db_path_smart`), so there is no
     // recorded model to honour; a non-existent/legacy index has none either.
     if force || !db_path.join("metadata.json").exists() {
-        return Ok(requested.unwrap_or_default());
+        let model = requested.unwrap_or_default();
+        model.try_dimensions()?;
+        return Ok(model);
     }
     let (recorded, _dims) = IndexManager::resolve_embed_model(db_path)?;
     match requested {
@@ -900,11 +902,6 @@ async fn index_with_options(
         for (_, chunk_ids) in deleted_files.iter() {
             total_chunks_to_delete += chunk_ids.len() as u32;
         }
-        for file in &changed_files {
-            let key = storage_key(&file.path, &project_path);
-            let (_, chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
-            total_chunks_to_delete += chunk_ids.len() as u32;
-        }
 
         if total_chunks_to_delete > 0 {
             log_print!("\n🔄 Deleting {} old chunks...", total_chunks_to_delete);
@@ -927,25 +924,6 @@ async fn index_with_options(
                     }
                 }
                 file_meta_store.remove_file(file_path.as_str());
-            }
-
-            // Delete changed files' old chunks
-            for file in &changed_files {
-                let key = storage_key(&file.path, &project_path);
-                let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
-                if !old_chunk_ids.is_empty() {
-                    let file_path_str = file.path.to_string_lossy().to_string();
-                    info!(
-                        "🔄 Deleting {} old chunks for changed file: {}",
-                        old_chunk_ids.len(),
-                        file_path_str
-                    );
-                    debug!("   File path: {}", file.path.display());
-                    store.delete_chunks(&old_chunk_ids)?;
-                    for chunk_id in &old_chunk_ids {
-                        fts_store.delete_chunk(*chunk_id)?;
-                    }
-                }
             }
 
             fts_store.commit()?;
@@ -1024,6 +1002,7 @@ async fn index_with_options(
     // arena allocator memory that grows monotonically. Model is on disk, so
     let mut skipped_files: Vec<String> = Vec::new();
     let mut cancelled = false;
+    let mut embedding_error = None;
     for file in &files {
         // Check for cancellation before processing each file
         // Uses BOTH global AtomicBool (set by ctrlc OS handler) AND CancellationToken (for programmatic cancel)
@@ -1081,6 +1060,14 @@ async fn index_with_options(
         );
 
         if chunks.is_empty() {
+            if let Some(meta) = file_meta_store.as_ref() {
+                let key = storage_key(&file.path, &project_path);
+                let (_, old_ids) = meta.check_file(&file.path, &key)?;
+                store.delete_chunks(&old_ids)?;
+                for id in old_ids {
+                    fts_store.delete_chunk(id)?;
+                }
+            }
             // Still track this file so we don't re-process it every run.
             // A file with 0 chunks (e.g. minified JS, empty file) is "processed
             // but unchunkable" — record it with an empty chunk list so check_file()
@@ -1099,13 +1086,26 @@ async fn index_with_options(
                 cancelled = true;
                 break;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                embedding_error = Some(e);
+                cancelled = true;
+                break;
+            }
         };
 
         // Check cancellation after embedding (most CPU-intensive step)
         if crate::constants::check_shutdown(&cancel_token) {
             cancelled = true;
             break;
+        }
+
+        if let Some(meta) = file_meta_store.as_ref() {
+            let key = storage_key(&file.path, &project_path);
+            let (_, old_ids) = meta.check_file(&file.path, &key)?;
+            store.delete_chunks(&old_ids)?;
+            for id in old_ids {
+                fts_store.delete_chunk(id)?;
+            }
         }
 
         // Phase 2c: Extract lightweight FTS data before handing ownership to vector store.
@@ -1275,6 +1275,9 @@ async fn index_with_options(
             "codesearch index".bright_cyan()
         );
 
+        if let Some(error) = embedding_error {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -3671,7 +3674,10 @@ mod index_model_resolution_tests {
     fn recorded_dimensions_reads_metadata_dimensions() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".codesearch.db");
-        write_metadata(&db, EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4));
+        write_metadata(
+            &db,
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        );
         assert_eq!(recorded_dimensions(&db), 768);
     }
 
@@ -3702,7 +3708,10 @@ mod index_model_resolution_tests {
         // default (384-dim MiniLM). The recorded model must win.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".codesearch.db");
-        write_metadata(&db, EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4));
+        write_metadata(
+            &db,
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        );
 
         assert_eq!(
             resolve_index_model(&db, false, None).unwrap(),
@@ -3711,7 +3720,14 @@ mod index_model_resolution_tests {
         );
         // An explicit --model that agrees is accepted.
         assert_eq!(
-            resolve_index_model(&db, false, Some(EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))).unwrap(),
+            resolve_index_model(
+                &db,
+                false,
+                Some(EmbeddingModel::Local(
+                    crate::embed::ModelType::EmbeddingGemma300MQ4
+                ))
+            )
+            .unwrap(),
             EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4)
         );
     }
@@ -3720,10 +3736,19 @@ mod index_model_resolution_tests {
     fn resolve_index_model_rejects_disagreeing_override_without_force() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".codesearch.db");
-        write_metadata(&db, EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4));
+        write_metadata(
+            &db,
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        );
 
-        let err = resolve_index_model(&db, false, Some(EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q)))
-            .expect_err("a --model that disagrees with the index must be rejected");
+        let err = resolve_index_model(
+            &db,
+            false,
+            Some(EmbeddingModel::Local(
+                crate::embed::ModelType::AllMiniLML6V2Q,
+            )),
+        )
+        .expect_err("a --model that disagrees with the index must be rejected");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Model mismatch") && msg.contains("embeddinggemma-q4"),
@@ -3732,7 +3757,14 @@ mod index_model_resolution_tests {
 
         // --force deletes the DB, so the requested model is honoured.
         assert_eq!(
-            resolve_index_model(&db, true, Some(EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q))).unwrap(),
+            resolve_index_model(
+                &db,
+                true,
+                Some(EmbeddingModel::Local(
+                    crate::embed::ModelType::AllMiniLML6V2Q
+                ))
+            )
+            .unwrap(),
             EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q)
         );
     }
@@ -3743,7 +3775,14 @@ mod index_model_resolution_tests {
         let db = dir.path().join(".codesearch.db"); // does not exist
 
         assert_eq!(
-            resolve_index_model(&db, false, Some(EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4))).unwrap(),
+            resolve_index_model(
+                &db,
+                false,
+                Some(EmbeddingModel::Local(
+                    crate::embed::ModelType::EmbeddingGemma300MQ4
+                ))
+            )
+            .unwrap(),
             EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4)
         );
         assert_eq!(
