@@ -271,6 +271,17 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn delete_chunks(&self, repo: &str, ids: &[u32]) -> Result<usize> {
+        let ids: Vec<i64> = ids.iter().copied().map(i64::from).collect();
+        let result =
+            sqlx::query("DELETE FROM codesearch_chunks WHERE repo = $1 AND chunk_id = ANY($2)")
+                .bind(repo)
+                .bind(ids)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() as usize)
+    }
+
     pub async fn delete_repo(&self, repo: &str) -> Result<()> {
         sqlx::query("DELETE FROM codesearch_repos WHERE repo = $1")
             .bind(repo)

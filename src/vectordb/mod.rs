@@ -1,6 +1,8 @@
 mod backend;
+mod config;
 mod store;
 pub use backend::ChunkStore;
+pub use config::{delete_postgres_repo, storage_backend};
 #[cfg(feature = "pgvector")]
 mod postgres;
 #[cfg(feature = "pgvector")]

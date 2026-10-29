@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use std::path::Path;
 
-use super::{ChunkMetadata, SearchResult, StoreStats, VectorStore};
+use super::{storage_backend, ChunkMetadata, SearchResult, StoreStats, VectorStore};
 use crate::embed::EmbeddedChunk;
 
 /// Storage for a repository's vectors and complete indexed chunk payloads.
@@ -22,10 +22,8 @@ impl ChunkStore {
         dimensions: usize,
         readonly: bool,
     ) -> Result<Self> {
-        match std::env::var("CODESEARCH_STORAGE")
-            .as_deref()
-            .unwrap_or("local")
-        {
+        let backend = storage_backend(db_path)?;
+        match backend.as_str() {
             "local" => Ok(Self::Local(if readonly {
                 VectorStore::open_readonly(db_path, dimensions)?
             } else {
@@ -60,19 +58,55 @@ impl ChunkStore {
         dimensions: usize,
         readonly: bool,
     ) -> Result<Self> {
-        if std::env::var("CODESEARCH_STORAGE").as_deref().unwrap_or("local") == "local" {
+        if storage_backend(db_path)? == "local" {
             return Self::open(db_path, "", model, dimensions, readonly).await;
         }
         let config = crate::db_discovery::repos::ReposConfig::load()?;
         let normalized = crate::cache::normalize_path(project_path);
-        let repo = config
-            .repos
-            .iter()
-            .find_map(|(alias, entry)| {
-                (crate::cache::normalize_path(entry) == normalized).then(|| alias.clone())
-            })
-            .unwrap_or_else(|| normalized.clone());
-        Self::open(db_path, &repo, model, dimensions, readonly).await
+        let manifest: serde_json::Value =
+            match std::fs::read_to_string(db_path.join("metadata.json")) {
+                Ok(content) => serde_json::from_str(&content)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+                Err(e) => return Err(e.into()),
+            };
+        let repo = manifest
+            .get("storage_repo")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                config
+                    .repos
+                    .iter()
+                    .find_map(|(alias, entry)| {
+                        (crate::cache::normalize_path(entry) == normalized).then(|| alias.clone())
+                    })
+                    .unwrap_or_else(|| normalized.clone())
+            });
+        let store = Self::open(db_path, &repo, model, dimensions, readonly).await?;
+        if !readonly {
+            std::fs::create_dir_all(db_path)?;
+            super::merge_metadata_atomic(db_path, |metadata| {
+                metadata.insert("storage_backend".into(), "postgres".into());
+                metadata.insert("storage_repo".into(), repo.into());
+            })?;
+        }
+        Ok(store)
+    }
+
+    pub fn local(&self) -> Option<&VectorStore> {
+        match self {
+            Self::Local(store) => Some(store),
+            #[cfg(feature = "pgvector")]
+            Self::Postgres { .. } => None,
+        }
+    }
+
+    pub fn local_mut(&mut self) -> Option<&mut VectorStore> {
+        match self {
+            Self::Local(store) => Some(store),
+            #[cfg(feature = "pgvector")]
+            Self::Postgres { .. } => None,
+        }
     }
 
     pub fn backend(&self) -> &'static str {
@@ -91,10 +125,9 @@ impl ChunkStore {
     ) -> Result<Vec<SearchResult>> {
         match self {
             Self::Local(store) => {
-                let mut results = store.search(embedding, limit)?;
-                if let Some(prefix) = prefix {
-                    results.retain(|r| r.path.starts_with(prefix));
-                }
+                let results = store.search(embedding, limit)?;
+                // Local filtering stays at the caller's existing normalized-path boundary.
+                let _ = prefix;
                 Ok(results)
             }
             #[cfg(feature = "pgvector")]
@@ -123,6 +156,9 @@ impl ChunkStore {
     }
 
     pub async fn get_chunk_as_result(&self, id: u32) -> Result<Option<SearchResult>> {
+        if let Self::Local(store) = self {
+            return store.get_chunk_as_result(id);
+        }
         Ok(self
             .get_chunk(id)
             .await?
@@ -179,6 +215,88 @@ impl ChunkStore {
             #[cfg(feature = "pgvector")]
             Self::Postgres { .. } => Ok(()),
         }
+    }
+
+    pub async fn chunks_for_file(&self, path: &str) -> Result<Vec<super::store::ChunkMeta>> {
+        if let Self::Local(store) = self {
+            return store.chunks_for_file(path);
+        }
+        let normalized = crate::cache::normalize_path_str(path);
+        let mut by_key = std::collections::HashMap::new();
+        for (id, chunk) in self.iter_all_chunks().await? {
+            if crate::cache::normalize_path_str(&chunk.path) != normalized {
+                continue;
+            }
+            let key = (
+                chunk.kind.clone(),
+                chunk.signature.clone(),
+                if chunk.signature.is_some() {
+                    (0, 0)
+                } else {
+                    (chunk.start_line, chunk.end_line)
+                },
+            );
+            by_key.insert(
+                key,
+                super::store::ChunkMeta {
+                    id,
+                    kind: chunk.kind,
+                    signature: chunk.signature,
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                },
+            );
+        }
+        let mut chunks: Vec<_> = by_key.into_values().collect();
+        chunks.sort_by_key(|chunk| chunk.start_line);
+        Ok(chunks)
+    }
+
+    pub async fn index_health(&self) -> Result<(usize, bool)> {
+        match self {
+            Self::Local(store) => store.index_health(),
+            #[cfg(feature = "pgvector")]
+            Self::Postgres { store, repo } => Ok((store.stats(repo).await?.total_chunks, true)),
+        }
+    }
+
+    pub async fn delete_chunks(&mut self, ids: &[u32]) -> Result<usize> {
+        match self {
+            Self::Local(store) => store.delete_chunks(ids),
+            #[cfg(feature = "pgvector")]
+            Self::Postgres { store, repo } => store.delete_chunks(repo, ids).await,
+        }
+    }
+
+    pub async fn insert_chunks_with_ids(&mut self, chunks: Vec<EmbeddedChunk>) -> Result<Vec<u32>> {
+        if let Self::Local(store) = self {
+            return store.insert_chunks_with_ids(chunks);
+        }
+        let mut grouped = std::collections::BTreeMap::<String, Vec<(usize, EmbeddedChunk)>>::new();
+        let count = chunks.len();
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            grouped
+                .entry(chunk.chunk.path.clone())
+                .or_default()
+                .push((index, chunk));
+        }
+        let mut ids = vec![0; count];
+        for (path, entries) in grouped {
+            let (positions, chunks): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+            let assigned = self.replace_file(&path, chunks).await?;
+            for (position, id) in positions.into_iter().zip(assigned) {
+                ids[position] = id;
+            }
+        }
+        Ok(ids)
+    }
+
+    pub async fn get_chunks_by_file(&self) -> Result<std::collections::HashMap<String, Vec<u32>>> {
+        let mut files = std::collections::HashMap::<String, Vec<u32>>::new();
+        for (id, chunk) in self.iter_all_chunks().await? {
+            files.entry(chunk.path).or_default().push(id);
+        }
+        Ok(files)
     }
 
     pub async fn iter_all_chunks(&self) -> Result<Vec<(u32, ChunkMetadata)>> {

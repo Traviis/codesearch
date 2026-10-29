@@ -97,6 +97,9 @@ async fn postgres_file_lifecycle_and_filtered_search() {
     let store = PostgresStore::connect(&url, "test-model", 3).await.unwrap();
     // Opening repeatedly exercises idempotent schema initialization.
     let reopened = PostgresStore::connect(&url, "test-model", 3).await.unwrap();
+    let local_state = tempfile::tempdir().unwrap();
+    std::fs::write(local_state.path().join("metadata.json"), r#"{"storage_backend":"postgres","storage_repo":"alpha","model_short_name":"test-model","dimensions":3}"#).unwrap();
+    assert!(!local_state.path().join("data.mdb").exists());
     let ids = store
         .replace_file(
             "alpha",
@@ -153,6 +156,29 @@ async fn postgres_file_lifecycle_and_filtered_search() {
     assert_ne!(ids, replacement);
     assert!(store.get_chunk("alpha", ids[0]).await.unwrap().is_none());
     assert_eq!(store.stats("alpha").await.unwrap().total_chunks, 1);
+    let mut backend = codesearch::vectordb::ChunkStore::Postgres {
+        store: store.clone(),
+        repo: "alpha".into(),
+    };
+    assert_eq!(
+        backend
+            .get_chunk_as_result(replacement[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "replacement"
+    );
+    assert_eq!(
+        backend.chunks_for_file("src/main.rs").await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        backend.get_chunks_by_file().await.unwrap()["src/main.rs"],
+        replacement
+    );
+    assert_eq!(backend.index_health().await.unwrap(), (1, true));
+    backend.build_index().await.unwrap();
     // Invalid replacement must preserve the complete previous file.
     let invalid = EmbeddedChunk::new(
         Chunk::new(
@@ -189,8 +215,145 @@ async fn postgres_file_lifecycle_and_filtered_search() {
         .unwrap()
         .to_string()
         .contains("mismatch"));
+    // Missing local publication state must not erase a committed remote file,
+    // even when embedding cannot proceed.
+    let recovery = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(recovery.path().join("src")).unwrap();
+    std::fs::write(recovery.path().join("src/main.rs"), "fn replacement() {}\n").unwrap();
+    let recovery_db = recovery.path().join(".codesearch.db");
+    let shared = codesearch::index::SharedStores::new(&recovery_db, 3).unwrap();
+    *shared.vector_store.write().await = codesearch::vectordb::ChunkStore::Postgres {
+        store: store.clone(),
+        repo: "alpha".into(),
+    };
+    std::fs::write(
+        recovery_db.join("metadata.json"),
+        r#"{"model_short_name":"test-model","dimensions":3}"#,
+    )
+    .unwrap();
+    let result = codesearch::index::IndexManager::perform_incremental_refresh_with_stores(
+        recovery.path(),
+        &recovery_db,
+        &shared,
+        &tokio_util::sync::CancellationToken::new(),
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "unavailable embedding model must fail refresh"
+    );
+    assert_eq!(
+        store
+            .get_chunk("alpha", replacement[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "replacement"
+    );
+
+    // Sparse path scopes must fill the requested limit despite closer vectors elsewhere.
+    let distractors: Vec<_> = (0..300)
+        .map(|_| chunk("bulk.rs", "distractor", [1.0, 0.0, 0.0]))
+        .collect();
+    store
+        .replace_file("noise", "bulk.rs", &distractors)
+        .await
+        .unwrap();
+    let scoped: Vec<_> = (0..12)
+        .map(|_| chunk("selected.rs", "scoped", [0.1, 0.9, 0.0]))
+        .collect();
+    store
+        .replace_file("scope", "selected.rs", &scoped)
+        .await
+        .unwrap();
+    let hits = store
+        .search(
+            &["noise".into(), "scope".into()],
+            &[1.0, 0.0, 0.0],
+            Some("selected"),
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 10);
+    assert!(hits
+        .iter()
+        .all(|hit| hit.origin.as_deref() == Some("scope")));
     store.delete_file("alpha", "src/main.rs").await.unwrap();
     assert_eq!(store.stats("alpha").await.unwrap().total_chunks, 0);
     store.delete_repo("beta").await.unwrap();
     assert_eq!(store.stats("beta").await.unwrap().total_chunks, 0);
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE DATABASE cli_fixture")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cli_url = url.replace("/postgres?", "/cli_fixture?");
+    let cli_store = PostgresStore::connect(&cli_url, "minilm-l6-q", 384)
+        .await
+        .unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = project.path().join(".codesearch.db");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(db.join("metadata.json"), r#"{"schema_version":1,"storage_backend":"postgres","storage_repo":"cli","model_short_name":"minilm-l6-q","dimensions":384,"partial":false}"#).unwrap();
+    let ids = cli_store
+        .replace_file(
+            "cli",
+            "src/rule.xml",
+            &[EmbeddedChunk::new(
+                Chunk::new(
+                    "<ref:classification search=\"gadget\" />".into(),
+                    1,
+                    1,
+                    ChunkKind::Block,
+                    "src/rule.xml".into(),
+                ),
+                vec![0.5; 384],
+            )],
+        )
+        .await
+        .unwrap();
+    let mut fts = codesearch::fts::FtsStore::new_with_writer(&db).unwrap();
+    fts.add_chunk(
+        ids[0],
+        "<ref:classification search=\"gadget\" />",
+        "src/rule.xml",
+        None,
+        "Block",
+    )
+    .unwrap();
+    fts.commit().unwrap();
+    drop(fts);
+    for args in [
+        vec!["gadget", "--literal"],
+        vec![r"ref:classification\s+search=", "--regex"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codesearch"))
+            .arg("search")
+            .args(args)
+            .arg("--json")
+            .arg("--path")
+            .arg(project.path())
+            .env("CODESEARCH_DATABASE_URL", &cli_url)
+            .env("CODESEARCH_STORAGE", "postgres")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI search failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "unexpected CLI diagnostics: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["results"][0]["path"], "src/rule.xml");
+    }
+    assert!(!db.join("data.mdb").exists());
 }

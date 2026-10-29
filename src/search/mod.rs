@@ -520,13 +520,24 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // Perform incremental sync if requested (after we know the model)
     if options.sync {
         info_print!("{}", "🔄 Syncing database...".yellow());
-        sync_database(&db_path, model_type)?;
+        if crate::vectordb::storage_backend(&db_path)? == "postgres" {
+            crate::index::index_quiet_with_model(
+                Some(project_path.clone()),
+                false,
+                false,
+                Some(model_type),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        } else {
+            sync_database(&db_path, model_type)?;
+        }
     }
 
     // Literal mode (--literal/--phrase/--regex): run the Tantivy primitives
     // directly — no embeddings, no fusion, no model load.
     if options.literal {
-        return literal::run(query, &db_path, &project_path, dimensions, &options);
+        return literal::run(query, &db_path, &project_path, dimensions, &options).await;
     }
 
     // Load database
