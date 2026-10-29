@@ -6,7 +6,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/flupkede/codesearch?include_prereleases)](https://github.com/flupkede/codesearch/releases)
 [![GitHub stars](https://img.shields.io/github/stars/flupkede/codesearch?style=social)](https://github.com/flupkede/codesearch/stargazers)
 
-**Multi-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid retrieval, symbol navigation, and cross-repository orchestration. Fully local, fully offline, no GPU, no Docker.**
+**Multi-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid retrieval, symbol navigation, and cross-repository orchestration. Local and offline by default, with optional remote embeddings. No GPU or Docker required.**
 
 codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) deep codebase understanding through 5 unified MCP tools. Index once, search semantically across multiple repositories simultaneously.
 
@@ -17,7 +17,7 @@ codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) d
 - **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents — in the same tool
 - **AST-aware chunking**: Tree-sitter parsing for 17 languages — chunks align to functions/classes (and Markdown sections), not arbitrary line ranges
 - **Token-efficient**: Returns metadata by default; agents fetch full code only when needed via `get_chunk`
-- **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only, no runtime model downloads (works behind enterprise proxies)
+- **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only; local embedding inference works offline after the one-time model download
 - **Zero config for single repos**: `codesearch index && codesearch mcp` — done
 
 ## How does this compare?
@@ -28,11 +28,26 @@ The MCP code-search ecosystem grew rapidly in late 2025 / early 2026 and many pr
 |---|---|---|
 | Repository scope | Multi-repo serve with cross-repo RRF | Usually single repo at a time |
 | Footprint | ~hundreds of MB, CPU-only, no Docker | GB-scale, GPU, Docker, or cloud |
-| Enterprise / offline | No runtime fetches; static binary | Often pulls models at first run |
+| Enterprise / offline | Offline by default after one-time model download; optional remote embeddings | Often pulls models at first run |
 | Symbol navigation | `find` (def/usages/imports/dependents) co-located with semantic search | Often a separate code-graph tool |
 | Token cost per call | `compact=true` by default; chunks fetched on demand | Frequently dumps full snippets |
 
-codesearch is intentionally narrower than full code-graph or knowledge-graph tools — it picks "lightweight, multi-repo, MCP-native, fully offline" and stays on that lane.
+codesearch is intentionally narrower than full code-graph or knowledge-graph tools — it focuses on lightweight, multi-repo, MCP-native search, offline by default.
+
+### Local vs. remote embeddings
+
+| Capability | Local embeddings (default) | Remote embeddings (opt-in) |
+|---|---|---|
+| Provider | fastembed / ONNX on your CPU | OpenAI-compatible HTTP endpoint, including proxies such as LiteLLM |
+| Network requirements | One-time model download; embedding inference then works offline | Endpoint connectivity for embedding inference during indexing and semantic search |
+| Code privacy | Source chunks and queries stay local for embedding inference | Source chunks and queries are sent to the configured endpoint and any backend it forwards to |
+| Model execution | On the codesearch host; no GPU required | On the endpoint's backend; no local embedding model download |
+| Search and storage | Local indexes; hybrid semantic + BM25 search | Local indexes; hybrid semantic + BM25 search with remote embedding inference |
+| Configuration | Default; no remote endpoint needed | Explicit provider, endpoint and model configuration; credentials if required |
+
+Remote embeddings change where inference runs, not where indexes are stored.
+Use only endpoints and backends approved for your code's confidentiality requirements.
+See [Embedding model](#embedding-model) for configuration and reindexing requirements.
 
 ## Architecture
 
@@ -188,8 +203,12 @@ The base URL must include the API prefix (for example `/v1`); codesearch appends
 persists only nonsecret defaults; it downloads no local model. `doctor` validates
 the active provider and probes remote inference. The key is read only from
 `CODESEARCH_EMBED_API_KEY` and may be omitted for unauthenticated servers.
-Source chunks and queries are sent to your configured endpoint: choose a proxy
-and backend appropriate for your code's confidentiality requirements.
+**Privacy: remote mode sends source chunks and queries to your configured
+endpoint and any backend it forwards to.** Before indexing or semantic search,
+review the active provider, base URL and model in your environment and saved
+setup configuration. Choose a proxy and backend appropriate for your code's
+confidentiality requirements. `doctor` performs a remote inference probe; it
+is not an offline-only configuration check.
 
 Changing provider, remote model, dimensions, prefixes or input limit requires
 **`--force` reindexing every affected repository**. Incompatible indexes fail
