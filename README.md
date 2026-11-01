@@ -38,15 +38,10 @@ codesearch is intentionally narrower than full code-graph or knowledge-graph too
 
 | Capability | Local embeddings (default) | Remote embeddings (opt-in) |
 |---|---|---|
-| Provider | fastembed / ONNX on your CPU | OpenAI-compatible HTTP endpoint, including proxies such as LiteLLM |
-| Network requirements | One-time model download; embedding inference then works offline | Endpoint connectivity for embedding inference during indexing and semantic search |
-| Code privacy | Source chunks and queries stay local for embedding inference | Source chunks and queries are sent to the configured endpoint and any backend it forwards to |
-| Model execution | On the codesearch host; no GPU required | On the endpoint's backend; no local embedding model download |
-| Search and storage | Local indexes; hybrid semantic + BM25 search | Local indexes; hybrid semantic + BM25 search with remote embedding inference |
-| Configuration | Default; no remote endpoint needed | Explicit provider, endpoint and model configuration; credentials if required |
+| Inference | fastembed / ONNX on your CPU | OpenAI-compatible HTTP endpoint |
+| Network | Offline after one-time model download | Endpoint required for indexing and semantic search |
+| Code privacy | Chunks and queries stay local for inference | Chunks and queries sent to endpoint and downstream backend |
 
-Remote embeddings change where inference runs, not where indexes are stored.
-Use only endpoints and backends approved for your code's confidentiality requirements.
 See [Embedding model](#embedding-model) for configuration and reindexing requirements.
 
 ## Architecture
@@ -203,12 +198,9 @@ The base URL must include the API prefix (for example `/v1`); codesearch appends
 persists only nonsecret defaults; it downloads no local model. `doctor` validates
 the active provider and probes remote inference. The key is read only from
 `CODESEARCH_EMBED_API_KEY` and may be omitted for unauthenticated servers.
-**Privacy: remote mode sends source chunks and queries to your configured
-endpoint and any backend it forwards to.** Before indexing or semantic search,
-review the active provider, base URL and model in your environment and saved
-setup configuration. Choose a proxy and backend appropriate for your code's
-confidentiality requirements. `doctor` performs a remote inference probe; it
-is not an offline-only configuration check.
+**Privacy:** remote mode sends source chunks and queries to the configured
+endpoint and any backend it forwards to. Choose services appropriate for your
+code's confidentiality requirements.
 
 Changing provider, remote model, dimensions, prefixes or input limit requires
 **`--force` reindexing every affected repository**. Incompatible indexes fail
