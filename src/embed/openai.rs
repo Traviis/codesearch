@@ -2,9 +2,10 @@ use super::config::EmbedConfig;
 use super::provider::Embedder;
 use anyhow::{bail, Result};
 use serde::Deserialize;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, SystemTime};
 
+static NOTICE: Once = Once::new();
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static DIMENSIONS: OnceLock<usize> = OnceLock::new();
 static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -146,6 +147,13 @@ async fn request(
     dimensions: usize,
 ) -> Result<Vec<Vec<f32>>> {
     let endpoint = config.endpoint()?;
+    NOTICE.call_once(|| {
+        eprintln!(
+            "Remote embeddings active: endpoint={} model={}\n\
+             Source chunks and queries will be sent to this endpoint.",
+            endpoint, config.model
+        );
+    });
     let mut body =
         serde_json::json!({ "model": config.model, "input": inputs, "encoding_format": "float" });
     if let Some(dimensions) = config.embed_dimensions {

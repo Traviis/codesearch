@@ -146,10 +146,20 @@ fn check_embedding_strategy(db_path: &Path) -> CheckResult {
         }
         Ok(model)
     }) {
-        Ok(model) => CheckResult::pass(
-            "Embedding strategy",
-            format!("{} ({} dimensions)", model.name(), model.dimensions()),
-        ),
+        Ok(model) => {
+            let result = CheckResult::pass(
+                "Embedding strategy",
+                format!("{} ({} dimensions)", model.name(), model.dimensions()),
+            );
+            if model == crate::embed::EmbeddingModel::ActiveRemote {
+                match crate::embed::active_config().endpoint() {
+                    Ok(endpoint) => result.with_details(format!("Remote endpoint: {endpoint}")),
+                    Err(error) => CheckResult::fail("Embedding strategy", format!("{error:#}")),
+                }
+            } else {
+                result
+            }
+        }
         Err(error) => CheckResult::fail("Embedding strategy", format!("{error:#}")),
     }
 }

@@ -221,7 +221,7 @@ async fn remote_refresh_failure_preserves_completed_and_previous_files_then_retr
         .env("CODESEARCH_EMBED_PROVIDER", "openai")
         .env("CODESEARCH_EMBED_BASE_URL", &url)
         .env("CODESEARCH_EMBED_DIMENSIONS", "2")
-        .env_remove("CODESEARCH_EMBED_API_KEY")
+        .env("CODESEARCH_EMBED_API_KEY", "private-test-key")
         .args(["--model", "proxy/model", "search", "replacement", "--path"])
         .arg(&repo)
         .arg("--create-index=false")
@@ -237,6 +237,37 @@ async fn remote_refresh_failure_preserves_completed_and_previous_files_then_retr
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let notice = format!("Remote embeddings active: endpoint={url}/embeddings model=proxy/model");
+    assert_eq!(stderr.matches(&notice).count(), 1, "{stderr}");
+    assert!(stderr.contains("Source chunks and queries will be sent to this endpoint."));
+    assert!(!stderr.contains("private-test-key"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(&notice));
+    let doctor = cli(&home)
+        .env("CODESEARCH_EMBED_PROVIDER", "openai")
+        .env("CODESEARCH_EMBED_BASE_URL", &url)
+        .env("CODESEARCH_EMBED_DIMENSIONS", "2")
+        .current_dir(&repo)
+        .args(["--model", "proxy/model", "doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&doctor.stderr)));
+    let strategy = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "Embedding strategy")
+        .unwrap();
+    assert_eq!(strategy["status"], "pass", "{strategy}");
+    assert!(strategy["message"]
+        .as_str()
+        .unwrap()
+        .contains("proxy/model"));
+    assert_eq!(
+        strategy["details"],
+        format!("Remote endpoint: {url}/embeddings")
+    );
     let before = std::fs::read(db.join("metadata.json")).unwrap();
     let rejected = cli(&home)
         .args(["search", "query", "--path"])
@@ -245,7 +276,26 @@ async fn remote_refresh_failure_preserves_completed_and_previous_files_then_retr
         .output()
         .unwrap();
     assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--force"));
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("--force"));
+    assert!(!stderr.contains("Remote embeddings active:"));
+    let rejected = cli(&home)
+        .env("CODESEARCH_EMBED_PROVIDER", "openai")
+        .env(
+            "CODESEARCH_EMBED_BASE_URL",
+            "https://user:url-password@example.invalid/v1?api_key=query-secret",
+        )
+        .current_dir(&repo)
+        .args(["--model", "proxy/model", "doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("without credentials, query or fragment"));
+    for secret in ["url-password", "query-secret", "Remote embeddings active:"] {
+        assert!(!stderr.contains(secret), "{stderr}");
+        assert!(!String::from_utf8_lossy(&rejected.stdout).contains(secret));
+    }
     assert_eq!(std::fs::read(db.join("metadata.json")).unwrap(), before);
     let rejected = cli(&home).args(["index"]).arg(&repo).output().unwrap();
     assert!(!rejected.status.success());
