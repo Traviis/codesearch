@@ -3,9 +3,9 @@ mod testing;
 use codesearch::embed::{configure, EmbedConfig, EmbeddingModel, EmbeddingServicePool};
 use codesearch::index::{IndexManager, SharedStores};
 use serde_json::{json, Value};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -243,6 +243,94 @@ async fn remote_refresh_failure_preserves_completed_and_previous_files_then_retr
     assert!(stderr.contains("Source chunks and queries will be sent to this endpoint."));
     assert!(!stderr.contains("private-test-key"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains(&notice));
+    let calls_before_mcp = calls.load(Ordering::Relaxed);
+    let mut mcp = cli(&home)
+        .env("CODESEARCH_EMBED_PROVIDER", "openai")
+        .env("CODESEARCH_EMBED_BASE_URL", &url)
+        .env("CODESEARCH_EMBED_DIMENSIONS", "2")
+        .env("CODESEARCH_EMBED_API_KEY", "private-test-key")
+        .args([
+            "--model",
+            "proxy/model",
+            "mcp",
+            "--mode",
+            "local",
+            "--readonly",
+        ])
+        .arg(&repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = mcp.stdout.take().unwrap();
+    let stderr = mcp.stderr.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        BufReader::new(stderr).read_to_string(&mut text).unwrap();
+        text
+    });
+    let requests = [
+        json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+            "protocolVersion":"2025-11-25", "capabilities":{},
+            "clientInfo":{"name":"remote-privacy-test", "version":"1.0"}
+        }}),
+        json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+            "name":"search", "arguments":{"query":"replacement", "mode":"semantic"}
+        }}),
+    ];
+    let mut responses = Vec::new();
+    for request in requests {
+        writeln!(mcp.stdin.as_mut().unwrap(), "{request}").unwrap();
+        mcp.stdin.as_mut().unwrap().flush().unwrap();
+        let Some(id) = request.get("id") else {
+            continue;
+        };
+        loop {
+            let line = match receive.recv_timeout(std::time::Duration::from_secs(20)) {
+                Ok(line) => line.unwrap(),
+                Err(error) => {
+                    mcp.kill().unwrap();
+                    mcp.wait().unwrap();
+                    panic!(
+                        "MCP response timeout/disconnect: {error}; {}",
+                        errors.join().unwrap()
+                    );
+                }
+            };
+            let response: Value = serde_json::from_str(&line).expect("JSON-RPC stdout");
+            assert_eq!(response["jsonrpc"], "2.0");
+            let matched = response.get("id") == Some(id);
+            responses.push(response);
+            if matched {
+                break;
+            }
+        }
+    }
+    drop(mcp.stdin.take());
+    assert!(mcp.wait().unwrap().success());
+    reader.join().unwrap();
+    for line in receive.try_iter() {
+        let response: Value = serde_json::from_str(&line.unwrap()).expect("JSON-RPC stdout");
+        assert_eq!(response["jsonrpc"], "2.0");
+    }
+    let stderr = errors.join().unwrap();
+    assert_eq!(stderr.matches(&notice).count(), 1, "{stderr}");
+    assert!(stderr.contains("Source chunks and queries will be sent to this endpoint."));
+    assert!(!stderr.contains("private-test-key"));
+    let result = &responses.iter().find(|r| r["id"] == 2).unwrap()["result"];
+    assert_ne!(result["isError"], true, "{result}");
+    assert!(result.to_string().contains("replacement_"), "{result}");
+    assert!(calls.load(Ordering::Relaxed) > calls_before_mcp);
     let doctor = cli(&home)
         .env("CODESEARCH_EMBED_PROVIDER", "openai")
         .env("CODESEARCH_EMBED_BASE_URL", &url)
